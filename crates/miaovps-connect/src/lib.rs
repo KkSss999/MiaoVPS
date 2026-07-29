@@ -22,10 +22,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info};
 
-use crate::error::ConnectError;
-use crate::state::{ConnectionState, ValidationStep};
-use crate::tunnel::TunnelHandle;
-use crate::validator::ConnectionValidator;
+pub use crate::error::ConnectError;
+pub use crate::state::{ConnectionState, ValidationStep};
+pub use crate::tunnel::{TunnelHandle, WireGuardHandshaker};
+pub use crate::validator::{ConnectionValidator, ValidationResult};
 
 /// VPN 配置（用于连接时）
 #[derive(Debug, Clone)]

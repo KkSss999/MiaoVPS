@@ -21,3 +21,5 @@ miaovps-ssh = { path = "../miaovps-ssh" }
 miaovps-wireguard-config = { path = "../miaovps-wireguard-config" }
 miaovps-provisioner = { path = "../miaovps-provisioner" }
 miaovps-storage = { path = "../miaovps-storage" }
+miaovps-connect = { path = "../miaovps-connect" }
+base64 = "0.22"

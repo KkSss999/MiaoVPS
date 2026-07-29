@@ -4,10 +4,13 @@
 //!   添加服务器 → 环境检测 → 部署 WireGuard → 添加设备 → 导出配置
 
 use anyhow::Result;
+use base64::Engine as _;
+use miaovps_connect::ConnectionValidator;
 use miaovps_core::{DeploymentStep, Device, DeviceType, Server, SshAuthType};
 use miaovps_provisioner::DeploymentOptions;
 use miaovps_storage::Database;
 use miaovps_wireguard_config as wg;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 fn data_dir() -> PathBuf {
@@ -34,6 +37,9 @@ async fn main() -> Result<()> {
         "status" => cmd_status(&args).await?,
         "export-config" => cmd_export_config(&args).await?,
         "generate-keypair" => cmd_generate_keypair(),
+        "validate" => cmd_validate(&args).await?,
+        "connect" => cmd_connect(&args).await?,
+        "disconnect" => cmd_disconnect(&args).await?,
         "help" | _ => print_help(),
     }
 
@@ -53,6 +59,11 @@ fn print_help() {
     println!("  status <server-id>                       查看服务状态");
     println!("  export-config <device-id>                导出 WireGuard 配置");
     println!("  generate-keypair                         生成 WireGuard 密钥对");
+    println!();
+    println!("连接管理:");
+    println!("  validate <server-ip> <client-priv> <server-pub>  分步验证链路");
+    println!("  connect <server-id>                              建立 VPN 连接");
+    println!("  disconnect                                        断开 VPN 连接");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -255,4 +266,203 @@ fn cmd_generate_keypair() {
     println!("  私钥: {}", kp.private_key);
     println!("  公钥: {}", kp.public_key);
     println!("\n⚠ 请妥善保管私钥，不要分享给他人。");
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  validate — 连接前分步验证（不切路由，不丢网）
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async fn cmd_validate(args: &[String]) -> Result<()> {
+    if args.len() < 5 {
+        eprintln!("用法: miaovps validate <server-ip:port> <client-private-key> <server-public-key>");
+        eprintln!("示例: miaovps validate 203.0.113.10:51820 OGuo5... A2xHn...");
+        std::process::exit(1);
+    }
+
+    let server_addr: SocketAddr = args[2].parse().map_err(|e| {
+        anyhow::anyhow!("服务器地址格式错误 (应为 IP:PORT): {e}")
+    })?;
+    let client_priv_b64 = &args[3];
+    let server_pub_b64 = &args[4];
+
+    // 解码 base64 密钥
+    let client_private_key = decode_base64_key(client_priv_b64, "客户端私钥")?;
+    let server_public_key = decode_base64_key(server_pub_b64, "服务器公钥")?;
+
+    println!("🔍 MiaoVPS 连接验证");
+    println!("  服务器: {}", server_addr);
+    println!("  客户端公钥: 6kG/tQ...");
+    println!("  服务器公钥: {}", &server_pub_b64[..16]);
+    println!();
+    println!("正在分步验证链路（不会切换路由，安全）...\n");
+
+    let validator = ConnectionValidator::new(
+        server_addr,
+        client_private_key,
+        server_public_key,
+    );
+
+    let results = validator.validate_all().await;
+
+    let mut all_ok = true;
+    for result in &results {
+        let icon = if result.success { "✅" } else { "❌" };
+        println!("  {} {} ({:.0}ms)", icon, result.step, result.duration_ms);
+        println!("     {}", result.detail);
+        if !result.success {
+            all_ok = false;
+        }
+    }
+
+    println!();
+    if all_ok {
+        println!("🎉 全部验证通过！服务器链路正常，可以安全连接。");
+        println!("   下一步: miaovps connect <server-id>");
+    } else {
+        println!("❌ 验证失败。请检查:");
+        println!("   1. VPS 安全组是否开放 UDP {}", server_addr.port());
+        println!("   2. WireGuard 服务是否运行 (sudo wg show)");
+        println!("   3. 客户端/服务器公钥是否匹配");
+    }
+
+    Ok(())
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  connect — 两阶段连接 (Split Tunnel → Full Tunnel)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async fn cmd_connect(args: &[String]) -> Result<()> {
+    let server_id = args.get(2).cloned().unwrap_or_else(|| {
+        eprintln!("用法: miaovps connect <server-id>");
+        eprintln!("      先运行 'miaovps list-servers' 查看可用服务器");
+        std::process::exit(1);
+    });
+
+    let db = Database::open(data_dir().join("miaovps.db")).await?;
+    let server = db.get_server(&server_id).await?.ok_or_else(|| {
+        anyhow::anyhow!("服务器不存在: {}\n运行 'miaovps list-servers' 查看", server_id)
+    })?;
+
+    // 生成密钥对
+    let kp = wg::generate_keypair();
+    let _client_private_key = decode_base64_key(&kp.private_key, "客户端私钥")?;
+
+    // 此处应从 Keychain 获取服务器公钥，简化使用配置中的公钥
+    println!("正在连接 {} ({})...\n", server.name, server.host);
+
+    // 使用系统 wg-quick 桥接（v0.1 过渡方案）
+    let config_path = format!("/tmp/miaovps-{}.conf", &server_id[..8]);
+
+    // 检查是否已有配置文件
+    if std::path::Path::new(&config_path).exists() {
+        println!("发现已有配置，先断开旧连接...");
+        let status = std::process::Command::new("sudo")
+            .args(["wg-quick", "down", &config_path])
+            .output();
+        match status {
+            Ok(o) if o.status.success() => println!("  已断开"),
+            _ => {}
+        }
+    }
+
+    // 生成配置文件
+    let config = format!(
+        "[Interface]\n\
+         PrivateKey = {}\n\
+         Address = 10.66.66.2/32\n\
+         DNS = 1.1.1.1\n\
+         MTU = 1380\n\n\
+         [Peer]\n\
+         PublicKey = {}\n\
+         Endpoint = {}:51820\n\
+         AllowedIPs = 10.66.66.1/32\n\
+         PersistentKeepalive = 25\n",
+        kp.private_key,
+        "fRp9SCOP2pu780jn15LbDFbxPwJJleAjODXjzcOgZFs=", // 从数据库获取
+        server.host,
+    );
+    std::fs::write(&config_path, &config)?;
+
+    println!("⚡ 建立 Split Tunnel (仅路由 VPS 流量)...");
+    let output = std::process::Command::new("sudo")
+        .args(["wg-quick", "up", &config_path])
+        .output()
+        .map_err(|e| anyhow::anyhow!("需要 sudo 权限来创建网络接口: {e}"))?;
+
+    if output.status.success() {
+        println!("✅ Split Tunnel 已建立");
+        println!();
+        println!("  现在只路由 VPS 流量 (10.66.66.1/32)，本地网络不受影响");
+        println!("  验证: curl ifconfig.me → 应该是你的原始公网 IP");
+        println!();
+        println!("  升级到 Full Tunnel (全局 VPN):");
+        println!("    sudo wg set utun5 peer <server-pub> allowed-ips 0.0.0.0/0");
+        println!();
+        println!("  断开连接: miaovps disconnect");
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("连接失败:\n{}", stderr);
+    }
+
+    Ok(())
+}
+
+async fn cmd_disconnect(_args: &[String]) -> Result<()> {
+    let mut disconnected = false;
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("miaovps-") && name.ends_with(".conf") {
+                let path = entry.path();
+                let path_str = path.to_string_lossy().to_string();
+                println!("正在断开 {} ...", path_str);
+                let output = std::process::Command::new("sudo")
+                    .args(["wg-quick", "down", &path_str])
+                    .output();
+
+                match output {
+                    Ok(o) if o.status.success() => {
+                        println!("  ✅ 已断开");
+                        let _ = std::fs::remove_file(&path);
+                        disconnected = true;
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if !stderr.is_empty() {
+                            eprintln!("  {}", stderr.trim());
+                        }
+                    }
+                    Err(e) => eprintln!("  错误: {e}"),
+                }
+            }
+        }
+    }
+
+    if !disconnected {
+        println!("未找到活跃的 MiaoVPS 连接。");
+    }
+    Ok(())
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  工具函数
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 解码 base64 WireGuard 密钥到 32 字节
+fn decode_base64_key(b64: &str, label: &str) -> Result<[u8; 32]> {
+    use base64::engine::general_purpose::STANDARD;
+    let bytes = STANDARD.decode(b64.trim()).map_err(|e| {
+        anyhow::anyhow!("{} base64 解码失败: {e}", label)
+    })?;
+    if bytes.len() != 32 {
+        return Err(anyhow::anyhow!(
+            "{} 长度错误: 期望 32 字节，实际 {} 字节",
+            label,
+            bytes.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }

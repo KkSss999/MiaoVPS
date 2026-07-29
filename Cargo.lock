@@ -1209,6 +1209,8 @@ name = "miaovps-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "miaovps-connect",
  "miaovps-core",
  "miaovps-provisioner",
  "miaovps-ssh",
