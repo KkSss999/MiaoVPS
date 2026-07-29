@@ -13,7 +13,9 @@
 //!     → Disconnected
 
 pub mod error;
+pub mod native;
 pub mod state;
+pub mod tun;
 pub mod tunnel;
 pub mod validator;
 
@@ -23,7 +25,9 @@ use tokio::sync::Mutex;
 use tracing::{info};
 
 pub use crate::error::ConnectError;
+pub use crate::native::NativeTunnel;
 pub use crate::state::{ConnectionState, ValidationStep};
+pub use crate::tun::TunInterface;
 pub use crate::tunnel::{TunnelHandle, WireGuardHandshaker};
 pub use crate::validator::{ConnectionValidator, ValidationResult};
 

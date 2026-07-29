@@ -5,6 +5,8 @@
 
 use anyhow::Result;
 use base64::Engine as _;
+use miaovps_connect::native::NativeTunnel;
+use miaovps_connect::tun::TunInterface;
 use miaovps_connect::ConnectionValidator;
 use miaovps_core::{DeploymentStep, Device, DeviceType, Server, SshAuthType};
 use miaovps_provisioner::DeploymentOptions;
@@ -12,6 +14,7 @@ use miaovps_storage::Database;
 use miaovps_wireguard_config as wg;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn data_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -344,105 +347,149 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         anyhow::anyhow!("服务器不存在: {}\n运行 'miaovps list-servers' 查看", server_id)
     })?;
 
-    // 生成密钥对
+    // 生成客户端密钥对
     let kp = wg::generate_keypair();
-    let _client_private_key = decode_base64_key(&kp.private_key, "客户端私钥")?;
+    let client_priv = decode_base64_key(&kp.private_key, "客户端私钥")?;
 
-    // 此处应从 Keychain 获取服务器公钥，简化使用配置中的公钥
-    println!("正在连接 {} ({})...\n", server.name, server.host);
+    // 服务器公钥（硬编码，实际应从数据库/Keychain获取）
+    let server_pub_b64 = "fRp9SCOP2pu780jn15LbDFbxPwJJleAjODXjzcOgZFs=";
+    let server_pub = decode_base64_key(server_pub_b64, "服务器公钥")?;
+    let server_addr: SocketAddr = format!("{}:51820", server.host).parse()?;
 
-    // 使用系统 wg-quick 桥接（v0.1 过渡方案）
-    let config_path = format!("/tmp/miaovps-{}.conf", &server_id[..8]);
+    println!("🔗 原生 WireGuard 隧道 — {} ({})", server.name, server.host);
+    println!();
 
-    // 检查是否已有配置文件
-    if std::path::Path::new(&config_path).exists() {
-        println!("发现已有配置，先断开旧连接...");
-        let status = std::process::Command::new("sudo")
-            .args(["wg-quick", "down", &config_path])
-            .output();
-        match status {
-            Ok(o) if o.status.success() => println!("  已断开"),
-            _ => {}
-        }
+    // ── 1. 验证 ──
+    println!("[1/4] 验证链路...");
+    let validator = ConnectionValidator::new(server_addr, client_priv, server_pub);
+    let results = validator.validate_all().await;
+    for r in &results {
+        println!("  {} {}", if r.success { "✅" } else { "❌" }, r.step);
+    }
+    if results.iter().any(|r| !r.success) {
+        anyhow::bail!("验证失败，取消连接");
     }
 
-    // 生成配置文件
-    let config = format!(
-        "[Interface]\n\
-         PrivateKey = {}\n\
-         Address = 10.66.66.2/32\n\
-         DNS = 1.1.1.1\n\
-         MTU = 1380\n\n\
-         [Peer]\n\
-         PublicKey = {}\n\
-         Endpoint = {}:51820\n\
-         AllowedIPs = 10.66.66.1/32\n\
-         PersistentKeepalive = 25\n",
-        kp.private_key,
-        "fRp9SCOP2pu780jn15LbDFbxPwJJleAjODXjzcOgZFs=", // 从数据库获取
-        server.host,
-    );
-    std::fs::write(&config_path, &config)?;
+    // ── 2. 创建 TUN ──
+    println!("[2/4] 创建虚拟网卡...");
+    let tun = TunInterface::create("10.66.66.2", "255.255.255.255")
+        .map_err(|e| anyhow::anyhow!("需要 sudo 权限来创建 TUN 接口: {e}"))?;
+    println!("  接口: {} (IP: 10.66.66.2)", tun.name());
 
-    println!("⚡ 建立 Split Tunnel (仅路由 VPS 流量)...");
-    let output = std::process::Command::new("sudo")
-        .args(["wg-quick", "up", &config_path])
-        .output()
-        .map_err(|e| anyhow::anyhow!("需要 sudo 权限来创建网络接口: {e}"))?;
+    // ── 3. Split Tunnel 路由 ──
+    println!("[3/4] 设置路由 (Split Tunnel)...");
+    let vps_ip = &server.host;
+    let tun_name = tun.name().to_string();
 
-    if output.status.success() {
-        println!("✅ Split Tunnel 已建立");
-        println!();
-        println!("  现在只路由 VPS 流量 (10.66.66.1/32)，本地网络不受影响");
-        println!("  验证: curl ifconfig.me → 应该是你的原始公网 IP");
-        println!();
-        println!("  升级到 Full Tunnel (全局 VPN):");
-        println!("    sudo wg set utun5 peer <server-pub> allowed-ips 0.0.0.0/0");
-        println!();
-        println!("  断开连接: miaovps disconnect");
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("连接失败:\n{}", stderr);
-    }
+    // 获取原始默认网关（VPS IP 需经此网关直连，避免隧道循环）
+    let default_gw = get_default_gateway().unwrap_or_else(|_| "192.168.1.1".to_string());
+
+    // VPS 公网 IP 经原始网关直连（不经过 TUN，防止循环）
+    run_sudo(&["route", "-q", "-n", "add", "-inet", vps_ip, "-gateway", &default_gw])?;
+
+    // VPN 网关路由（VPS 内网网段走 TUN）
+    run_sudo(&["route", "-q", "-n", "add", "-inet", "10.66.66.1/32", "-interface", &tun_name])?;
+    println!("  VPS 直连: {} → {}", vps_ip, default_gw);
+    println!("  VPN 网关: 10.66.66.1/32 → {}", tun_name);
+
+    // ── 4. 启动隧道 ──
+    println!("[4/4] 启动加密隧道...");
+    let tunnel = NativeTunnel::start(tun, client_priv, server_pub, server_addr, 25)?;
+
+    println!();
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  ✅ MiaoVPS 隧道已建立 (Split Tunnel)");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
+    println!("  当前仅路由 VPS 流量，本地网络不受影响。");
+    println!();
+    println!("  升级到 Full Tunnel:");
+    println!("    sudo route -q -n add -inet 0.0.0.0/1 -interface {}", tun_name);
+    println!("    sudo route -q -n add -inet 128.0.0.0/1 -interface {}", tun_name);
+    println!();
+    println!("  验证: curl ifconfig.me");
+    println!("  停止: Ctrl+C");
+
+    // 等待 Ctrl+C
+    tokio::signal::ctrl_c().await?;
+    println!("\n正在关闭...");
+
+    // 清理
+    tunnel.stop();
+    cleanup_routes(vps_ip, &tun_name)?;
+    println!("✅ 已断开");
 
     Ok(())
 }
 
 async fn cmd_disconnect(_args: &[String]) -> Result<()> {
-    let mut disconnected = false;
+    // 查找并清理可能的残留路由
+    println!("清理残留路由...");
+    cleanup_routes("203.0.113.10", "utun5")?;
+    cleanup_routes("203.0.113.10", "utun4")?;
+    cleanup_routes("203.0.113.10", "utun3")?;
+    println!("✅ 清理完成");
+
+    // 同时也清理旧的 wg-quick 配置
     if let Ok(entries) = std::fs::read_dir("/tmp") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("miaovps-") && name.ends_with(".conf") {
                 let path = entry.path();
                 let path_str = path.to_string_lossy().to_string();
-                println!("正在断开 {} ...", path_str);
-                let output = std::process::Command::new("sudo")
+                println!("清理旧配置: {}", path_str);
+                let _ = Command::new("sudo")
                     .args(["wg-quick", "down", &path_str])
                     .output();
-
-                match output {
-                    Ok(o) if o.status.success() => {
-                        println!("  ✅ 已断开");
-                        let _ = std::fs::remove_file(&path);
-                        disconnected = true;
-                    }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        if !stderr.is_empty() {
-                            eprintln!("  {}", stderr.trim());
-                        }
-                    }
-                    Err(e) => eprintln!("  错误: {e}"),
-                }
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
+    Ok(())
+}
 
-    if !disconnected {
-        println!("未找到活跃的 MiaoVPS 连接。");
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  路由管理工具
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+fn run_sudo(args: &[&str]) -> Result<()> {
+    let output = Command::new("sudo").args(args).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // route add 可能因路由已存在而报错，不算致命
+        if !stderr.contains("File exists") {
+            eprintln!("  sudo {} 失败: {}", args.join(" "), stderr.trim());
+        }
     }
     Ok(())
+}
+
+fn cleanup_routes(vps_ip: &str, _tun_name: &str) -> Result<()> {
+    let _ = Command::new("sudo")
+        .args(["route", "-q", "-n", "delete", "-inet", "0.0.0.0/1"])
+        .output();
+    let _ = Command::new("sudo")
+        .args(["route", "-q", "-n", "delete", "-inet", "128.0.0.0/1"])
+        .output();
+    let _ = Command::new("sudo")
+        .args(["route", "-q", "-n", "delete", "-inet", "10.66.66.1/32"])
+        .output();
+    let _ = Command::new("sudo")
+        .args(["route", "-q", "-n", "delete", "-inet", vps_ip])
+        .output();
+    Ok(())
+}
+
+/// 获取当前默认网关 IP
+fn get_default_gateway() -> Result<String> {
+    let output = Command::new("sh")
+        .args(["-c", "route -n get default 2>/dev/null | grep gateway | awk '{print $2}'"])
+        .output()?;
+    let gw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if gw.is_empty() {
+        anyhow::bail!("无法获取默认网关")
+    }
+    Ok(gw)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
