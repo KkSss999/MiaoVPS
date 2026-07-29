@@ -8,6 +8,7 @@ members = [
     "crates/miaovps-tunnel-api",
     "crates/miaovps-telemetry",
     "crates/miaovps-storage",
+    "crates/miaovps-cli",
 ]
 
 [workspace.package]
@@ -23,7 +24,7 @@ thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

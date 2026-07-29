@@ -3,6 +3,8 @@
 //! 管理 servers、devices、deployments 表的迁移和 CRUD 操作。
 //! 敏感凭据不存明文字段，只存 Keychain 引用标识。
 
+pub mod keychain;
+
 use miaovps_core::{Device, DeviceType, Server, ServerStatus};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;

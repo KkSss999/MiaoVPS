@@ -11,4 +11,5 @@ tokio.workspace = true
 sqlx.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 miaovps-core = { path = "../miaovps-core" }
