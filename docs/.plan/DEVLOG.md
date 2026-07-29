@@ -4,26 +4,33 @@
 
 ---
 
+## 2026-07-29（第三次更新）— 第二轮架构完善
+
+### 完成事项
+- [x] 产品定位升级：从"部署器"到"完整 VPN 客户端"
+- [x] 确立三条通道架构：数据平面(WireGuard) + 控制平面(SSH) + 观测平面(WSS/SSH)
+- [x] 新增 3 个模块卡片：tunnel-api、telemetry、agent
+- [x] 大幅更新 platform-tunnel（macOS Network Extension 完整方案）
+- [x] 更新 desktop-ui（新首页设计 + 连接状态机）
+- [x] 新增 4 个决策卡片：three-channel-arch、agent-design、websocket-protocol、version-plan
+- [x] 版本规划统一：v0.1.0 一次性完整开发，不再分 Sprint/Phase
+- [x] 开发顺序确定：后端优先（6 个 Phase, 22 任务）→ 前端后做（4 个 Phase, 20 任务）
+- [x] 卡片总数：41 张
+
+### 当前阶段
+v0.1.0 后端开发 Phase 1 — 基础 crates 🔄
+
+### 下一步
+B1-1: 搭建 Cargo workspace + crates 目录结构
+B1-2: `miaovps-core` 领域模型实现
+
+---
+
 ## 2026-07-29（第二次更新）— PRD 沉淀
 
 ### 完成事项
 - [x] 基于正式 PRD 更新全部 pmem 记忆卡片
-  - 更新 4 个模块卡片（vpn-core 领域模型、server-provisioner 幂等/备份/原子写入、desktop-ui 信息架构、security 安全约束）
-  - 更新 4 个决策卡片（Sprint 计划、技术栈+TanStack Query、错误模型、MVP 截断范围）
-  - 新增 4 个特性卡片（welcome-flow、env-detect、deployment-flow、diagnostics）
-  - 删除 1 个旧特性（one-click-init → 被 deployment-flow 替代）
-  - 重构 4 个任务卡片（P0-P3 → Sprint 0-4，共 55 个任务）
-  - 更新 4 个已有特性（server-add、device-manage、config-export、status-monitor）
-- [x] 卡片总数：32 张（7 modules + 7 decisions + 8 features + 5 tasks + 4 risks + 1 trace）
-- [x] 同步更新 docs/PRD.md、ROADMAP.md、TASKS.md
-
-### 当前阶段
-Sprint 0 — 项目骨架 🔄
-
-### 下一步
-1. `cargo create-tauri-app` 初始化 Tauri 2 项目
-2. 搭建 crates 目录结构
-3. SQLite 迁移框架
+- [x] Sprint 0-4 替代 P0-P3
 
 ---
 
@@ -34,7 +41,6 @@ Sprint 0 — 项目骨架 🔄
 - [x] 确定产品定位
 - [x] 技术栈决策
 - [x] 初始化 Git + pmem 项目记忆
-- [x] 生成完整项目文档
 
 ---
 
