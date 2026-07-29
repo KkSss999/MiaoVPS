@@ -7,6 +7,7 @@ members = [
     "crates/miaovps-provisioner",
     "crates/miaovps-tunnel-api",
     "crates/miaovps-telemetry",
+    "crates/miaovps-storage",
 ]
 
 [workspace.package]
