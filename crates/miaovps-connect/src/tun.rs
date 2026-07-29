@@ -46,6 +46,9 @@ impl TunInterface {
             .map_err(|e| ConnectError::TunError(format!("设置 IP 失败: {e}")))?;
 
         let raw_fd = device.as_raw_fd();
+        device.set_nonblock().map_err(|e| {
+            ConnectError::TunError(format!("设置非阻塞失败: {e}"))
+        })?;
         let (reader, writer) = device.split();
 
         tracing::info!("[TUN] 创建 {} — IP: {}/{}", name, address, netmask);

@@ -3,3 +3,4 @@
 .pmem/pmem.db
 .pmem/pmem.db-shm
 .pmem/pmem.db-wal
+.miaovps-data/

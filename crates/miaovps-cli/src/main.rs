@@ -17,8 +17,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".miaovps")
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let dir = project_root.join(".miaovps-data");
+    std::fs::create_dir_all(&dir).ok();
+    dir
 }
 
 #[tokio::main]
@@ -360,14 +365,19 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     println!();
 
     // ── 1. 验证 ──
-    println!("[1/4] 验证链路...");
-    let validator = ConnectionValidator::new(server_addr, client_priv, server_pub);
-    let results = validator.validate_all().await;
-    for r in &results {
-        println!("  {} {}", if r.success { "✅" } else { "❌" }, r.step);
-    }
-    if results.iter().any(|r| !r.success) {
-        anyhow::bail!("验证失败，取消连接");
+    let skip_validate = args.get(3).map(|s| s.as_str()) == Some("--skip-validate");
+    if !skip_validate {
+        println!("[1/4] 验证链路...");
+        let validator = ConnectionValidator::new(server_addr, client_priv, server_pub);
+        let results = validator.validate_all().await;
+        for r in &results {
+            println!("  {} {}", if r.success { "✅" } else { "❌" }, r.step);
+        }
+        if results.iter().any(|r| !r.success) {
+            anyhow::bail!("验证失败，取消连接。加 --skip-validate 可跳过");
+        }
+    } else {
+        println!("[1/4] ⏭ 跳过验证");
     }
 
     // ── 2. 创建 TUN ──

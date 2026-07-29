@@ -55,6 +55,36 @@ impl NativeTunnel {
             .spawn(move || {
                 tracing::info!("[隧道] 开始运行 → {}", server_addr);
 
+                // 启动握手：用 force_resend 强制发起
+                let mut hs_buf = [0u8; 148];
+                match tunn.format_handshake_initiation(&mut hs_buf[..], true) {
+                    TunnResult::WriteToNetwork(packet) => {
+                        let _ = udp.send(packet);
+                        tracing::info!("[隧道] 握手初始化已发送");
+                        // 等待握手响应
+                        let mut resp = [0u8; 1500];
+                        udp.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                        if let Ok(n) = udp.recv(&mut resp) {
+                            let mut tmp = [0u8; 2048];
+                            match tunn.decapsulate(None, &resp[..n], &mut tmp[..]) {
+                                TunnResult::WriteToNetwork(reply) => {
+                                    let _ = udp.send(reply);
+                                    // 第二次等待确认
+                                    if let Ok(n2) = udp.recv(&mut resp) {
+                                        let _ = tunn.decapsulate(None, &resp[..n2], &mut tmp[..]);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        tracing::info!("[隧道] 握手完成");
+                    }
+                    other => {
+                        tracing::warn!("[隧道] 握手启动异常: {other:?}");
+                    }
+                }
+                udp.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+
                 while running_clone.load(Ordering::Relaxed) {
                     // ── TUN → WG → UDP ──
                     match tun.read_packet() {

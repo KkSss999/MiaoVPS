@@ -43,7 +43,7 @@ impl WireGuardHandshaker {
         }
     }
 
-    /// 尝试一次握手：通过encapsulate触发握手 → 发送 → 等待 Response → decapsulate
+    /// 尝试一次握手：强制发送 Initiation → 等待 Response → decapsulate
     pub async fn try_handshake(&mut self) -> Result<(), String> {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
@@ -53,64 +53,50 @@ impl WireGuardHandshaker {
             .await
             .map_err(|e| format!("无法连接: {e}"))?;
 
-        // Step 1: 用 encapsulate 触发握手（发送一个空的/dummy IP 包）
-        let mut buf = [0u8; 1500];
-        // 构造最小 IPv4 包 (20B header, proto UDP, TTL 64)
-        let dummy_ip: [u8; 20] = [
-            0x45, 0x00, 0x00, 0x14,  // ver=4,ihl=5,tos=0,total_len=20
-            0x00, 0x00, 0x00, 0x00,  // id=0, flags=0, frag=0
-            0x40, 0x11, 0x00, 0x00,  // TTL=64, proto=UDP(17), checksum=0
-            0x0a, 0x42, 0x42, 0x02,  // src=10.66.66.2
-            0x0a, 0x42, 0x42, 0x01,  // dst=10.66.66.1
-        ];
-
-        let result = self.tunn.encapsulate(&dummy_ip, &mut buf[..]);
-        match result {
-            TunnResult::WriteToNetwork(handshake_packet) => {
-                // 握手初始化包
+        // 强制发起握手（force_resend=true 跳过"已在握手"检查）
+        let mut buf = [0u8; 148];
+        match self.tunn.format_handshake_initiation(&mut buf[..], true) {
+            TunnResult::WriteToNetwork(packet) => {
                 socket
-                    .send(handshake_packet)
+                    .send(packet)
                     .await
                     .map_err(|e| format!("发送握手包失败: {e}"))?;
 
-                // 等待握手响应
+                // 等待响应，最多 5 秒
                 let mut recv_buf = [0u8; 1500];
-                let (n, _src) = socket
-                    .recv_from(&mut recv_buf)
-                    .await
-                    .map_err(|e| format!("接收握手响应失败: {e}"))?;
+                let recv_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    socket.recv_from(&mut recv_buf),
+                )
+                .await
+                .map_err(|_| "握手超时".to_string())?
+                .map_err(|e| format!("接收失败: {e}"))?;
 
-                // 处理响应
+                // 解密响应
+                let (n, _src) = recv_result;
                 let mut tmp = [0u8; 1500];
                 match self.tunn.decapsulate(None, &recv_buf[..n], &mut tmp[..]) {
                     TunnResult::Done => Ok(()),
                     TunnResult::WriteToNetwork(reply) => {
                         let _ = socket.send(reply).await;
-                        // 可能还需要再收一次
-                        let mut r2 = [0u8; 1500];
-                        match socket.recv_from(&mut r2).await {
-                            Ok((n2, _)) => {
-                                let mut t2 = [0u8; 1500];
-                                match self.tunn.decapsulate(None, &r2[..n2], &mut t2[..]) {
-                                    TunnResult::Done => Ok(()),
-                                    TunnResult::WriteToNetwork(reply2) => {
-                                        let _ = socket.send(reply2).await;
-                                        Ok(()) // 握手完成
-                                    }
-                                    TunnResult::Err(e) => Err(format!("握手失败: {e:?}")),
-                                    _ => Ok(()), // 握手可能已完成
-                                }
+                        // 等最终确认
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            socket.recv_from(&mut recv_buf),
+                        ).await {
+                            Ok(Ok((n2, _))) => {
+                                let _ = self.tunn.decapsulate(None, &recv_buf[..n2], &mut tmp[..]);
                             }
-                            Err(_) => Ok(()), // 可能不需要更多包
+                            _ => {}
                         }
+                        Ok(())
                     }
-                    TunnResult::Err(e) => Err(format!("握手失败: {e:?}")),
-                    _ => Ok(()), // 握手可能已完成
+                    TunnResult::Err(e) => Err(format!("解密失败: {e:?}")),
+                    _ => Ok(()),
                 }
             }
-            TunnResult::Done => Err("隧道尚未准备好发动握手，请稍后重试".into()),
             TunnResult::Err(e) => Err(format!("握手初始化失败: {e:?}")),
-            other => Err(format!("意外的结果: {other:?}")),
+            other => Err(format!("意外结果: {other:?}")),
         }
     }
 }
