@@ -1,2 +1,5 @@
 /target
 **/.DS_Store
+.pmem/pmem.db
+.pmem/pmem.db-shm
+.pmem/pmem.db-wal
