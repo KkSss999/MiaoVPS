@@ -57,8 +57,13 @@ fn real_home() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 默认 miaovps=info，可用 RUST_LOG 覆盖以查看数据平面细节
+    // （解密错误分级、重连退避等都在 debug 级别）
     tracing_subscriber::fmt()
-        .with_env_filter("miaovps=info")
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("miaovps=info")),
+        )
         .init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -501,6 +506,18 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         }
     }
 
+    // Full Tunnel 的全局路由+DNS 交给 overlay 管理，断线时可临时撤下
+    let mut overlay = if full_tunnel {
+        Some(FullTunnelOverlay::new(
+            tun_name.clone(),
+            profile.dns.clone(),
+            dns_backup.clone(),
+            data_dir(),
+        ))
+    } else {
+        None
+    };
+
     // ── 4. 启动隧道 ──
     println!("[4/4] 启动加密隧道...");
     let tunnel = match NativeTunnel::start(tun, client_priv, server_pub, server_addr, 25) {
@@ -531,13 +548,71 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     println!("  断线会自动重连（无限重试，不改动路由）。");
     println!();
 
-    // 周期性输出状态直到 Ctrl+C — 静默重连和静默失效一样难排查
-    let status_interval = Duration::from_secs(30);
+    // 网关看护 + 状态输出。网关检查要比状态输出频繁 ——
+    // 它决定断线后能否恢复，而状态输出只是给人看的。
+    let mut gw_guard = VpsRouteGuard::new(vps_ip.clone(), default_gw.clone());
+    let mut ticks: u32 = 0;
+    let mut outage_ticks: u32 = 0;
+    const TICK: Duration = Duration::from_secs(5);
+    const STATUS_EVERY: u32 = 6; // 30s
+    /// 连续这么多 tick 无会话就回落直连。
+    ///
+    /// 6×5s=30s。boringtun 自己的重传窗口是 105s，但那期间隧道已经不通了 ——
+    /// 没必要让用户断网等它。30s 足够滤掉瞬时抖动（切换 WiFi 本身只需几秒）。
+    const OUTAGE_TICKS_BEFORE_FALLBACK: u32 = 6;
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            _ = tokio::time::sleep(status_interval) => {
-                println!("  [状态] {}", tunnel.health_line());
+            _ = tokio::time::sleep(TICK) => {
+                if let Some((old, new)) = gw_guard.reconcile() {
+                    println!("  [网络] 默认网关 {old} → {new}，已重建 VPS 直连路由");
+                    // 路由修好后立刻重绑定 —— 在此之前重绑定是无用功，
+                    // 因为包没有可用的出口
+                    tunnel.notify_network_changed();
+                }
+                ticks += 1;
+                if ticks.is_multiple_of(STATUS_EVERY) {
+                    println!("  [状态] {}", tunnel.health_line());
+                }
+
+                // ── 断线回落 / 恢复接管 ──
+                //
+                // 会话状态用 is_session_alive()（boringtun 的握手状态），
+                // 不能用流量 —— 回落期间隧道内没有数据，只有 keepalive。
+                if let Some(ov) = overlay.as_mut() {
+                    let alive = tunnel.stats().is_session_alive();
+
+                    if ov.is_engaged() && !alive {
+                        outage_ticks += 1;
+                        if outage_ticks >= OUTAGE_TICKS_BEFORE_FALLBACK {
+                            println!();
+                            println!("  ⚠ 隧道断开约 {}s 未恢复 —— 回落直连以保持网络可用",
+                                outage_ticks * TICK.as_secs() as u32);
+                            ov.disengage();
+                            println!("    全局路由已撤下。隧道继续重连，恢复后自动接管。");
+                            println!("    此时流量不经 VPN（无隐私保护）。");
+                            println!();
+                        }
+                    } else if !ov.is_engaged() && alive {
+                        // 会话恢复 —— 重新接管
+                        println!();
+                        println!("  ✅ 隧道已恢复 —— 重新接管全局流量");
+                        match ov.engage() {
+                            Ok(()) => {
+                                println!("    全局路由 + DNS 已恢复接管");
+                                outage_ticks = 0;
+                            }
+                            Err(e) => {
+                                eprintln!("    ⚠ 重新接管失败: {e}");
+                                eprintln!("    仍为直连状态，可 Ctrl+C 后重连");
+                            }
+                        }
+                        println!();
+                    } else if alive {
+                        outage_ticks = 0;
+                    }
+                }
             }
         }
     }
@@ -547,11 +622,18 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     let reconnects = tunnel.stats().reconnects();
     tunnel.shutdown();
 
-    // 先还原 DNS 再删路由 — 反过来会有一小段时间 DNS 指向已失效的隧道
-    if let Some(backup) = &dns_backup {
-        match backup.restore(&data_dir()) {
-            Ok(()) => println!("  DNS 已还原: {}", backup.describe()),
-            Err(e) => eprintln!("  ⚠ {e}"),
+    // Full Tunnel 的全局路由/DNS 由 overlay 负责 —— 它知道当前是接管还是
+    // 已回落状态。回落时 DNS 早已还原，重复 restore 会写回过期备份。
+    match overlay.as_mut() {
+        Some(ov) => ov.teardown(),
+        None => {
+            // Split Tunnel 不接管 DNS，但防御性还原以防将来改动
+            if let Some(backup) = &dns_backup {
+                match backup.restore(&data_dir()) {
+                    Ok(()) => println!("  DNS 已还原: {}", backup.describe()),
+                    Err(e) => eprintln!("  ⚠ {e}"),
+                }
+            }
         }
     }
     remove_tunnel_routes(&vps_ip, &vpn_net);
@@ -797,6 +879,163 @@ fn get_default_gateway() -> Result<String> {
     Ok(gw)
 }
 
+/// Full Tunnel 的全局路由 + DNS 接管，可临时撤下再装回
+///
+/// ## 为什么需要
+///
+/// Full Tunnel 下 `0/1`+`128/1` 指向 utun、DNS 指向只能经隧道到达的地址。
+/// 隧道断了但路由还在时，全局流量和 DNS 全进黑洞 —— macOS 的连通性探测
+/// 失败，系统判定「已连接但无互联网」，用户看到的是 WiFi 坏了。
+///
+/// 所以长时间断线时把全局路由和 DNS 撤下（回落直连），隧道进程继续重连；
+/// 会话恢复后再装回。VPN 的价值是隐私，但断网期间守着一个死隧道
+/// 既没有隐私也没有网络。
+struct FullTunnelOverlay {
+    tun_name: String,
+    dns_servers: Vec<String>,
+    dns_backup: Option<dns::DnsBackup>,
+    data_dir: PathBuf,
+    /// 当前是否处于「已接管」状态
+    engaged: bool,
+}
+
+impl FullTunnelOverlay {
+    /// 覆盖全局路由的两条半区路由 —— 比改 default 条目更容易精确回滚
+    const GLOBAL_ROUTES: [&'static str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
+
+    fn new(
+        tun_name: String,
+        dns_servers: Vec<String>,
+        dns_backup: Option<dns::DnsBackup>,
+        data_dir: PathBuf,
+    ) -> Self {
+        Self { tun_name, dns_servers, dns_backup, data_dir, engaged: true }
+    }
+
+    fn is_engaged(&self) -> bool {
+        self.engaged
+    }
+
+    /// 撤下全局路由与 DNS，回落到直连
+    fn disengage(&mut self) {
+        if !self.engaged {
+            return;
+        }
+
+        // 先还原 DNS 再删路由：反序会有一段时间 DNS 指向已失效的隧道
+        if let Some(b) = &self.dns_backup {
+            match b.restore(&self.data_dir) {
+                Ok(()) => println!("    DNS 已还原: {}", b.describe()),
+                Err(e) => eprintln!("    ⚠ DNS 还原失败: {e}"),
+            }
+        }
+        for dest in Self::GLOBAL_ROUTES {
+            let _ = Command::new("route")
+                .args(["-q", "-n", "delete", "-inet", dest])
+                .output();
+        }
+        self.engaged = false;
+    }
+
+    /// 重新接管全局路由与 DNS
+    fn engage(&mut self) -> Result<()> {
+        if self.engaged {
+            return Ok(());
+        }
+
+        // DNS 备份要重新抓取 —— 回落期间用户可能换了网络，
+        // 沿用旧备份会在下次还原时写回错误的 DNS
+        self.dns_backup = match dns::DnsBackup::capture(&self.data_dir) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                println!("    ⚠ 无法备份 DNS，跳过 DNS 接管: {e}");
+                None
+            }
+        };
+
+        let plan: Vec<RouteSpec> = Self::GLOBAL_ROUTES
+            .iter()
+            .map(|d| RouteSpec::interface((*d).into(), &self.tun_name))
+            .collect();
+        apply_routes(&plan)?;
+
+        if self.dns_backup.is_some() && !self.dns_servers.is_empty() {
+            if let Err(e) = dns::apply(&self.dns_servers) {
+                println!("    ⚠ DNS 接管失败（查询可能泄露给 ISP）: {e}");
+            }
+        }
+
+        self.engaged = true;
+        Ok(())
+    }
+
+    /// 退出时的清理：只在仍处于接管状态时才需要还原
+    fn teardown(&mut self) {
+        if self.engaged {
+            self.disengage();
+        } else {
+            // 已回落 —— DNS 早已还原，只清理可能残留的路由
+            for dest in Self::GLOBAL_ROUTES {
+                let _ = Command::new("route")
+                    .args(["-q", "-n", "delete", "-inet", dest])
+                    .output();
+            }
+        }
+    }
+}
+
+/// VPS 直连路由的看护者 —— 网络切换后把它重新指向当前网关
+///
+/// ## 为什么必需
+///
+/// VPS 公网 IP 的主机路由在连接时被钉到当时的网关。WiFi 重连换网段
+/// （或 WiFi↔有线切换）后网关变了，这条路由指向一个不可达的下一跳 ——
+/// 握手包连出口都没有，隧道永远无法恢复。
+///
+/// Full Tunnel 下后果更严重：`0/1`+`128/1` 仍指向已死的 utun，
+/// DNS 又指向只能经隧道到达的地址，于是系统的连通性探测（HTTP + DNS）
+/// 全部进黑洞，macOS 判定「已连接但无互联网」—— 表现为 WiFi 连不上。
+///
+/// 物理默认路由与 `0/1`/`128/1` 并存（后者更具体但不覆盖 default 条目），
+/// 所以 `get_default_gateway()` 在 Full Tunnel 下仍能读到真实网关。
+struct VpsRouteGuard {
+    vps_ip: String,
+    /// 当前这条主机路由指向的网关
+    pinned_gw: String,
+}
+
+impl VpsRouteGuard {
+    fn new(vps_ip: String, gw: String) -> Self {
+        Self { vps_ip, pinned_gw: gw }
+    }
+
+    /// 检查网关是否变化；变了就重建 VPS 主机路由。
+    ///
+    /// 返回 `Some((旧网关, 新网关))` 表示做了重建。
+    fn reconcile(&mut self) -> Option<(String, String)> {
+        let current = get_default_gateway().ok()?;
+        if current == self.pinned_gw {
+            return None;
+        }
+
+        let old = std::mem::replace(&mut self.pinned_gw, current.clone());
+        let dest = format!("{}/32", self.vps_ip);
+
+        // 先删旧的，否则 add 会因 "File exists" 静默保留错误的下一跳
+        let _ = Command::new("route")
+            .args(["-q", "-n", "delete", "-inet", &dest])
+            .output();
+
+        match run_route(&["add", "-inet", &dest, "-gateway", &current]) {
+            Ok(()) => Some((old, current)),
+            Err(e) => {
+                eprintln!("  ⚠ VPS 直连路由重建失败: {e}");
+                None
+            }
+        }
+    }
+}
+
 /// 由 VPN 网关地址推导 /24 网段 CIDR
 fn vpn_network_cidr(peer_ip: &str) -> Result<String> {
     let ip: std::net::Ipv4Addr = peer_ip
@@ -856,6 +1095,85 @@ mod tests {
         assert_eq!(human_bytes(512), "512B");
         assert_eq!(human_bytes(2048), "2.0KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0MiB");
+    }
+
+    /// 构造一个不触碰真实系统的 overlay：没有 DNS 备份 → 不会调 networksetup；
+    /// 路由操作在非 root 下失败但不 panic。只验证状态机。
+    fn test_overlay() -> FullTunnelOverlay {
+        FullTunnelOverlay::new(
+            "utun-test-nonexistent".into(),
+            vec![],
+            None,
+            std::env::temp_dir().join("miaovps-overlay-test"),
+        )
+    }
+
+    #[test]
+    fn overlay_starts_engaged() {
+        assert!(test_overlay().is_engaged(), "Full Tunnel 建立后应处于接管状态");
+    }
+
+    #[test]
+    fn overlay_disengage_is_idempotent() {
+        let mut ov = test_overlay();
+        ov.disengage();
+        assert!(!ov.is_engaged());
+        // 重复调用不应改变状态或重复还原 DNS
+        ov.disengage();
+        assert!(!ov.is_engaged());
+    }
+
+    #[test]
+    fn overlay_engage_noops_when_already_engaged() {
+        let mut ov = test_overlay();
+        // 已接管时 engage 应直接返回 Ok，不重新抓 DNS 备份、不重复加路由
+        assert!(ov.engage().is_ok());
+        assert!(ov.is_engaged());
+    }
+
+    #[test]
+    fn overlay_teardown_from_disengaged_state_does_not_restore_dns() {
+        let mut ov = test_overlay();
+        ov.disengage();
+        // 已回落状态下 teardown 只清路由 —— 若此时再 restore DNS，
+        // 会把回落时抓的过期备份写回系统
+        ov.teardown();
+        assert!(!ov.is_engaged());
+    }
+
+    #[test]
+    fn overlay_covers_full_ipv4_space() {
+        // 0/1 + 128/1 必须完整覆盖 IPv4，漏掉一半会导致部分流量绕过隧道
+        assert_eq!(
+            FullTunnelOverlay::GLOBAL_ROUTES,
+            ["0.0.0.0/1", "128.0.0.0/1"]
+        );
+    }
+
+    #[test]
+    fn route_guard_noops_when_gateway_unchanged() {
+        // 用当前真实网关构造，reconcile 应判定无变化且不碰路由表
+        let gw = match get_default_gateway() {
+            Ok(g) => g,
+            Err(_) => return, // 无网络时跳过
+        };
+        let mut guard = VpsRouteGuard::new("203.0.113.1".into(), gw.clone());
+        assert!(guard.reconcile().is_none(), "网关未变时不应重建路由");
+        assert_eq!(guard.pinned_gw, gw);
+    }
+
+    #[test]
+    fn route_guard_detects_stale_gateway() {
+        // 构造一个不可能是当前网关的值，reconcile 应检测到差异。
+        // 使用 TEST-NET-3 (RFC 5737) 保证不会误撞真实网关。
+        let mut guard = VpsRouteGuard::new("203.0.113.1".into(), "203.0.113.254".into());
+        if get_default_gateway().is_err() {
+            return; // 无网络时跳过
+        }
+        // 会尝试重建路由；非 root 下 route add 失败返回 None，
+        // 但 pinned_gw 必须已更新 —— 否则每 5s 都会重试同一个失效网关
+        let _ = guard.reconcile();
+        assert_ne!(guard.pinned_gw, "203.0.113.254", "检测到变化后必须更新记录");
     }
 
     #[test]

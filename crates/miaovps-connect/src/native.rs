@@ -17,7 +17,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,146 @@ const DECRYPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(5);
 /// 复活尝试的最大间隔 — VPS 长期宕机时避免无意义的高频重试
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// 两次 socket 重绑定的最小间隔 — 防止网络震荡期打转
+const REBIND_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// 出站发送失败的日志抑制间隔 — 断网期间每个积压包都会失败
+const SEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 可重绑定的 UDP 端点
+///
+/// ## 为什么需要重绑定
+///
+/// `UdpSocket::connect()` 会让内核按当时的路由选定源地址并**钉死**它
+/// （`local_addr()` 从 `0.0.0.0:0` 变成具体 IP）。WiFi 重连拿到新 IP、
+/// 或从 WiFi 切到有线后，这个源地址不再存在，`send()` 永久失败 ——
+/// 重连逻辑若一直用同一个 socket 就永远不可能成功。
+///
+/// 所以 socket 必须可替换。三个线程通过 `RwLock` 共享，但都先把
+/// `Arc<UdpSocket>` 克隆出来再做阻塞 I/O，不持锁等待 —— 否则重绑定
+/// 会被入站线程的 500ms 读超时挡住。
+pub struct Endpoint {
+    socket: RwLock<Arc<UdpSocket>>,
+    server_addr: SocketAddr,
+    /// 重绑定次数，用于诊断
+    rebinds: AtomicU64,
+    /// 上次重绑定时刻，用于限流 —— 防止在网络震荡期打转
+    last_rebind: Mutex<Option<Instant>>,
+}
+
+impl Endpoint {
+    fn new(server_addr: SocketAddr) -> Result<Self, ConnectError> {
+        let socket = Self::make_socket(server_addr)?;
+        Ok(Self {
+            socket: RwLock::new(Arc::new(socket)),
+            server_addr,
+            rebinds: AtomicU64::new(0),
+            last_rebind: Mutex::new(None),
+        })
+    }
+
+    fn make_socket(server_addr: SocketAddr) -> Result<UdpSocket, ConnectError> {
+        let s = UdpSocket::bind("0.0.0.0:0").map_err(ConnectError::Io)?;
+        s.connect(server_addr).map_err(ConnectError::Io)?;
+        s.set_read_timeout(Some(UDP_READ_TIMEOUT))
+            .map_err(ConnectError::Io)?;
+        Ok(s)
+    }
+
+    /// 取当前 socket 的快照 — 阻塞 I/O 必须在锁外进行
+    fn current(&self) -> Arc<UdpSocket> {
+        match self.socket.read() {
+            Ok(g) => g.clone(),
+            // 锁中毒时退化为直接取值，避免整条数据路径卡死
+            Err(e) => e.into_inner().clone(),
+        }
+    }
+
+    /// 重新绑定 socket 以适应新的网络环境
+    ///
+    /// 新 socket 会有新的源端口。WireGuard 服务端按公钥识别 peer 并支持
+    /// endpoint 漫游，收到合法握手后会自动把回包地址更新过来。
+    /// 带限流的重绑定。间隔不足 `REBIND_MIN_INTERVAL` 时直接跳过。
+    ///
+    /// 限流是必需的：网络切换瞬间地址可能反复变化，
+    /// 不限流会在震荡期打转（实测一秒 700 次）。
+    pub fn rebind(&self) -> Result<(), ConnectError> {
+        {
+            let mut last = match self.last_rebind.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            if let Some(t) = *last {
+                if t.elapsed() < REBIND_MIN_INTERVAL {
+                    return Ok(()); // 视为成功 —— 当前 socket 还很新
+                }
+            }
+            *last = Some(Instant::now());
+        }
+
+        let fresh = Self::make_socket(self.server_addr)?;
+        let local = fresh.local_addr().ok();
+        match self.socket.write() {
+            Ok(mut g) => *g = Arc::new(fresh),
+            Err(e) => *e.into_inner() = Arc::new(fresh),
+        }
+        let n = self.rebinds.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::debug!(
+            "[隧道] UDP socket 已重绑定 (第 {n} 次) → {}",
+            local.map(|a| a.to_string()).unwrap_or_else(|| "?".into())
+        );
+        Ok(())
+    }
+
+    /// 发送数据。**不会**自动重绑定。
+    ///
+    /// 重绑定的决策权归计时线程（它有退避）。出站数据路径若在这里重绑定，
+    /// 会退化成「每个包一次重绑定」的风暴 —— 断网时 TUN 内积压的每个包
+    /// 都触发一次，实测一秒内 700 次。
+    ///
+    /// 断网期间丢弃出站数据包是正确行为：恢复只依赖握手包发出去，
+    /// 而上层协议（TCP）自己会重传。
+    pub fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.current().send(buf)
+    }
+
+    /// 发送并在必要时重绑定 —— 仅供计时线程的握手路径使用
+    fn send_with_rebind(&self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.current().send(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if is_network_change_error(&e) => {
+                if self.rebind().is_err() {
+                    return Err(e); // 网络完全不可用，保留原始错误
+                }
+                self.current().send(buf)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.current().recv(buf)
+    }
+
+    pub fn rebinds(&self) -> u64 {
+        self.rebinds.load(Ordering::Relaxed)
+    }
+}
+
+/// 判断错误是否源于本机网络环境变化（需要重绑定 socket）
+///
+/// 这些错误意味着 socket 钉死的源地址或路由已失效，重试同一个 socket
+/// 不可能成功；而其他错误（如 UDP 载荷过大）重绑定也无济于事。
+fn is_network_change_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::AddrNotAvailable | ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable
+    ) || matches!(
+        e.raw_os_error(),
+        // macOS: EADDRNOTAVAIL(49) ENETDOWN(50) ENETUNREACH(51) EHOSTUNREACH(65) EHOSTDOWN(64)
+        Some(49) | Some(50) | Some(51) | Some(64) | Some(65)
+    )
+}
 
 /// 隧道流量统计
 #[derive(Debug, Default)]
@@ -69,12 +209,16 @@ pub struct TunnelStats {
     pub rx_bytes: AtomicU64,
     /// 解密错误计数
     pub decrypt_errors: AtomicU64,
+    /// 因网络不可用而丢弃的出站包数
+    pub tx_dropped: AtomicU64,
     /// 重连次数 — boringtun 放弃后我们强制复活的次数
     pub reconnects: AtomicU64,
     /// 最后一次收到任何入站包的时刻（隧道启动后的毫秒数）
     pub last_inbound_ms: AtomicU64,
-    /// 当前是否有活跃会话
+    /// 是否曾成功解出对端包（含 keepalive）
     pub healthy: AtomicBool,
+    /// boringtun 报告的会话是否存活 —— 恢复判定用这个，与流量无关
+    pub session_alive: AtomicBool,
 }
 
 impl TunnelStats {
@@ -95,6 +239,12 @@ impl TunnelStats {
         self.healthy.load(Ordering::Relaxed)
     }
 
+    /// 会话是否存活 —— 由 boringtun 的握手状态判定，不依赖流量。
+    /// fallback 模式下（路由已撤、隧道内无数据）恢复检测只能用这个。
+    pub fn is_session_alive(&self) -> bool {
+        self.session_alive.load(Ordering::Relaxed)
+    }
+
     /// 距上次收到入站包的时长；从未收到过则返回 None
     pub fn since_last_inbound(&self, started_at: Instant) -> Option<Duration> {
         let last = self.last_inbound_ms.load(Ordering::Relaxed);
@@ -112,6 +262,8 @@ pub struct NativeTunnel {
     stats: Arc<TunnelStats>,
     threads: Vec<JoinHandle<()>>,
     started_at: Instant,
+    /// 供状态输出读取重绑定次数
+    udp: Arc<Endpoint>,
 }
 
 impl NativeTunnel {
@@ -130,15 +282,11 @@ impl NativeTunnel {
         let pk: PublicKey = server_public_key.into();
         let tunn = Tunn::new(sk, pk, None, Some(keepalive_secs), 0, None);
 
-        let udp = UdpSocket::bind("0.0.0.0:0").map_err(ConnectError::Io)?;
-        udp.connect(server_addr).map_err(ConnectError::Io)?;
-        udp.set_read_timeout(Some(UDP_READ_TIMEOUT))
-            .map_err(ConnectError::Io)?;
+        let udp = Arc::new(Endpoint::new(server_addr)?);
 
         let running = Arc::new(AtomicBool::new(true));
         let stats = Arc::new(TunnelStats::default());
         let tunn = Arc::new(Mutex::new(tunn));
-        let udp = Arc::new(udp);
         let (tun_rx, tun_tx) = tun.into_split();
         // 所有线程共用同一时间基准，统计才可比
         let started_at = Instant::now();
@@ -156,11 +304,11 @@ impl NativeTunnel {
                 stats.clone(),
                 started_at,
             )?,
-            spawn_timer(tunn, udp, running.clone(), stats.clone(), started_at)?,
+            spawn_timer(tunn, udp.clone(), running.clone(), stats.clone(), started_at)?,
         ];
 
         tracing::info!("[隧道] 已启动 → {}", server_addr);
-        Ok(Self { running, stats, threads, started_at })
+        Ok(Self { running, stats, threads, started_at, udp })
     }
 
     /// 请求停止隧道（非阻塞）
@@ -193,6 +341,17 @@ impl NativeTunnel {
         self.started_at.elapsed()
     }
 
+    /// 通知隧道本机网络环境已变，立即重绑定 socket
+    ///
+    /// 上层修好路由后调用。比等计时线程的退避快得多 —— 实测网络切换后
+    /// 真正让隧道恢复的是路由修复，socket 必须在那之后重绑定才有意义。
+    /// 受 `REBIND_MIN_INTERVAL` 限流保护，可安全频繁调用。
+    pub fn notify_network_changed(&self) {
+        if let Err(e) = self.udp.rebind() {
+            tracing::debug!("[隧道] 网络变更后重绑定失败: {e}");
+        }
+    }
+
     /// 人类可读的当前状态 — 供 CLI 周期性输出
     pub fn health_line(&self) -> String {
         let (tx, rx, errs) = self.stats.snapshot();
@@ -212,6 +371,14 @@ impl NativeTunnel {
         );
         if reconnects > 0 {
             line.push_str(&format!(" · 重连 {reconnects} 次"));
+        }
+        let rebinds = self.udp.rebinds();
+        if rebinds > 0 {
+            line.push_str(&format!(" · 重绑定 {rebinds} 次"));
+        }
+        let dropped = self.stats.tx_dropped.load(Ordering::Relaxed);
+        if dropped > 0 {
+            line.push_str(&format!(" · 丢包 {dropped}"));
         }
         if errs > 0 {
             line.push_str(&format!(" · 解密错误 {errs}"));
@@ -243,7 +410,7 @@ impl Drop for NativeTunnel {
 }
 
 /// 发送握手 Initiation（force_resend 跳过「已在握手中」检查）
-fn send_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<UdpSocket>) {
+fn send_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) {
     let mut buf = [0u8; HANDSHAKE_BUF];
     let packet = {
         let mut t = match tunn.lock() {
@@ -274,7 +441,7 @@ fn send_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<UdpSocket>) {
 fn spawn_outbound(
     mut tun_rx: TunReader,
     tunn: Arc<Mutex<Tunn>>,
-    udp: Arc<UdpSocket>,
+    udp: Arc<Endpoint>,
     running: Arc<AtomicBool>,
     stats: Arc<TunnelStats>,
 ) -> Result<JoinHandle<()>, ConnectError> {
@@ -282,6 +449,8 @@ fn spawn_outbound(
         .name("miaovps-tx".into())
         .spawn(move || {
             let mut encrypted = [0u8; PKT_BUF];
+            let mut last_send_err_log: Option<Instant> = None;
+            let mut dropped_since_log: u64 = 0;
             while running.load(Ordering::Relaxed) {
                 // 先 poll — 空闲时也能周期性复查停止标志，否则 shutdown 会死锁
                 match tun_rx.wait_readable(TUN_POLL_TIMEOUT) {
@@ -330,10 +499,28 @@ fn spawn_outbound(
                 };
 
                 if let Some(p) = outbound {
-                    if let Err(e) = udp.send(&p) {
-                        tracing::error!("[隧道] UDP 发送失败: {e}");
-                    } else {
-                        stats.tx_bytes.fetch_add(plaintext_len, Ordering::Relaxed);
+                    match udp.send(&p) {
+                        Ok(_) => {
+                            stats.tx_bytes.fetch_add(plaintext_len, Ordering::Relaxed);
+                            dropped_since_log = 0;
+                        }
+                        Err(e) => {
+                            // 断网期间 TUN 里每个积压包都会失败 —— 必须抑制，
+                            // 否则日志刷屏（实测一秒数百行）
+                            stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                            dropped_since_log += 1;
+                            let due = last_send_err_log
+                                .map(|t: Instant| t.elapsed() >= SEND_ERROR_LOG_INTERVAL)
+                                .unwrap_or(true);
+                            if due {
+                                last_send_err_log = Some(Instant::now());
+                                tracing::warn!(
+                                    "[隧道] 出站发送失败: {e}（已丢弃 {dropped_since_log} 个包，\
+                                     等待重连）"
+                                );
+                                dropped_since_log = 0;
+                            }
+                        }
                     }
                 }
             }
@@ -349,7 +536,7 @@ fn spawn_outbound(
 fn spawn_inbound(
     mut tun_tx: TunWriter,
     tunn: Arc<Mutex<Tunn>>,
-    udp: Arc<UdpSocket>,
+    udp: Arc<Endpoint>,
     running: Arc<AtomicBool>,
     stats: Arc<TunnelStats>,
     started_at: Instant,
@@ -398,12 +585,14 @@ fn spawn_inbound(
                     };
                     match t.decapsulate(None, &udp_buf[..n], &mut decrypted[..]) {
                         TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
-                            // 能解出明文说明会话已建立
-                            if !stats.healthy.swap(true, Ordering::Relaxed) {
-                                tracing::info!("[隧道] 会话已建立，链路正常");
-                            }
+                            mark_healthy(&stats);
                             to_tun = Some(p.to_vec());
                         }
+                        // 空载荷 keepalive 走这里（validate_decapsulated_packet 对
+                        // len==0 返回 Done）。它同样证明会话存活 —— 且在
+                        // fallback 模式下路由已撤、隧道内没有数据流量时，
+                        // keepalive 是**唯一**的存活信号，必须计入。
+                        TunnResult::Done => mark_healthy(&stats),
                         TunnResult::WriteToNetwork(p) => {
                             to_net.push(p.to_vec());
                             // boringtun 约定：用空输入反复调用以排空待发队列。
@@ -426,7 +615,6 @@ fn spawn_inbound(
                                 &mut last_decrypt_log,
                             );
                         }
-                        TunnResult::Done => {}
                     }
                 }
 
@@ -447,6 +635,13 @@ fn spawn_inbound(
             tracing::debug!("[隧道] 入站线程退出");
         })
         .map_err(|e| ConnectError::TunError(format!("无法启动入站线程: {e}")))
+}
+
+/// 标记会话存活，仅在状态翻转时记日志
+fn mark_healthy(stats: &Arc<TunnelStats>) {
+    if !stats.healthy.swap(true, Ordering::Relaxed) {
+        tracing::info!("[隧道] 会话已建立，链路正常");
+    }
 }
 
 /// 按「瞬态 vs 持续」分级记录解密错误
@@ -503,7 +698,7 @@ fn log_decrypt_error(
 /// 与 WireGuard 本身的语义一致：链路恢复即自动可用。
 fn spawn_timer(
     tunn: Arc<Mutex<Tunn>>,
-    udp: Arc<UdpSocket>,
+    udp: Arc<Endpoint>,
     running: Arc<AtomicBool>,
     stats: Arc<TunnelStats>,
     started_at: Instant,
@@ -523,6 +718,13 @@ fn spawn_timer(
                         Ok(t) => t,
                         Err(_) => break,
                     };
+
+                    // boringtun 的权威会话状态：time_since_last_handshake()
+                    // 返回 Some 即会话已建立。这与「有无流量」无关 ——
+                    // fallback 模式下路由已撤、隧道内无数据，只能靠这个判断恢复。
+                    let alive = t.stats().0.is_some();
+                    stats.session_alive.store(alive, Ordering::Relaxed);
+
                     match t.update_timers(&mut buf[..]) {
                         TunnResult::WriteToNetwork(p) => TimerOutcome::Send(p.to_vec()),
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
@@ -538,8 +740,9 @@ fn spawn_timer(
                         // 有包可发说明会话在正常推进，重置退避
                         backoff = RECONNECT_BACKOFF_MIN;
                         next_revive = None;
-                        if let Err(e) = udp.send(&p) {
-                            tracing::error!("[隧道] 保活/握手发送失败: {e}");
+                        if let Err(e) = udp.send_with_rebind(&p) {
+                            // 断网期间这条每 250ms 会触发一次，降为 debug
+                            tracing::debug!("[隧道] 保活/握手发送失败: {e}");
                         }
                     }
                     TimerOutcome::Idle => {
@@ -551,6 +754,7 @@ fn spawn_timer(
                     }
                     TimerOutcome::Expired => {
                         stats.healthy.store(false, Ordering::Relaxed);
+                        stats.session_alive.store(false, Ordering::Relaxed);
 
                         // 首次进入 expired 立即复活，后续按退避
                         let due = next_revive.map(|t| Instant::now() >= t).unwrap_or(true);
@@ -605,7 +809,17 @@ enum TimerOutcome {
 /// 强制发起新握手以复活 expired 的 `Tunn`
 ///
 /// 返回是否成功发出握手包。
-fn revive_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<UdpSocket>) -> bool {
+///
+/// 进入这里说明连接已确认死亡，所以**无条件重绑定 socket**：
+/// 网络切换后源地址可能仍然存在（同一 WiFi 重连拿回同一 IP）但路由已变，
+/// 此时 `send()` 不报错却发不出去 —— 靠错误码触发重绑定会漏掉这种情况。
+fn revive_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) -> bool {
+    if let Err(e) = udp.rebind() {
+        // 网络完全不可用时绑定会失败，等下次退避重试
+        tracing::debug!("[隧道] 重绑定失败（网络不可用?）: {e}");
+        return false;
+    }
+
     let mut buf = [0u8; HANDSHAKE_BUF];
     let packet = {
         let mut t = match tunn.lock() {
@@ -694,6 +908,66 @@ mod tests {
         stats.decrypt_errors.store(3, Ordering::Relaxed);
 
         assert_eq!(stats.snapshot(), (100, 200, 3));
+    }
+
+    #[test]
+    fn detects_errors_that_require_rebind() {
+        use std::io::{Error, ErrorKind};
+
+        // macOS 网络环境变化的 errno — 必须重绑定
+        for code in [49, 50, 51, 64, 65] {
+            assert!(
+                is_network_change_error(&Error::from_raw_os_error(code)),
+                "errno {code} 应触发重绑定"
+            );
+        }
+        assert!(is_network_change_error(&Error::from(ErrorKind::AddrNotAvailable)));
+
+        // 与本机地址无关的错误 — 重绑定无济于事，不该重绑
+        assert!(!is_network_change_error(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!is_network_change_error(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_network_change_error(&Error::from(ErrorKind::TimedOut)));
+        // EMSGSIZE(40): 载荷过大，换 socket 也一样失败
+        assert!(!is_network_change_error(&Error::from_raw_os_error(40)));
+    }
+
+    #[test]
+    fn endpoint_rebind_produces_new_source_port() {
+        let addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let ep = Endpoint::new(addr).expect("绑定本地回环应成功");
+
+        let before = ep.current().local_addr().unwrap();
+        assert_eq!(ep.rebinds(), 0);
+
+        ep.rebind().expect("重绑定应成功");
+        let after = ep.current().local_addr().unwrap();
+
+        assert_eq!(ep.rebinds(), 1);
+        assert_ne!(before.port(), after.port(), "重绑定应得到新源端口");
+    }
+
+    /// 限流是防日志风暴/CPU 打转的关键 —— 曾实测一秒 700 次重绑定
+    #[test]
+    fn rebind_is_rate_limited() {
+        let addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let ep = Endpoint::new(addr).unwrap();
+
+        // 连续 50 次调用，限流应让实际重绑定只发生 1 次
+        for _ in 0..50 {
+            ep.rebind().expect("限流跳过也应返回 Ok");
+        }
+        assert_eq!(ep.rebinds(), 1, "限流窗口内应只重绑定一次");
+    }
+
+    /// 出站 send 绝不能自己重绑定 —— 否则退化成每包一次
+    #[test]
+    fn plain_send_never_rebinds() {
+        let addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        let ep = Endpoint::new(addr).unwrap();
+
+        // 回环上发送会成功；关键是断言计数不变
+        let _ = ep.send(b"probe");
+        assert_eq!(ep.rebinds(), 0, "数据路径的 send 不应触发重绑定");
     }
 
     #[test]
