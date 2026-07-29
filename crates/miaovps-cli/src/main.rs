@@ -18,6 +18,7 @@ use profile::{decode_key, derive_public_key, ConnectionProfile};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 /// 数据目录 — 数据库和连接配置的存放位置
 ///
@@ -527,11 +528,23 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     }
     println!("  停止:        Ctrl+C");
     println!();
+    println!("  断线会自动重连（无限重试，不改动路由）。");
+    println!();
 
-    tokio::signal::ctrl_c().await?;
+    // 周期性输出状态直到 Ctrl+C — 静默重连和静默失效一样难排查
+    let status_interval = Duration::from_secs(30);
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(status_interval) => {
+                println!("  [状态] {}", tunnel.health_line());
+            }
+        }
+    }
     println!("\n正在关闭...");
 
     let (tx, rx, errs) = tunnel.stats().snapshot();
+    let reconnects = tunnel.stats().reconnects();
     tunnel.shutdown();
 
     // 先还原 DNS 再删路由 — 反过来会有一小段时间 DNS 指向已失效的隧道
@@ -543,9 +556,10 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     }
     remove_tunnel_routes(&vps_ip, &vpn_net);
 
-    println!("  流量: ↑{} ↓{}{}",
+    println!("  流量: ↑{} ↓{}{}{}",
         human_bytes(tx),
         human_bytes(rx),
+        if reconnects > 0 { format!("  重连: {reconnects} 次") } else { String::new() },
         if errs > 0 { format!("  解密错误: {errs}") } else { String::new() });
     println!("✅ 已断开");
 

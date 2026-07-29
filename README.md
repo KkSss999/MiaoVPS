@@ -22,7 +22,7 @@
 │  │              │  │  ├─ Provisioner  SSH 部署     │ │
 │  │  · 服务器列表 │  │  ├─ Connect      连接管理     │ │
 │  │  · 一键部署   │  │  │   ├─ Validator 分步验证   │ │
-│  │  · 连接/断开  │  │  │   └─ Tunnel    boringtun  │ │
+│  │  · 连接/断开  │  │  │   └─ Native    三线程隧道  │ │
 │  │  · 实时状态   │  │  ├─ Telemetry    实时遥测    │ │
 │  │              │  │  └─ Storage      SQLite+密钥  │ │
 │  └──────────────┘  └──────────────────────────────┘ │
@@ -58,21 +58,32 @@ Full Tunnel (全局流量走 VPN)
 ## 开发进度
 
 ```
-v0.1.0 后端 ✅  v0.1.0 macOS 隧道 ⬜  v0.1.0 前端 ⬜
+v0.1.0 后端 ✅  macOS 隧道 ✅  前端 ⬜
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ miaovps-core            322行  领域模型
-✅ miaovps-wireguard-config 363行 密钥·配置·二维码
-✅ miaovps-tunnel-api       191行 平台隧道抽象
-✅ miaovps-ssh              139行 russh SSH
-✅ miaovps-provisioner      715行 环境检测·部署·回滚
-✅ miaovps-telemetry        202行 WSS 客户端
-✅ miaovps-storage          627行 SQLite + Keychain
-✅ miaovps-connect          634行 状态机·验证器·boringtun 隧道
-✅ miaovps-cli              439行 12 命令 (含 validate/connect/disconnect)
-✅ 端到端验证                VPS WG 握手 575ms ✅
+✅ miaovps-core             领域模型
+✅ miaovps-wireguard-config 密钥·配置·二维码
+✅ miaovps-tunnel-api       平台隧道抽象
+✅ miaovps-ssh              russh SSH
+✅ miaovps-provisioner      环境检测·部署·回滚
+✅ miaovps-telemetry        WSS 客户端
+✅ miaovps-storage          SQLite + Keychain
+✅ miaovps-connect          三线程数据平面·验证器·断线重连
+✅ miaovps-cli              14 命令 (含 profile/connect --full)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   总计: 3999 行 · 21 tests · 0 warnings
+   ~4900 行 · 45 tests · 0 warnings
 ```
+
+### 真机验证状态 (VPS 新加坡, RTT 275ms)
+
+| 能力 | 状态 |
+|------|------|
+| WireGuard 握手 | ✅ 194ms |
+| Split Tunnel | ✅ ping 50/50 零丢包 |
+| Full Tunnel | ✅ 出口 IP = VPS |
+| DNS 接管 / 还原 | ✅ 无泄露，退出正确还原 |
+| MTU 1380 生效 | ✅ 1352B 通过 / 1400B+DF 失败 |
+| 吞吐 | ✅ UDP 176 Mbps · TCP 稳态 ~79 Mbps |
+| **断线自动重连** | ⬜ **代码完成，待真机验证** |
 
 ## 项目结构
 
@@ -87,10 +98,11 @@ MiaoVPS/
 │   ├── miaovps-telemetry/         实时遥测 (WSS)
 │   ├── miaovps-storage/           SQLite + Keychain
 │   ├── miaovps-connect/           连接管理 (boringtun + 分步验证)
-│   └── miaovps-cli/               命令行工具 (12 命令)
+│   └── miaovps-cli/               命令行工具 (14 命令)
 ├── native/macos/                  macOS Network Extension (待)
 ├── scripts/
-│   └── bootstrap-server.sh        手动部署脚本
+│   ├── bootstrap-server.sh        手动部署脚本
+│   └── test-reconnect.sh          断线重连验证
 └── docs/                          项目文档
 ```
 
@@ -133,6 +145,27 @@ sudo miaovps disconnect
 验证连通性：Split Tunnel 下 `ping 10.66.66.1`；Full Tunnel 下
 `curl ifconfig.me` 应返回 VPS 的公网 IP。
 
+### 断线重连
+
+隧道运行期间每 30 秒输出一行状态。断线后自动重连，无限重试、不改动路由 ——
+链路恢复即自动可用，与 WireGuard 本身语义一致。
+
+时序分工（这决定了怎么测才有意义）：
+
+| 阶段 | 耗时 | 负责方 |
+|------|------|--------|
+| 对端静默 → 触发新握手 | 15s | boringtun |
+| 握手重传（每 5s） | 90s | boringtun |
+| → `ConnectionExpired` | 累计 ~105s | — |
+| 强制复活 + 无限重试（退避 5s→60s） | 之后 | MiaoVPS |
+
+短于 105s 的中断由 boringtun 自行恢复；超过则由 MiaoVPS 接手。
+验证脚本（需先启动隧道，建议用 Split Tunnel 以免影响正常上网）：
+
+```bash
+bash scripts/test-reconnect.sh    # 在 VPS 侧阻断 UDP 51820 共 130s
+```
+
 ### 开发
 
 ```bash
@@ -163,6 +196,7 @@ cargo run -p miaovps-cli -- help  # CLI 帮助
 ## 产品原则
 
 - **安全连接** — 分步验证，失败不切路由；路由分步应用，任一步失败即回滚
+- **断线自愈** — 无限重试重连，退避 5s→60s，全程不改动路由
 - **本地优先** — 所有数据存本地 SQLite + Keychain
 - **密钥私有** — 私钥永不离开客户端
 - **不泄露 DNS** — Full Tunnel 接管 DNS 并在退出时还原（含崩溃后恢复）
