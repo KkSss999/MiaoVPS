@@ -1,195 +1,160 @@
-# MiaoVPS PRD
+# MiaoVPS 产品需求文档 PRD
 
-> 版本：v0.1.0 | 2026-07-29 | Phase 0
-
----
-
-## Problem Statement
-
-想自建 VPN 的人通常卡在几个环节：不会在 Linux 上配置 WireGuard、不知道密钥怎么生成和分发、每加一台设备都要手动编辑配置文件、连不上也不知道哪里出了问题。现有的 VPN 客户端要么绑定商业服务，要么只管连接不管部署。
-
-用户真正需要的是一个**从购买 VPS 到所有设备连上 VPN，中间每一步都有人帮他搞定的工具**。
-
-## Solution
-
-MiaoVPS —— 私人 VPN 节点部署器 + 设备配置管理器。
-
-桌面端通过 SSH 直连 VPS，一键完成 WireGuard 的安装、配置和防火墙设置。用户在界面上添加设备，桌面端自动生成密钥、分配 IP、导出配置。全程私钥不离开客户端，不需要注册任何账户。
+**文档版本：** v0.1  
+**产品阶段：** MVP  
+**技术基线：** Tauri 2 + Rust + React/TypeScript  
+**首发平台：** macOS  
+**后续平台：** Windows、Linux  
+**核心协议：** WireGuard  
+**产品定位：** 将用户购买的普通 VPS，一键转换为可管理的私人 VPN 节点
 
 ---
 
-## User Stories
+## 1. 产品概述
 
-### P0 — 端到端验证
+### 1.1 产品名称
 
-1. 作为用户，我希望跟着文档手动完成一次 VPS 部署和客户端连接，验证整个链路可行。
-2. 作为用户，我希望用 macOS 官方 WireGuard 客户端连接自己的 VPS，确认握手成功。
-3. 作为用户，我希望确认连接后公网出口 IP 变成 VPS 的 IP。
+**MiaoVPS**
 
-### P1 — 桌面端部署器
+> 买一台 VPS，建立自己的私人网络。
 
-4. 作为用户，我希望输入 VPS 的 IP、SSH 端口、用户名和私钥，将服务器添加到管理列表。
-5. 作为用户，我希望点击一个按钮，桌面端自动 SSH 到 VPS 完成 WireGuard 的全部安装和配置。
-6. 作为用户，我希望在初始化过程中看到实时进度回显，知道每一步在做什么。
-7. 作为用户，我希望为 VPN 添加新设备，客户端本地生成密钥，只把公钥传到服务器。
-8. 作为用户，我希望一键导出设备的 WireGuard 配置文件 (.conf)。
-9. 作为用户，我希望看到配置文件的二维码，方便手机扫描导入。
-10. 作为用户，我希望点击按钮直接在系统 WireGuard 客户端中打开配置。
-11. 作为用户，我希望查看服务器是否在线、WireGuard 服务是否运行。
-12. 作为用户，我希望看到每台设备的最近握手时间和流量统计。
-13. 作为用户，我希望查看当前 VPN 连接的公网出口 IP 和延迟。
-14. 作为用户，我希望启用/禁用某台设备，或将其从 VPN 中移除。
-15. 作为用户，我希望从管理列表中删除一台不再使用的 VPS。
+> Turn your VPS into a private network in minutes.
 
-### P2 — macOS 一键连接
+### 1.2 产品定义
 
-16. 作为 macOS 用户，我希望在 MiaoVPS 里一键连接 VPN，不需要打开官方客户端。
-17. 作为 macOS 用户，我希望 VPN 连接状态实时同步到桌面端界面。
-18. 作为 macOS 用户，我希望断开 VPN 后流量恢复正常网络出口。
+MiaoVPS 是一款本地优先的桌面端 VPS 私人网络管理工具。
 
-### P3 — 产品化
+用户只需要提供：VPS 公网 IP、SSH 用户名、SSH 密码或私钥、SSH 端口。
 
-19. 作为用户，我希望管理多台 VPS 节点，在不同地区切换。
-20. 作为用户，我希望自动选择延迟最低的节点连接。
-21. 作为用户，我希望节点故障时自动切换到备用节点。
-22. 作为用户，我希望 VPN 断开时自动阻断所有流量（Kill Switch）。
-23. 作为用户，我希望指定哪些流量走 VPN、哪些走本地（Split Tunnel）。
-24. 作为用户，我希望设定流量额度并收到告警。
-25. 作为用户，我希望系统启动后自动连接 VPN。
-26. 作为用户，我希望断线后自动重连。
+MiaoVPS 自动完成：检测服务器 → 安装 WireGuard → 配置服务器网络 → 创建本机设备 → 生成 VPN 配置 → 验证连接 → 持续监测节点状态。
+
+产品不自建中心化 VPN 网络，不销售共享节点，也不要求用户将流量交给 MiaoVPS 的服务。
+
+### 1.3 当前产品边界
+
+MiaoVPS 当前不是：通用 VPS 运维面板、云服务器销售平台、公共 VPN 节点服务、多租户企业网络平台、自研 VPN 协议、服务器代理程序。
+
+MVP 聚焦一件事：**让普通用户在自己的 VPS 上快速建立并管理 WireGuard 私人网络。**
 
 ---
 
-## Implementation Decisions
+## 2. 背景与问题
 
-### 架构决策
+用户购买 VPS 后建立私人 VPN 需自行完成：SSH 登录、安装 WireGuard、生成密钥、分配虚拟 IP、开启内核转发、配置 NAT、配置防火墙、开放云安全组、创建客户端配置、传输配置文件、排查无法握手或无法联网。
 
-1. **Tauri 2 + React** — 轻量桌面框架，Rust 核心处理系统级操作
-2. **russh 纯 Rust SSH** — 无 C 依赖，交叉编译简单
-3. **分阶段交付** — P0 先验证链路，P1 出可用产品，P2 做隧道集成
-4. **不自己写 WireGuard 协议** — 使用官方实现，安全可靠
+主要问题不是 WireGuard 本身复杂，而是整个部署链条跨越了 Linux 系统管理、网络路由、防火墙、密钥管理、SSH、客户端配置和故障诊断。
 
-### 核心模块设计
-
-#### M1 — vpn-core（领域模型）
-- **职责**：VpnServer、VpnDevice、TunnelStatus 等核心数据结构
-- **技术**：Rust + serde
-- **接口**：纯数据结构 + 基础方法
-
-#### M2 — wg-config（配置生成）
-- **职责**：WireGuard 密钥对生成、服务端/客户端配置生成
-- **技术**：x25519-dalek、base64
-- **接口**：`generate_keypair()`, `generate_server_config()`, `generate_client_config()`
-
-#### M3 — server-provisioner（服务器部署）
-- **职责**：SSH 连接、OS 检测、WireGuard 安装、Peer 管理
-- **技术**：russh + tokio
-- **接口**：`ServerProvisioner` trait（inspect/install/add_peer/remove_peer/status）
-
-#### M4 — storage（本地存储）
-- **职责**：SQLite 数据持久化 + Keychain 密钥管理
-- **技术**：sqlx + keyring-rs
-- **接口**：CRUD for servers/devices/configs/tunnels
-
-#### M5 — security（安全模块）
-- **职责**：密钥生成、加密存储、内存安全释放
-- **技术**：ring、zeroize、keyring-rs
-- **原则**：私钥不出客户端
-
-#### M6 — desktop-ui（桌面界面）
-- **职责**：服务器管理、设备配置、状态监控的 UI
-- **技术**：React + Tailwind CSS + shadcn/ui + Zustand
-- **Tauri Commands**：add_server, init_server, add_device, export_config, get_status
-
-#### M7 — platform-tunnel（平台隧道·P2）
-- **职责**：跨平台 VPN 隧道抽象
-- **技术**：平台原生 FFI 绑定
-- **接口**：`TunnelBackend` trait（install/connect/disconnect/status）
-
-### 状态管理
-
-- **Zustand store**: `serverStore`、`deviceStore`、`configStore`、`statusStore`
-- **持久化**：关键状态同步 SQLite，UI 状态存内存
-
-### 性能优化
-
-1. SSH 连接复用，避免重复握手
-2. 状态监控增量刷新（仅更新变化字段）
-3. SQLite WAL 模式提升并发读
-
-### 数据流
-
-```
-用户操作 → React UI → Zustand Action
-                         ↓
-                   Tauri invoke()
-                         ↓
-                   Rust Command
-                         ↓
-              ┌──────────┼──────────┐
-              ↓          ↓          ↓
-        provisioner   storage   wg-config
-        (SSH→VPS)    (SQLite)  (生成配置)
-```
+MiaoVPS 的核心价值是把这些步骤压缩成一条可观察、可回滚的自动化流程。
 
 ---
 
-## Testing Decisions
+## 3. 产品目标
 
-### 测试原则
+### 3.1 MVP 核心目标
 
-- Rust crate 单元测试覆盖率 > 80%
-- 核心模块（provisioner、security）必须有测试
-- UI 组件用手动测试 + 未来补充 Playwright E2E
+用户在拿到一台全新的 Ubuntu VPS 后，**5 分钟内**完成私人 VPN 部署。
 
-### 测试策略
+MVP 必须完成：
+1. 添加 VPS
+2. 验证 SSH 连接
+3. 自动检测服务器环境
+4. 一键安装并配置 WireGuard
+5. 创建第一台客户端设备
+6. 导出 WireGuard 配置
+7. 展示二维码
+8. 检测服务器及 WireGuard 状态
+9. 添加、禁用和删除设备
+10. 提供基础故障诊断
 
-| 模块 | 测试类型 | 工具 |
-|------|----------|------|
-| vpn-core | 单元测试 | `cargo test` |
-| wg-config | 单元测试 + 配置解析测试 | `cargo test` |
-| server-provisioner | 集成测试（需测试 VPS） | `cargo test` + Docker |
-| storage | 单元测试 (SQLite in-memory) | `cargo test` |
-| security | 单元测试 | `cargo test` |
-| desktop-ui | 手动测试 + 未来 E2E | Playwright |
+### 3.2 成功指标
+
+| 指标 | 目标 |
+|------|------|
+| 首次部署成功率 | ≥ 90% |
+| 标准 Ubuntu 部署时间 | ≤ 5 分钟 |
+| 从打开应用到生成客户端配置 | ≤ 8 分钟 |
+| 非代码操作占比 | 100%（用户无需手动编辑配置） |
+| 添加第二台设备 | ≤ 30 秒 |
+| 节点状态检测 | ≤ 10 秒 |
+| 敏感凭据 | 默认不以明文保存 |
 
 ---
 
-## Out of Scope
+## 4. 目标用户
 
-1. **用户账户系统** — 本地优先，不需要注册登录
-2. **云同步** — 配置导出即可，不做自动跨设备同步
-3. **订阅/付费** — 免费开源工具
-4. **iOS/Android 客户端** — 首版只做桌面端，移动端用户用官方 WireGuard
-5. **WireGuard 协议自实现** — 使用官方实现
-6. **代理/翻墙功能** — 定位是私人 VPN，不是代理工具
-7. **多用户管理** — 单用户场景
+具备 VPS 但不想手动维护 WireGuard 的个人用户：开发者、独立开发者、小团队负责人、远程办公用户、需访问私有服务的用户、重视网络控制权和密钥隐私的用户。
+
+用户能力假设：知道 VPS 是什么、公网 IP 在哪查看、SSH 用户名是什么、如何获得服务器密码或私钥。
+
+用户不需要知道：iptables、nftables、sysctl、WireGuard Peer 结构、CIDR 地址分配、NAT 和 IP Forward、systemd 服务管理。
 
 ---
 
-## Further Notes
+## 5. 产品原则
 
-### 项目开发阶段
+### 5.1 本地优先
+配置、节点资料和设备记录默认只保存在本机。MVP 不要求注册账户、登录云端、上传服务器凭据、上传 WireGuard 私钥。
 
-| 阶段 | 内容 | 优先级 | 状态 |
-|------|------|--------|------|
-| Phase 0 | 手动跑通 WireGuard 端到端连接 | P0 | 🔄 进行中 |
-| Phase 1 | 桌面端部署器（服务器+设备管理+导出） | P1 | ⬜ 待启动 |
-| Phase 2 | macOS 一键连接（系统隧道集成） | P2 | ⬜ 待启动 |
-| Phase 3 | 产品化（多节点/Kill Switch/Split Tunnel） | P3 | ⬜ 待启动 |
+### 5.2 无服务器 Agent
+通过 SSH 完成部署和管理，不在 VPS 上安装自定义 Agent。服务器只运行标准组件：WireGuard、systemd、iptables/nftables、Linux 网络栈。
 
-### 关键技术风险
+### 5.3 密钥归用户所有
+服务端私钥只保存在 VPS。客户端私钥优先在本机生成。上传到 VPS 的只有客户端公钥。私钥不写入应用日志。导出配置时明确提示包含敏感密钥。
 
-| 风险 | 等级 | 应对 |
-|------|------|------|
-| macOS Network Extension 权限 | 高 | P1 不依赖，P2 提前申请 Developer 账号 |
-| SSH 私钥安全 | 严重 | Keychain 存储 + zeroize + 审计 |
-| 跨平台 SSH 兼容性 | 中 | 多发行版测试 + 容错脚本 |
-| Tauri 打包分发 | 中 | 研究最佳实践，先 dev 模式开发 |
+### 5.4 不重写 WireGuard
+MiaoVPS 不实现新的 VPN 协议，不自行设计密码学方案。
 
-### 后期扩展方向
+---
 
-- 手机端管理 App（先用官方 WireGuard 客户端过渡）
-- 可选局域网穿透 (Tailscale-like mesh)
-- 配置分享（一键帮朋友部署）
-- Docker 容器化部署
+## 6. 版本规划
+
+| 版本 | 目标 | 关键交付 |
+|------|------|----------|
+| v0.1 | VPS 部署与配置管理器 | 添加VPS、SSH连接、一键部署、设备管理、配置导出、状态监控 |
+| v0.2 | macOS 原生连接 | Tauri→Swift Bridge→WireGuardKit→Network Extension，应用内连接/断开 |
+| v0.3 | 多节点与 Windows | Windows 客户端、多节点、测速、故障切换、配置迁移 |
+| v1.0 | 私人网络管理平台 | 分流规则、Kill Switch、DNS策略、Site-to-Site、团队设备邀请 |
+
+**v0.1 截断决策：不做应用内"连接 VPN"**。做到"一键部署服务器 → 一键创建设备 → 一键导出配置 → 一键打开 WireGuard"。
+
+---
+
+## 7. 开发阶段（Sprint 0-4）
+
+| Sprint | 目标 | 核心交付 |
+|--------|------|----------|
+| Sprint 0 | 项目骨架 | Tauri 2 可运行、SQLite迁移、基础路由、错误模型、日志脱敏框架 |
+| Sprint 1 | SSH 与服务器检测 | 添加VPS、SSH登录、Host Key确认、OS检测、11项环境检测 |
+| Sprint 2 | 部署 WireGuard | 部署状态机、备份、安装、配置、转发NAT、启动、回滚 |
+| Sprint 3 | 设备管理 | 创建Peer、分配IP、配置生成、二维码、导出.conf、禁用/删除 |
+| Sprint 4 | 诊断与打磨 | 自动诊断+修复、状态首页、macOS打包、更新机制、MVP发布 |
+
+---
+
+## 8. 核心功能清单
+
+### P0 必须实现（20 项）
+
+F-001 创建本地项目数据 · F-002 添加 VPS · F-003 SSH 密码登录 · F-004 SSH 私钥登录 · F-005 SSH 连接测试 · F-006 Ubuntu 环境检测 · F-007 自动安装 WireGuard · F-008 自动配置 IPv4 Forward · F-009 自动配置 NAT · F-010 自动配置系统防火墙 · F-011 启动并启用 wg0 · F-012 创建客户端设备 · F-013 导出 WireGuard 配置 · F-014 生成二维码 · F-015 查看节点状态 · F-016 查看最近握手和流量 · F-017 禁用和删除设备 · F-018 部署失败回滚 · F-019 诊断报告 · F-020 敏感信息脱敏日志
+
+### P1 应该实现（10 项）
+
+F-101 导入已有 WireGuard 节点 · F-102 修改默认 DNS · F-103 修改 MTU · F-104 自定义 VPN 子网 · F-105 自定义端口 · F-106 多节点管理 · F-107 节点延迟测试 · F-108 配置备份和恢复 · F-109 SSH Agent 登录 · F-110 UFW 与 nftables 兼容
+
+---
+
+## 9. MVP 验收标准
+
+### 新服务器部署
+给定一台全新 Ubuntu 24.04 VPS + root SSH 密码 + UDP 51820 已开放，用户应能：
+1. 添加服务器 → 2. 测试 SSH 成功 → 3. 完成环境检测 → 4. 一键部署 → 5. wg0 启动 → 6. 生成 macOS 客户端配置 → 7. 导入 WireGuard → 8. 建立握手 → 9. 通过 VPS 访问互联网 → 10. 看到握手时间和流量
+
+### 设备管理
+1. 添加 iPhone 设备 → 2. 扫描二维码 → 3. 成功连接 → 4. 看到最近握手 → 5. 禁用后设备无法连接 → 6. 删除后 Peer 不存在
+
+### 故障处理（覆盖 10 个场景）
+SSH 密码错误、端口错误、无 sudo 权限、系统不受支持、UDP 端口被占用、WG 启动失败、安全组未开放无握手、有握手无互联网、DNS 不可用、MTU 问题。
+
+---
+
+*完整详情参见 `.pmem/` 下的模块卡片、决策记录和任务卡片。*
