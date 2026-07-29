@@ -99,22 +99,39 @@ MiaoVPS/
 ### 手动部署
 
 ```bash
-# 1. 上传脚本
+# 1. 上传并执行部署脚本
 scp scripts/bootstrap-server.sh ubuntu@<VPS_IP>:/tmp/
+ssh ubuntu@<VPS_IP> "sudo bash /tmp/bootstrap-server.sh"
+```
 
-# 2. 执行部署
-ssh ubuntu@<VPS_IP>
-sudo bash /tmp/bootstrap-server.sh
+### 连接
 
-# 3. 验证链路（不切路由，安全）
+客户端密钥必须**稳定** — WireGuard 服务端只接受 peer 列表里已注册的公钥，
+每次连接换新密钥会被静默丢弃（表现为握手超时）。
+
+```bash
+# 1. 生成客户端密钥对（只做一次）
+miaovps generate-keypair
+
+# 2. 在 VPS 上注册公钥
+ssh <VPS> "sudo wg set wg0 peer <客户端公钥> allowed-ips 10.66.66.2/32"
+
+# 3. 保存连接配置到 ~/.miaovps/profile.json (0600)
+miaovps profile init <VPS_IP>:51820 <客户端私钥> <服务器公钥> 10.66.66.2 10.66.66.1
+
+# 4. 验证链路（不切路由，安全）
 miaovps validate <VPS_IP>:51820 <客户端私钥> <服务器公钥>
 
-# 4. 连接
-miaovps connect <server-id>
+# 5. 连接 — Split Tunnel 只路由 VPN 网段，Full Tunnel 接管全局流量 + DNS
+sudo miaovps connect          # Split Tunnel
+sudo miaovps connect --full   # Full Tunnel
 
-# 5. 断开
-miaovps disconnect
+# 6. 清理残留路由 / DNS（异常退出后使用）
+sudo miaovps disconnect
 ```
+
+验证连通性：Split Tunnel 下 `ping 10.66.66.1`；Full Tunnel 下
+`curl ifconfig.me` 应返回 VPS 的公网 IP。
 
 ### 开发
 
@@ -138,14 +155,17 @@ cargo run -p miaovps-cli -- help  # CLI 帮助
 | `export-config` | 导出 WireGuard 配置 |
 | `generate-keypair` | 生成 x25519 密钥对 |
 | `validate` | **分步验证（不切路由，安全）** |
-| `connect` | **建立 VPN 连接（Split Tunnel）** |
-| `disconnect` | **断开连接** |
+| `profile init` | **保存连接配置（稳定密钥）** |
+| `profile show` | **查看配置 + 公私钥自洽校验** |
+| `connect [--full]` | **建立隧道，需 sudo** |
+| `disconnect` | **清理路由 + 还原 DNS** |
 
 ## 产品原则
 
-- **安全连接** — 分步验证，失败不切路由，永不一键丢网
+- **安全连接** — 分步验证，失败不切路由；路由分步应用，任一步失败即回滚
 - **本地优先** — 所有数据存本地 SQLite + Keychain
 - **密钥私有** — 私钥永不离开客户端
+- **不泄露 DNS** — Full Tunnel 接管 DNS 并在退出时还原（含崩溃后恢复）
 - **纯 Rust** — boringtun WireGuard 协议栈，零外部依赖
 
 ## License

@@ -65,80 +65,59 @@ impl ConnectionValidator {
         results
     }
 
-    /// UDP 端口可达测试：发送探测包并等待任意响应
+    /// UDP 出站可达性：确认能绑定本地端口并把包送出去
+    ///
+    /// 这一步**不能**判定服务器可达。WireGuard 是静默协议，对非法包不回复，
+    /// 所以「发了没回」是正常现象，不是故障。真正的连通性判定在握手步骤。
+    /// 这里只捕获本地故障：无法绑定端口、无路由、地址族不匹配。
     async fn check_udp_reachable(&self) -> ValidationResult {
         let start = std::time::Instant::now();
-        let step = "UDP 端口可达";
+        let step = "UDP 出站可达";
 
         debug!("[验证] {} — 目标: {}", step, self.server_addr);
 
-        // 绑定任意本地端口
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
             Err(e) => {
                 return ValidationResult {
                     step: step.into(),
                     success: false,
-                    detail: format!("无法绑定本地端口: {e}"),
+                    detail: format!("无法绑定本地 UDP 端口: {e}"),
                     duration_ms: start.elapsed().as_millis() as u64,
                 };
             }
         };
 
-        // 发送探测包（WireGuard 格式的 Initiation 不会穿透 NAT，但能测试可达性）
-        // 如果有响应（任何 UDP 包），说明可达
-        match socket.connect(self.server_addr).await {
-            Ok(_) => {}
-            Err(e) => {
-                return ValidationResult {
-                    step: step.into(),
-                    success: false,
-                    detail: format!("无法连接到服务器: {e}"),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                };
-            }
-        }
-
-        // 发送探测
-        if let Err(e) = socket.send(&[0u8; 32]).await {
+        if let Err(e) = socket.connect(self.server_addr).await {
             return ValidationResult {
                 step: step.into(),
                 success: false,
-                detail: format!("发送探测失败: {e}"),
+                detail: format!("无法路由到 {}: {e}（检查本机网络/残留路由）", self.server_addr),
                 duration_ms: start.elapsed().as_millis() as u64,
             };
         }
 
-        // 等待响应或超时（UDP 不可达会收到 ICMP 错误，但应用层看不到）
-        // 这里主要测试 connect+sent 成功
-        let mut buf = [0u8; 1500];
-        match timeout(Duration::from_secs(3), socket.recv(&mut buf)).await {
-            Ok(Ok(_n)) => {
-                info!("[验证] ✅ {} — 收到 {_n}B 响应", step);
-                ValidationResult {
-                    step: step.into(),
-                    success: true,
-                    detail: format!("端口 {} 可达", self.server_addr.port()),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                }
-            }
-            Ok(Err(e)) => ValidationResult {
+        // 发一个空包确认出站路径通畅。服务器不会回复，这是预期行为。
+        if let Err(e) = socket.send(&[]).await {
+            return ValidationResult {
                 step: step.into(),
                 success: false,
-                detail: format!("接收错误: {e}"),
+                detail: format!("UDP 发送失败: {e}"),
                 duration_ms: start.elapsed().as_millis() as u64,
-            },
-            Err(_) => {
-                // 超时 — 可能是防火墙丢弃 UDP，也可能是服务器没响应探测包
-                // 不直接判负，因为 WireGuard 握手才是真正的判断
-                warn!("[验证] ⚠ {} — 无响应（可能是防火墙丢弃非 WG 包，继续握手测试）", step);
-                ValidationResult {
-                    step: step.into(),
-                    success: true, // 放过，等握手测试判决
-                    detail: "端口已连接但无返回包（防火墙可能丢弃非 WG 包，切换握手验证）".into(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                }
-            }
+            };
+        }
+
+        let local = socket
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".into());
+
+        info!("[验证] ✅ {} — 出站路径就绪 ({local})", step);
+        ValidationResult {
+            step: step.into(),
+            success: true,
+            detail: format!("出站路径就绪 {local} → {}", self.server_addr),
+            duration_ms: start.elapsed().as_millis() as u64,
         }
     }
 
@@ -149,50 +128,49 @@ impl ConnectionValidator {
 
         debug!("[验证] {} — 发起握手...", step);
 
-        let mut handshaker = WireGuardHandshaker::new(
+        // 每次调用内部新建 Tunn — 见 WireGuardHandshaker 文档
+        let handshaker = WireGuardHandshaker::new(
             self.client_private_key,
             self.server_public_key,
             self.server_addr,
         );
 
-        let max_retries = 3;
-        for attempt in 1..=max_retries {
-            match timeout(Duration::from_secs(5), handshaker.try_handshake()).await {
+        const MAX_RETRIES: u32 = 3;
+        let mut last_error = String::new();
+
+        for attempt in 1..=MAX_RETRIES {
+            // 外层超时留出余量，让内层的具体错误信息能返回
+            match timeout(Duration::from_secs(6), handshaker.try_handshake()).await {
                 Ok(Ok(())) => {
-                    info!("[验证] ✅ {} — 握手成功 (第 {attempt} 次尝试)", step);
+                    info!("[验证] ✅ {} — 成功 (第 {attempt} 次尝试)", step);
                     return ValidationResult {
                         step: step.into(),
                         success: true,
-                        detail: format!("握手成功，{attempt}/{} 次尝试", max_retries),
+                        detail: format!("握手成功 ({attempt}/{MAX_RETRIES} 次尝试)"),
                         duration_ms: start.elapsed().as_millis() as u64,
                     };
                 }
                 Ok(Err(e)) => {
-                    warn!("[验证] {} — 第 {} 次握手失败: {}", step, attempt, e);
-                    if attempt == max_retries {
-                        return ValidationResult {
-                            step: step.into(),
-                            success: false,
-                            detail: format!("握手失败 ({} 次尝试): {}", max_retries, e),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        };
-                    }
+                    warn!("[验证] {step} — 第 {attempt} 次失败: {e}");
+                    last_error = e;
                 }
                 Err(_) => {
-                    warn!("[验证] {} — 第 {} 次握手超时", step, attempt);
-                    if attempt == max_retries {
-                        return ValidationResult {
-                            step: step.into(),
-                            success: false,
-                            detail: format!("握手超时 ({} 次尝试，每次 5s)", max_retries),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        };
-                    }
+                    warn!("[验证] {step} — 第 {attempt} 次整体超时");
+                    last_error = "握手整体超时".into();
                 }
+            }
+
+            if attempt < MAX_RETRIES {
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
 
-        unreachable!()
+        ValidationResult {
+            step: step.into(),
+            success: false,
+            detail: format!("{MAX_RETRIES} 次尝试均失败: {last_error}"),
+            duration_ms: start.elapsed().as_millis() as u64,
+        }
     }
 }
 

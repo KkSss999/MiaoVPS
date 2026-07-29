@@ -23,3 +23,5 @@ miaovps-provisioner = { path = "../miaovps-provisioner" }
 miaovps-storage = { path = "../miaovps-storage" }
 miaovps-connect = { path = "../miaovps-connect" }
 base64 = "0.22"
+x25519-dalek.workspace = true
+libc = "0.2"

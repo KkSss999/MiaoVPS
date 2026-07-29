@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 boringtun.workspace = true
 tun = "0.6"
+libc = "0.2"
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

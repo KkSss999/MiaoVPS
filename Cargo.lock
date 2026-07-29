@@ -1210,6 +1210,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "libc",
  "miaovps-connect",
  "miaovps-core",
  "miaovps-provisioner",
@@ -1222,6 +1223,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1229,6 +1231,7 @@ name = "miaovps-connect"
 version = "0.1.0"
 dependencies = [
  "boringtun",
+ "libc",
  "miaovps-core",
  "miaovps-wireguard-config",
  "rand",

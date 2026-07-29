@@ -16,13 +16,25 @@ use tracing::warn;
 
 use crate::error::ConnectError;
 
+/// 包缓冲区 — 覆盖最大 MTU + WireGuard 封装开销
+const PKT_BUF: usize = 2048;
+/// 握手包缓冲区（Initiation 固定 148B）
+const HANDSHAKE_BUF: usize = 256;
+/// 单次握手等待响应的超时
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  WireGuard 握手器 — 用于验证阶段的纯握手测试（不使用 TUN）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// WireGuard 握手器 — 发送 Initiation，等待 Response
+///
+/// 每次 `try_handshake` 都新建 `Tunn` 和 socket。`Tunn` 内部持有握手状态
+/// 和限流计数，跨重试复用会让第二次之后的尝试在无效状态下发包 —
+/// 表现为首次成功、重试全部超时。
 pub struct WireGuardHandshaker {
-    tunn: Tunn,
+    private_key: [u8; 32],
+    server_public_key: [u8; 32],
     server_addr: SocketAddr,
 }
 
@@ -32,71 +44,61 @@ impl WireGuardHandshaker {
         server_public_key: [u8; 32],
         server_addr: SocketAddr,
     ) -> Self {
-        let sk: StaticSecret = private_key.into();
-        let pk: PublicKey = server_public_key.into();
-
-        let tunn = Tunn::new(sk, pk, None, None, 0, None);
-
         Self {
-            tunn,
+            private_key,
+            server_public_key,
             server_addr,
         }
     }
 
-    /// 尝试一次握手：强制发送 Initiation → 等待 Response → decapsulate
-    pub async fn try_handshake(&mut self) -> Result<(), String> {
+    /// 尝试一次握手：Initiation → 等待 Response → decapsulate
+    ///
+    /// 成功的判定是**收到并解密了服务器的 Response**，这同时验证了
+    /// 密钥匹配、UDP 双向连通和服务端 WireGuard 在线。
+    pub async fn try_handshake(&self) -> Result<(), String> {
+        let sk: StaticSecret = self.private_key.into();
+        let pk: PublicKey = self.server_public_key.into();
+        let mut tunn = Tunn::new(sk, pk, None, None, 0, None);
+
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
-            .map_err(|e| format!("无法绑定: {e}"))?;
+            .map_err(|e| format!("无法绑定本地端口: {e}"))?;
         socket
             .connect(self.server_addr)
             .await
-            .map_err(|e| format!("无法连接: {e}"))?;
+            .map_err(|e| format!("无法连接 {}: {e}", self.server_addr))?;
 
-        // 强制发起握手（force_resend=true 跳过"已在握手"检查）
-        let mut buf = [0u8; 148];
-        match self.tunn.format_handshake_initiation(&mut buf[..], true) {
-            TunnResult::WriteToNetwork(packet) => {
-                socket
-                    .send(packet)
-                    .await
-                    .map_err(|e| format!("发送握手包失败: {e}"))?;
+        let mut buf = [0u8; HANDSHAKE_BUF];
+        let init = match tunn.format_handshake_initiation(&mut buf[..], true) {
+            TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+            TunnResult::Err(e) => return Err(format!("握手初始化失败: {e:?}")),
+            other => return Err(format!("握手初始化意外结果: {other:?}")),
+        };
 
-                // 等待响应，最多 5 秒
-                let mut recv_buf = [0u8; 1500];
-                let recv_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    socket.recv_from(&mut recv_buf),
-                )
-                .await
-                .map_err(|_| "握手超时".to_string())?
-                .map_err(|e| format!("接收失败: {e}"))?;
+        socket
+            .send(&init)
+            .await
+            .map_err(|e| format!("发送握手包失败: {e}"))?;
 
-                // 解密响应
-                let (n, _src) = recv_result;
-                let mut tmp = [0u8; 1500];
-                match self.tunn.decapsulate(None, &recv_buf[..n], &mut tmp[..]) {
-                    TunnResult::Done => Ok(()),
-                    TunnResult::WriteToNetwork(reply) => {
-                        let _ = socket.send(reply).await;
-                        // 等最终确认
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            socket.recv_from(&mut recv_buf),
-                        ).await {
-                            Ok(Ok((n2, _))) => {
-                                let _ = self.tunn.decapsulate(None, &recv_buf[..n2], &mut tmp[..]);
-                            }
-                            _ => {}
-                        }
-                        Ok(())
-                    }
-                    TunnResult::Err(e) => Err(format!("解密失败: {e:?}")),
-                    _ => Ok(()),
-                }
+        let mut recv_buf = [0u8; PKT_BUF];
+        let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.recv(&mut recv_buf))
+            .await
+            .map_err(|_| {
+                format!("等待响应超时 {}s — 检查 UDP {} 是否开放", HANDSHAKE_TIMEOUT.as_secs(), self.server_addr.port())
+            })?
+            .map_err(|e| format!("接收失败: {e}"))?;
+
+        let mut tmp = [0u8; PKT_BUF];
+        match tunn.decapsulate(None, &recv_buf[..n], &mut tmp[..]) {
+            // Response 解密成功 — boringtun 可能要求回发 keepalive
+            TunnResult::WriteToNetwork(reply) => {
+                let _ = socket.send(reply).await;
+                Ok(())
             }
-            TunnResult::Err(e) => Err(format!("握手初始化失败: {e:?}")),
-            other => Err(format!("意外结果: {other:?}")),
+            TunnResult::Done
+            | TunnResult::WriteToTunnelV4(..)
+            | TunnResult::WriteToTunnelV6(..) => Ok(()),
+            TunnResult::Err(e) => Err(format!("响应解密失败（密钥可能不匹配）: {e:?}")),
         }
     }
 }

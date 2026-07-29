@@ -304,11 +304,10 @@ impl Default for VpnConnection {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_vpn_connection_default_disconnected() {
-        let _conn = VpnConnection::new();
-        // 同步测试 — 状态验证通过类型即可
-        assert!(true);
+    #[tokio::test]
+    async fn new_connection_starts_disconnected() {
+        let conn = VpnConnection::new();
+        assert_eq!(conn.state().await, ConnectionState::Disconnected);
     }
 
     #[test]
