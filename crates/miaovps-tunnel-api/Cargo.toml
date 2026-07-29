@@ -1,0 +1,10 @@
+[package]
+name = "miaovps-tunnel-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"
+miaovps-core = { path = "../miaovps-core" }

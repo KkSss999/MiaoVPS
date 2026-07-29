@@ -1,0 +1,14 @@
+[package]
+name = "miaovps-ssh"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+russh.workspace = true
+russh-keys.workspace = true
+miaovps-core = { path = "../miaovps-core" }

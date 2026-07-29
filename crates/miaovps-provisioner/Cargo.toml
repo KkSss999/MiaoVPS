@@ -1,0 +1,16 @@
+[package]
+name = "miaovps-provisioner"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+miaovps-core = { path = "../miaovps-core" }
+miaovps-ssh = { path = "../miaovps-ssh" }
+miaovps-wireguard-config = { path = "../miaovps-wireguard-config" }
