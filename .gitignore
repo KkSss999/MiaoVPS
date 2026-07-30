@@ -4,3 +4,5 @@
 .pmem/pmem.db-shm
 .pmem/pmem.db-wal
 .miaovps-data/
+node_modules/
+apps/desktop/dist/

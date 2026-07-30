@@ -1,0 +1,73 @@
+/*
+ * 设计令牌 —— 冻结自 miaovps-frontend/brand-spec.md
+ *
+ * 这些值是视觉契约，不是建议值。改动前先改 brand-spec.md。
+ * accent (#63fe13) 只做状态信号：连接状态、在线点、部署完成标记。
+ * 主 CTA 用 --fg 反色，不用 accent。
+ */
+
+:root {
+  /* ── 六个基础令牌 ── */
+  --bg: #000000;
+  --surface: #0a0a0a;
+  --surface-2: #111111;
+  --fg: #ffffff;
+  --muted: #7a7a7a;
+  --border: #242424;
+  --accent: #63fe13;
+  --accent-secondary: #26251e;
+
+  /* ── 派生色 ── */
+  --accent-soft: color-mix(in oklch, var(--accent) 14%, transparent);
+  --fg-soft: color-mix(in oklch, var(--fg) 6%, transparent);
+  --fg-soft-2: color-mix(in oklch, var(--fg) 10%, transparent);
+  --danger: #ff5449;
+  --danger-soft: color-mix(in oklch, var(--danger) 16%, transparent);
+  --warn: #f5a524;
+  --warn-soft: color-mix(in oklch, var(--warn) 16%, transparent);
+
+  /* ── 字体 ── */
+  --font-display: 'Albert Sans', system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-body: 'Albert Sans', system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* ── 几何 ── */
+  --radius: 8px;
+  --radius-lg: 8px;
+  --radius-pill: 999px;
+
+  /* ── 8px 基线间距 ── */
+  --gap-xs: 8px;
+  --gap-sm: 12px;
+  --gap-md: 16px;
+  --gap-lg: 24px;
+  --gap-xl: 32px;
+
+  /* ── 动效 ── */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 0.15s;
+  --dur-base: 0.2s;
+  --dur-enter: 0.5s;
+
+  /* ── 布局 ── */
+  --topnav-h: 64px;
+  --page-max: 1160px;
+}
+
+html[data-theme='light'] {
+  --bg: #f4f4f4;
+  --surface: #ffffff;
+  --surface-2: #eeeeee;
+  --fg: #1a1a1a;
+  --muted: #666666;
+  --border: #e0e0e0;
+  --accent-secondary: #eeeeee;
+  --danger: #e53935;
+}
+
+/* 亮色下亚像素渲染更清晰（原型行为） */
+html[data-theme='light'] body {
+  -webkit-font-smoothing: subpixel-antialiased;
+}

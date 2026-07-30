@@ -7,7 +7,7 @@ use crate::credentials::ServerCredential;
 use crate::session::{open_provisioner, open_provisioner_any, ServiceError};
 use miaovps_core::{Device, DeviceType, Server, ServerStatus, SshAuthType, WireGuardNode};
 use miaovps_provisioner::{
-    DeploymentOptions, DeploymentProgress, ServerReport, StepSender,
+    DeploymentOptions, DeploymentProgress, DetectKey, DetectStatus, ServerReport, StepSender,
 };
 use miaovps_storage::{keychain::WgKeyStore, Database};
 use miaovps_wireguard_config::{generate_client_config, generate_keypair, ClientConfigParams};
@@ -68,21 +68,19 @@ impl AppService {
         let report = provisioner.inspect().await?;
 
         // 持久化检测结果到 Server
+        //
+        // 按 DetectKey 匹配而非 item.name —— name 是 UI 文案，
+        // 改一次措辞就会静默丢掉 os/arch/ip 的持久化。
         let mut updated = server.clone();
         for item in &report.items {
-            match item.name.as_str() {
-                "操作系统" => {
-                    if let Some(msg) = item.message.split_whitespace().nth(1) {
-                        updated.os_name = Some(item.message.clone());
-                        if msg.contains("24.04") {
-                            updated.os_version = Some("24.04".into());
-                        } else if msg.contains("22.04") {
-                            updated.os_version = Some("22.04".into());
-                        }
-                    }
+            match item.key {
+                DetectKey::Os => {
+                    updated.os_name = Some(item.message.clone());
+                    updated.os_version = parse_os_version(&item.message);
                 }
-                "架构" => updated.architecture = Some(item.message.clone()),
-                "公网 IPv4" if item.message != "无法检测公网 IP" => {
+                DetectKey::Arch => updated.architecture = Some(item.message.clone()),
+                // Warning 时 message 是「无法检测公网 IP」这类提示文案，不是 IP
+                DetectKey::PublicIpv4 if item.status == DetectStatus::Pass => {
                     updated.public_ipv4 = Some(item.message.clone());
                 }
                 _ => {}
@@ -195,10 +193,12 @@ impl AppService {
         // 生成客户端密钥
         let keypair = generate_keypair();
 
-        // 分配 VPN IP（简化实现：按设备数 +2）
+        // 分配 VPN IP —— 扫首个空闲地址，不能用设备数递增
+        //
+        // 删掉中间某台设备后 len() 会回退，下次分配就撞上已存在的地址，
+        // 服务端 AllowedIPs 冲突表现为「新设备连上后旧设备莫名断流」。
         let devices = self.db.list_devices(&server_id).await?;
-        let next_ip = 2 + devices.len();
-        let vpn_address = format!("10.66.66.{}/32", next_ip);
+        let vpn_address = allocate_vpn_address(&node.vpn_cidr, &devices)?;
 
         let mut device = Device::new(
             server_id.clone(),
@@ -290,4 +290,118 @@ fn current_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// 从「Ubuntu 24.04」这类检测文案里取版本号
+fn parse_os_version(message: &str) -> Option<String> {
+    message
+        .split_whitespace()
+        .find(|tok| tok.contains('.') && tok.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|s| s.to_string())
+}
+
+/// 在 VPN 网段内分配首个空闲地址
+///
+/// `.1` 是服务端网关，客户端从 `.2` 开始。返回带 `/32` 的地址 ——
+/// 客户端 peer 的 AllowedIPs 必须是单机地址，给整个网段会抢走其他设备的流量。
+fn allocate_vpn_address(vpn_cidr: &str, devices: &[Device]) -> Result<String, ServiceError> {
+    // vpn_cidr 形如 "10.66.66.0/24"，取前三段作为前缀
+    let base = vpn_cidr.split('/').next().unwrap_or(vpn_cidr);
+    let octets: Vec<&str> = base.split('.').collect();
+    if octets.len() != 4 {
+        return Err(ServiceError::other(format!("VPN 网段格式错误: {vpn_cidr}")));
+    }
+    let prefix = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
+
+    let used: std::collections::HashSet<&str> = devices
+        .iter()
+        .map(|d| d.vpn_address.split('/').next().unwrap_or(&d.vpn_address))
+        .collect();
+
+    // .1 留给服务端网关，.255 是广播地址
+    for host in 2u16..255 {
+        let candidate = format!("{prefix}.{host}");
+        if !used.contains(candidate.as_str()) {
+            return Ok(format!("{candidate}/32"));
+        }
+    }
+    Err(ServiceError::other(format!(
+        "{vpn_cidr} 内无空闲地址（已用 {} 个）",
+        used.len()
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device_at(addr: &str) -> Device {
+        Device::new(
+            "srv".into(),
+            "dev".into(),
+            DeviceType::Other,
+            "pubkey".into(),
+            addr.into(),
+        )
+    }
+
+    #[test]
+    fn first_device_gets_dot_two() {
+        let addr = allocate_vpn_address("10.66.66.0/24", &[]).unwrap();
+        assert_eq!(addr, "10.66.66.2/32");
+    }
+
+    #[test]
+    fn allocates_sequentially() {
+        let devices = vec![device_at("10.66.66.2/32"), device_at("10.66.66.3/32")];
+        assert_eq!(
+            allocate_vpn_address("10.66.66.0/24", &devices).unwrap(),
+            "10.66.66.4/32"
+        );
+    }
+
+    /// 这是修复的核心 —— 删掉中间设备后必须复用空洞，不能跳到 .4 撞车
+    #[test]
+    fn reuses_gap_after_deletion() {
+        let devices = vec![device_at("10.66.66.2/32"), device_at("10.66.66.4/32")];
+        assert_eq!(
+            allocate_vpn_address("10.66.66.0/24", &devices).unwrap(),
+            "10.66.66.3/32"
+        );
+    }
+
+    #[test]
+    fn respects_custom_cidr() {
+        let addr = allocate_vpn_address("10.7.0.0/24", &[]).unwrap();
+        assert_eq!(addr, "10.7.0.2/32");
+    }
+
+    #[test]
+    fn handles_address_without_mask() {
+        let devices = vec![device_at("10.66.66.2")];
+        assert_eq!(
+            allocate_vpn_address("10.66.66.0/24", &devices).unwrap(),
+            "10.66.66.3/32"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_cidr() {
+        assert!(allocate_vpn_address("not-a-cidr", &[]).is_err());
+    }
+
+    #[test]
+    fn errors_when_pool_exhausted() {
+        let devices: Vec<Device> = (2u16..255)
+            .map(|h| device_at(&format!("10.66.66.{h}/32")))
+            .collect();
+        assert!(allocate_vpn_address("10.66.66.0/24", &devices).is_err());
+    }
+
+    #[test]
+    fn parses_os_version() {
+        assert_eq!(parse_os_version("Ubuntu 24.04").as_deref(), Some("24.04"));
+        assert_eq!(parse_os_version("Ubuntu 22.04").as_deref(), Some("22.04"));
+        assert_eq!(parse_os_version("Debian"), None);
+    }
 }

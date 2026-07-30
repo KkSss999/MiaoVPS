@@ -6,7 +6,8 @@
 mod dns;
 mod profile;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use miaovps_app::tunnel::{TunnelMode, TunnelState, TunnelStatus};
 use miaovps_connect::native::NativeTunnel;
 use miaovps_connect::tun::{TunConfig, TunInterface};
 use miaovps_connect::ConnectionValidator;
@@ -111,8 +112,9 @@ fn print_help() {
     println!("  profile init <ip:port> <client-priv> <server-pub> [client-ip]");
     println!("                                                保存连接配置");
     println!("  profile show                                  查看当前配置");
-    println!("  connect [--full] [--skip-validate]            建立隧道 (需 sudo)");
-    println!("  disconnect                                    清理残留路由");
+    println!("  connect [--full] [--skip-validate] [--daemon] 建立隧道 (需 sudo)");
+    println!("                                                --daemon 后台运行并写状态文件");
+    println!("  disconnect                                    停止隧道并清理路由");
     println!();
     println!("典型流程:");
     println!("  1. miaovps generate-keypair              # 生成客户端密钥对");
@@ -524,10 +526,78 @@ async fn cmd_validate(args: &[String]) -> Result<()> {
 //  connect — 两阶段连接 (Split Tunnel → Full Tunnel)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// 标记环境变量 —— 区分「要派生 daemon 的父进程」和「已经是 daemon 的子进程」
+const DAEMON_MARKER: &str = "MIAOVPS_DAEMON_CHILD";
+
+/// daemon 日志文件名 —— 前端读它排查启动失败
+const DAEMON_LOG: &str = "tunnel.log";
+
+/// re-exec 自己进入后台
+///
+/// stdout/stderr 重定向到日志文件。osascript 会等 `do shell script` 的
+/// 进程退出才返回，所以父进程必须立刻退出，否则授权框一直转圈。
+fn spawn_daemon(args: &[String]) -> Result<()> {
+    use std::process::Stdio;
+
+    let exe = std::env::current_exe().context("无法获取自身路径")?;
+    let log_path = data_dir().join(DAEMON_LOG);
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("无法创建日志 {}", log_path.display()))?;
+    let log_err = log.try_clone()?;
+
+    let child = Command::new(exe)
+        .args(&args[1..]) // 保留 connect 及其后所有 flag（含 --daemon）
+        .env(DAEMON_MARKER, "1")
+        .env("MIAOVPS_DATA_DIR", data_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .context("无法派生隧道进程")?;
+
+    println!("✓ 隧道进程已启动 (pid {})", child.id());
+    println!("  日志: {}", log_path.display());
+    println!("  状态: {}", TunnelState::path(&data_dir()).display());
+    Ok(())
+}
+
+/// 把隧道运行时状态刷进状态文件
+fn publish_state(
+    data_dir: &std::path::Path,
+    profile: &ConnectionProfile,
+    mode: TunnelMode,
+    status: TunnelStatus,
+    tunnel: &NativeTunnel,
+    started_at: i64,
+) {
+    let (tx, rx, errs) = tunnel.stats().snapshot();
+    let state = TunnelState {
+        status,
+        mode,
+        pid: std::process::id(),
+        server_endpoint: profile.server_endpoint.clone(),
+        client_ip: profile.client_ip.clone(),
+        started_at,
+        updated_at: miaovps_app::tunnel::now_secs(),
+        tx_bytes: tx,
+        rx_bytes: rx,
+        decrypt_errors: errs,
+        session_churn: tunnel.stats().session_churn(),
+        reconnects: tunnel.stats().reconnects(),
+        session_alive: tunnel.stats().is_session_alive(),
+        last_error: None,
+    };
+    if let Err(e) = state.save(data_dir) {
+        // 状态写失败不该终止隧道 —— 隧道本身还在正常工作
+        eprintln!("  ⚠ 状态文件写入失败: {e}");
+    }
+}
+
 async fn cmd_connect(args: &[String]) -> Result<()> {
     let flags: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
     let skip_validate = flags.contains(&"--skip-validate");
     let full_tunnel = flags.contains(&"--full");
+    let daemon = flags.contains(&"--daemon");
 
     // 权限先查 — 创建 TUN 和改路由都需要 root，
     // 没有权限就别让用户白等几秒验证
@@ -538,6 +608,16 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
             if full_tunnel { " --full" } else { "" }
         );
     }
+
+    // ── daemon 模式：父进程 re-exec 自己后立刻退出 ──
+    //
+    // 不用 fork()：tokio 运行时已经起了线程，fork 只复制调用线程，
+    // 子进程里的 runtime 会带着半套线程状态死锁。re-exec 拿到干净进程。
+    if daemon && std::env::var_os(DAEMON_MARKER).is_none() {
+        return spawn_daemon(args);
+    }
+
+    let is_daemon_child = daemon && std::env::var_os(DAEMON_MARKER).is_some();
 
     let profile = ConnectionProfile::load(&data_dir())?;
     let server_addr = profile.server_addr()?;
@@ -687,6 +767,20 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     println!("  断线会自动重连（无限重试，不改动路由）。");
     println!();
 
+    // daemon 模式向状态文件发布运行时状态供前端轮询
+    let tunnel_mode = if full_tunnel { TunnelMode::Full } else { TunnelMode::Split };
+    let started_at = miaovps_app::tunnel::now_secs();
+    if is_daemon_child {
+        publish_state(
+            &data_dir(),
+            &profile,
+            tunnel_mode,
+            TunnelStatus::Connecting,
+            &tunnel,
+            started_at,
+        );
+    }
+
     // 网关看护 + 状态输出。网关检查要比状态输出频繁 ——
     // 它决定断线后能否恢复，而状态输出只是给人看的。
     let mut gw_guard = VpsRouteGuard::new(vps_ip.clone(), default_gw.clone());
@@ -700,9 +794,17 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     /// 没必要让用户断网等它。30s 足够滤掉瞬时抖动（切换 WiFi 本身只需几秒）。
     const OUTAGE_TICKS_BEFORE_FALLBACK: u32 = 6;
 
+    // daemon 没有终端，Ctrl+C 收不到 —— 必须听 SIGTERM 才能被 disconnect 停掉
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("无法注册 SIGTERM 处理")?;
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = sigterm.recv() => {
+                println!("\n收到 SIGTERM，开始收尾");
+                break;
+            }
             _ = tokio::time::sleep(TICK) => {
                 if let Some((old, new)) = gw_guard.reconcile() {
                     println!("  [网络] 默认网关 {old} → {new}，已重建 VPS 直连路由");
@@ -752,6 +854,19 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
                         outage_ticks = 0;
                     }
                 }
+
+                // 每 tick 刷一次状态文件 —— 前端轮询靠它
+                if is_daemon_child {
+                    let alive = tunnel.stats().is_session_alive();
+                    let fallen_back = overlay.as_ref().is_some_and(|ov| !ov.is_engaged());
+                    let status = match (alive, fallen_back) {
+                        // 回落状态优先 —— 此时流量不经 VPN，必须让前端明确警示
+                        (_, true) => TunnelStatus::FallbackDirect,
+                        (true, false) => TunnelStatus::Connected,
+                        (false, false) => TunnelStatus::Reconnecting,
+                    };
+                    publish_state(&data_dir(), &profile, tunnel_mode, status, &tunnel, started_at);
+                }
             }
         }
     }
@@ -777,6 +892,11 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     }
     remove_tunnel_routes(&vps_ip, &vpn_net);
 
+    // 状态文件必须在路由清理后删 —— 中间崩溃时留着文件才能被识别为 Stale
+    if is_daemon_child {
+        TunnelState::clear(&data_dir());
+    }
+
     println!("  流量: ↑{} ↓{}{}{}",
         human_bytes(tx),
         human_bytes(rx),
@@ -793,6 +913,10 @@ async fn cmd_disconnect(_args: &[String]) -> Result<()> {
     }
 
     println!("清理残留状态...");
+
+    // 先停 daemon 隧道进程 —— 它还活着的话会把路由重新加回来
+    // （VpsRouteGuard 每 5s 核对一次），先清路由就白清了
+    stop_daemon_if_running();
 
     // 上次异常退出（kill -9 / 崩溃）可能留下被改写的 DNS，优先还原
     if let Some(desc) = dns::restore_if_pending(&data_dir()) {
@@ -812,8 +936,41 @@ async fn cmd_disconnect(_args: &[String]) -> Result<()> {
     };
 
     remove_tunnel_routes(&vps_ip, &vpn_net);
+    TunnelState::clear(&data_dir());
     println!("✅ 清理完成");
     Ok(())
+}
+
+/// 发 SIGTERM 停掉 daemon 隧道进程并等它退出
+///
+/// 隧道自己的 shutdown 会还原 DNS 并撤路由，比外部清理更准确
+/// （它知道当前是接管还是已回落状态）。所以优先让它自己收尾。
+fn stop_daemon_if_running() {
+    let state = TunnelState::load(&data_dir());
+    if state.status == TunnelStatus::Disconnected || state.pid == 0 {
+        return;
+    }
+    if state.status == TunnelStatus::Stale {
+        println!("  上次隧道异常退出 (pid {} 已不存在)", state.pid);
+        return;
+    }
+
+    println!("  停止隧道进程 (pid {})...", state.pid);
+    // Safety: 仅向已知 pid 投递 SIGTERM，无内存操作
+    unsafe {
+        libc::kill(state.pid as i32, libc::SIGTERM);
+    }
+
+    // 隧道 shutdown 最坏 500ms（三线程各自的轮询周期），给 5s 余量
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(100));
+        // Safety: signal 0 只检查存在性
+        if unsafe { libc::kill(state.pid as i32, 0) } != 0 {
+            println!("  隧道进程已退出");
+            return;
+        }
+    }
+    println!("  ⚠ 隧道进程 {} 未在 5s 内退出，继续强制清理路由", state.pid);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

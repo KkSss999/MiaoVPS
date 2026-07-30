@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Albert+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<title>MiaoVPS · 桌面端</title>
+<style>
+  :root {
+    --bg:      #000000;
+    --surface: #0a0a0a;
+    --surface-2: #111111;
+    --fg:      #ffffff;
+    --muted:   #7a7a7a;
+    --border:  #242424;
+    --accent:  #63fe13;
+    --accent-secondary: #26251e;
+
+    --accent-soft: color-mix(in oklch, var(--accent) 14%, transparent);
+    --fg-soft:     color-mix(in oklch, var(--fg) 6%, transparent);
+    --fg-soft-2:   color-mix(in oklch, var(--fg) 10%, transparent);
+    --danger:      #ff5449;
+    --danger-soft: color-mix(in oklch, var(--danger) 16%, transparent);
+
+    --font-display: 'Albert Sans', system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+    --font-body:    'Albert Sans', system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+    --font-mono:    'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+    --radius: 8px;
+    --radius-lg: 8px;
+    --gap-xs: 8px; --gap-sm: 12px; --gap-md: 16px; --gap-lg: 24px; --gap-xl: 32px;
+  }
+  html[data-theme="light"] {
+    --bg:      #f4f4f4;
+    --surface: #ffffff;
+    --surface-2: #eeeeee;
+    --fg:      #1a1a1a;
+    --muted:   #666666;
+    --border:  #e0e0e0;
+    --accent-secondary: #eeeeee;
+    --danger:  #e53935;
+  }
+  html[data-theme="light"] body { -webkit-font-smoothing: subpixel-antialiased; }
+  * , *::before, *::after { box-sizing: border-box; }
+  html, body { margin:0; height:100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  img, svg { display:block; }
+  button { font: inherit; cursor: pointer; }
+  a { color: inherit; text-decoration: none; }
+  p { margin: 0; }
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .meta { font-family: var(--font-mono); font-size: 12px; color: var(--muted); letter-spacing: 0.02em; }
+  .eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  h1,h2,h3 { font-family: var(--font-display); margin: 0; letter-spacing: -0.01em; }
+
+  @keyframes fadeUp { from { opacity:0; transform: translateY(10px); } to { opacity:1; transform: translateY(0); } }
+  @keyframes pulseRing {
+    0%   { box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 35%, transparent); }
+    70%  { box-shadow: 0 0 0 14px color-mix(in oklch, var(--accent) 0%, transparent); }
+    100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 0%, transparent); }
+  }
+  @keyframes dotPulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+  @keyframes barFill { from { width:0; } }
+  @keyframes spinSlow { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  /* ─── top nav (no sidebar) ─────────────────────────────────────── */
+  .app { display:flex; flex-direction:column; height:100vh; }
+  .topnav {
+    height: 64px; flex: 0 0 64px;
+    display:flex; align-items:center; gap: var(--gap-xl);
+    padding: 0 var(--gap-xl);
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in oklch, var(--bg) 88%, transparent);
+    backdrop-filter: blur(14px);
+    position: sticky; top:0; z-index: 20;
+  }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .brand img { width: 26px; height: 26px; border-radius: 7px; }
+  .brand span { font-family: var(--font-display); font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+  .topnav-nav { display:flex; align-items:center; gap: 4px; }
+  .nav-item {
+    display:flex; align-items:center; gap: 8px;
+    padding: 8px 14px;
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+    transition: background .15s ease, color .15s ease;
+  }
+  .nav-item svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.8; flex-shrink:0; }
+  .nav-item:hover { background: var(--fg-soft); color: var(--fg); }
+  .nav-item.active { background: var(--fg); color: var(--bg); }
+  .topnav-right { margin-left:auto; display:flex; align-items:center; gap: 14px; }
+  .topnav-node { display:flex; align-items:center; gap:8px; padding: 6px 12px 6px 8px; border-radius: 999px; border:1px solid var(--border); background: var(--surface); }
+  .topnav-node .dot { width:6px; height:6px; border-radius:50%; background: var(--accent); animation: dotPulse 2s ease-in-out infinite; }
+
+  .main { flex: 1 1 auto; min-width:0; overflow:hidden; display:flex; flex-direction:column; }
+  .page { flex: 1 1 auto; overflow-y: auto; padding: var(--gap-xl); }
+  .page-inner { max-width: 1160px; margin: 0 auto; display:none; flex-direction:column; gap: var(--gap-lg); }
+  .page-inner.active { display:flex; }
+  .page-inner.active > * { animation: fadeUp .5s cubic-bezier(.16,1,.3,1) both; }
+  .page-inner.active > *:nth-child(1) { animation-delay: .02s; }
+  .page-inner.active > *:nth-child(2) { animation-delay: .08s; }
+  .page-inner.active > *:nth-child(3) { animation-delay: .14s; }
+  .page-inner.active > *:nth-child(4) { animation-delay: .2s; }
+  .page-inner.active > *:nth-child(5) { animation-delay: .26s; }
+  .page-header { display:flex; align-items:baseline; justify-content:space-between; gap: var(--gap-sm); }
+  .page-header h2 { font-size: 22px; font-weight:700; }
+
+  /* ─── primitives ─────────────────────────────────────────────── */
+  .row { display:flex; align-items:center; gap: var(--gap-sm); }
+  .row-between { display:flex; align-items:center; justify-content:space-between; gap: var(--gap-sm); }
+  .stack { display:flex; flex-direction:column; gap: var(--gap-md); }
+  .bento { display:grid; grid-template-columns: repeat(6, 1fr); gap: var(--gap-md); }
+  .span-2 { grid-column: span 2; }
+  .span-3 { grid-column: span 3; }
+  .span-4 { grid-column: span 4; }
+  .span-6 { grid-column: span 6; }
+  @media (max-width: 1080px) { .bento { grid-template-columns: repeat(2,1fr); } .span-2,.span-3,.span-4 { grid-column: span 2; } }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: var(--gap-lg);
+    transition: border-color .2s ease, transform .2s ease, background .2s ease;
+  }
+  .card.hoverable:hover { border-color: color-mix(in oklch, var(--fg) 25%, var(--border)); transform: translateY(-2px); background: var(--surface-2); }
+  .card-flat { background: transparent; border: 0; padding: 0; }
+
+  .btn {
+    display:inline-flex; align-items:center; justify-content:center; gap: 8px;
+    padding: 9px 16px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    font-size: 13px; font-weight: 600;
+    transition: background .15s ease, border-color .15s ease, color .15s ease, transform .1s ease;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn-primary { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .btn-primary:hover { background: color-mix(in oklch, var(--fg) 85%, transparent); }
+  .btn-secondary { background: transparent; color: var(--fg); border-color: var(--border); }
+  .btn-secondary:hover { border-color: var(--fg); }
+  .btn-danger { background: transparent; color: var(--danger); border-color: var(--danger); }
+  .btn-danger:hover { background: var(--danger-soft); }
+  .btn-ghost { background: transparent; color: var(--muted); border-color: transparent; padding-inline: 8px; }
+  .btn-ghost:hover { color: var(--fg); }
+  .btn[disabled] { opacity: .4; cursor: not-allowed; }
+
+  .pill {
+    display:inline-flex; align-items:center; gap:6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px; letter-spacing: .03em;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .pill-dot { width:6px; height:6px; border-radius:50%; }
+  .pill.ok { background: var(--accent-soft); color: var(--accent); }
+  .pill.ok .pill-dot { background: var(--accent); animation: dotPulse 2s ease-in-out infinite; }
+  .pill.warn { background: var(--fg-soft); color: var(--muted); }
+  .pill.warn .pill-dot { background: var(--muted); }
+  .pill.off { background: var(--fg-soft); color: var(--muted); }
+  .pill.off .pill-dot { background: var(--muted); }
+  .pill.err { background: var(--danger-soft); color: var(--danger); }
+  .pill.err .pill-dot { background: var(--danger); }
+
+  .rule { border:0; border-top:1px solid var(--border); margin:0; }
+
+  /* ─── hero / connection ──────────────────────────────────────── */
+  .hero-card { position: relative; padding: 28px 32px; overflow:hidden; }
+  .hero-row { display:flex; align-items:center; gap: 20px; }
+  .hero-ring {
+    width: 48px; height: 48px; flex-shrink:0;
+    border-radius: 50%;
+    display:grid; place-items:center;
+    background: radial-gradient(circle at 50% 40%, color-mix(in oklch, var(--accent) 16%, transparent), transparent 70%);
+    border: 1px solid var(--border);
+    position: relative;
+  }
+  .hero-ring::before { content:''; position:absolute; inset:0; border-radius:50%; border: 1px solid color-mix(in oklch, var(--accent) 45%, transparent); animation: pulseRing 2.4s ease-out infinite; }
+  .hero-ring svg { width: 30px; height: 30px; stroke: var(--accent); fill:none; stroke-width: 1.6; }
+  .hero-card.disconnected .hero-ring { background: radial-gradient(circle at 50% 40%, color-mix(in oklch, var(--muted) 10%, transparent), transparent 70%); }
+  .hero-card.disconnected .hero-ring::before { border-color: transparent; animation: none; }
+  .hero-card.disconnected .hero-ring svg { stroke: var(--muted); }
+
+  .bar-track { height:6px; border-radius:999px; background: var(--border); overflow:hidden; }
+  .bar-fill { display:block; height:100%; background: var(--fg); border-radius:999px; animation: barFill 1s cubic-bezier(.16,1,.3,1) both; }
+
+  .sparkline-svg { width:100%; height:36px; overflow:visible; margin-top:4px; }
+  .sparkline-svg polyline { fill:none; stroke: var(--fg); stroke-width:1.5; stroke-linecap:round; stroke-linejoin:round; vector-effect:non-scaling-stroke; opacity:0.6; }
+
+  .step-row { display:flex; align-items:center; gap:10px; padding: 7px 0; }
+  .step-icon { width:20px; height:20px; border-radius:50%; display:grid; place-items:center; flex-shrink:0; font-size:11px; }
+  .step-icon.done { background: var(--accent-soft); color: var(--accent); }
+  .step-icon.active { background: var(--fg-soft-2); color: var(--fg); }
+  .step-icon.active svg { animation: spinSlow 1.1s linear infinite; }
+  .step-icon.pending { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  .step-icon svg { width:11px; height:11px; }
+  .step-row.done span.label { color: var(--fg); }
+  .step-row.pending span.label { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topnav" data-od-id="topnav">
+    <div class="brand" data-od-id="brand">
+      <img src="../pubilc/miaovps-head.png" alt="MiaoVPS" />
+      <span>MiaoVPS</span>
+    </div>
+    <nav class="topnav-nav" id="nav">
+      <a class="nav-item active" data-page="home" data-od-id="nav-home">
+        <svg viewBox="0 0 24 24"><path d="M3 12 12 3l9 9"/><path d="M5 10v10h14V10"/></svg>
+        首页
+      </a>
+      <a class="nav-item" data-page="nodes" data-od-id="nav-nodes">
+        <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        节点
+      </a>
+      <a class="nav-item" data-page="devices" data-od-id="nav-devices">
+        <svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="14" rx="2"/><path d="M9 21h6M12 17v4"/></svg>
+        设备
+      </a>
+      <a class="nav-item" data-page="settings" data-od-id="nav-settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        设置
+      </a>
+    </nav>
+    <div class="topnav-right">
+      <div class="topnav-node" data-od-id="topnav-node">
+        <span class="dot"></span>
+        <span class="meta" style="color:var(--fg);">新加坡 · SG-01</span>
+      </div>
+      
+    </div>
+  </header>
+
+  <div class="main">
+    <div class="page">
+      <!-- ══ 首页 ══ -->
+      <div class="page-inner active" id="page-home" data-od-id="page-home">
+        <section class="card hero-card" id="connection-card" data-od-id="connection-card">
+          <div class="hero-row" style="margin-bottom: 0;">
+            <div class="hero-ring" id="hero-ring">
+              <svg viewBox="0 0 24 24" style="width:22px;height:22px;"><path d="M5 12.5a10 10 0 0 1 14 0"/><path d="M8 15.5a6 6 0 0 1 8 0"/><circle cx="12" cy="18.5" r="1.4" fill="currentColor" stroke="none"/></svg>
+            </div>
+            <div style="flex:1;min-width:0;">
+              <div class="row" style="gap:10px;margin-bottom:3px;">
+                <h2 style="font-size:20px;">Singapore VPS</h2>
+                <span class="pill ok" id="hero-pill"><span class="pill-dot"></span>已连接</span>
+              </div>
+              <p class="num" style="color:var(--muted);font-size:13px;">203.0.113.18 · RTT 43ms · WireGuard</p>
+            </div>
+            <button class="btn btn-danger" id="btn-disconnect">断开连接</button>
+          </div>
+          <hr class="rule" style="margin: 20px 0;" />
+          <div class="bento" style="grid-template-columns: repeat(4,1fr);">
+            <div class="stack" style="gap:4px;">
+              <span class="meta">连接时长</span>
+              <span class="num" id="duration" style="font-size:18px;font-weight:600;">01:42:18</span>
+            </div>
+            <div>
+              <span class="meta" style="display:block;margin-bottom:4px;">已传输</span>
+              <span class="num" style="font-size:18px;font-weight:600;">1.2 GB</span>
+            </div>
+            <div>
+              <span class="meta" style="display:block;margin-bottom:4px;">在线设备</span>
+              <span class="num" style="font-size:18px;font-weight:600;">3 台</span>
+            </div>
+            <div>
+              <span class="meta" style="display:block;margin-bottom:4px;">出口 IP</span>
+              <span class="num" style="font-size:14px;font-weight:500;color:var(--muted);">203.0.113.18</span>
+            </div>
+          </div>
+        </section>
+
+        <div class="bento" data-od-id="stat-row">
+          <div class="card hoverable span-3">
+            <div class="row-between" style="margin-bottom:4px;">
+              <span class="meta">下载速率</span>
+              <span class="num" style="font-size:24px;font-weight:700;">3.8 <span style="font-size:13px;color:var(--muted);font-weight:500;">MB/s</span></span>
+            </div>
+            <svg class="sparkline-svg" viewBox="0 0 100 36" preserveAspectRatio="none"><polyline points="0,14 9,17 18,8 27,12 36,3 45,9 55,0 64,15 73,5 82,10 91,1 100,7"/></svg>
+          </div>
+          <div class="card hoverable span-3">
+            <div class="row-between" style="margin-bottom:4px;">
+              <span class="meta">上传速率</span>
+              <span class="num" style="font-size:24px;font-weight:700;">420 <span style="font-size:13px;color:var(--muted);font-weight:500;">KB/s</span></span>
+            </div>
+            <svg class="sparkline-svg" viewBox="0 0 100 36" preserveAspectRatio="none"><polyline points="0,14 9,8 18,13 27,2 36,11 45,6 55,0 64,9 73,4 82,6 91,2 100,2"/></svg>
+          </div>
+        </div>
+
+        <div class="card hoverable" data-od-id="node-resource">
+          <p class="row-between" style="margin-bottom: 16px;">
+            <span style="font-weight:600;">节点资源</span>
+            <span class="pill ok"><span class="pill-dot"></span>WireGuard 正常 · 3 台设备</span>
+          </p>
+          <div class="bento" style="grid-template-columns: repeat(3,1fr);">
+            <div class="stack" style="gap:6px;">
+              <p class="row-between"><span class="meta">CPU</span><span class="num">4%</span></p>
+              <div class="bar-track"><span class="bar-fill" style="width:4%;"></span></div>
+            </div>
+            <div class="stack" style="gap:6px;">
+              <p class="row-between"><span class="meta">内存</span><span class="num">21%</span></p>
+              <div class="bar-track"><span class="bar-fill" style="width:21%; animation-delay:.06s;"></span></div>
+            </div>
+            <div class="stack" style="gap:6px;">
+              <p class="row-between"><span class="meta">磁盘</span><span class="num">15%</span></p>
+              <div class="bar-track"><span class="bar-fill" style="width:15%; animation-delay:.12s;"></span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══ 节点 ══ -->
+      <div class="page-inner" id="page-nodes" data-od-id="page-nodes">
+        <div class="page-header">
+          <h2>我的节点</h2>
+          <button class="btn btn-primary" id="btn-add-node">+ 添加 VPS</button>
+        </div>
+
+        <div class="bento" data-od-id="node-list">
+          <div class="card hoverable span-6 row-between">
+            <div class="row" style="gap:14px;">
+              <span style="width:8px; height:8px; border-radius:50%; background:var(--accent); flex-shrink:0; box-shadow:0 0 0 4px var(--accent-soft);"></span>
+              <div>
+                <p style="font-weight:600;">Singapore VPS · SG-01</p>
+                <p class="meta" style="margin-top:4px;">203.0.113.18 · RTT 43ms · Ubuntu 24.04</p>
+              </div>
+            </div>
+            <div class="row" style="gap:8px;">
+              <span class="pill ok"><span class="pill-dot"></span>已连接</span>
+              <button class="btn btn-ghost">详情</button>
+            </div>
+          </div>
+          <div class="card hoverable span-6 row-between">
+            <div class="row" style="gap:14px;">
+              <span style="width:8px; height:8px; border-radius:50%; background:var(--muted); flex-shrink:0;"></span>
+              <div>
+                <p style="font-weight:600;">Tokyo VPS · JP-02</p>
+                <p class="meta" style="margin-top:4px;">198.51.100.42 · RTT 118ms · Debian 12</p>
+              </div>
+            </div>
+            <div class="row" style="gap:8px;">
+              <span class="pill off"><span class="pill-dot"></span>未连接</span>
+              <button class="btn btn-secondary">连接</button>
+              <button class="btn btn-ghost">详情</button>
+            </div>
+          </div>
+          <div class="card hoverable span-6 row-between">
+            <div class="row" style="gap:14px;">
+              <span style="width:8px; height:8px; border-radius:50%; background:var(--fg); flex-shrink:0;"></span>
+              <div>
+                <p style="font-weight:600;">Frankfurt VPS · DE-03</p>
+                <p class="meta" style="margin-top:4px;">203.0.113.90 · WireGuard 握手超时</p>
+              </div>
+            </div>
+            <div class="row" style="gap:8px;">
+              <span class="pill err"><span class="pill-dot"></span>连接失败</span>
+              <button class="btn btn-secondary">诊断</button>
+              <button class="btn btn-ghost">详情</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card hoverable" data-od-id="deploy-progress">
+          <p class="eyebrow" style="margin-bottom: 16px;">Frankfurt VPS 部署进度</p>
+          <div class="stack" style="gap:2px;">
+            <p class="step-row done"><span class="step-icon done">✓</span><span class="label">备份现有配置</span></p>
+            <p class="step-row done"><span class="step-icon done">✓</span><span class="label">安装 WireGuard</span></p>
+            <p class="step-row done"><span class="step-icon done">✓</span><span class="label">生成密钥</span></p>
+            <p class="step-row done"><span class="step-icon done">✓</span><span class="label">写入配置</span></p>
+            <p class="step-row done"><span class="step-icon done">✓</span><span class="label">配置路由与 NAT</span></p>
+            <p class="step-row"><span class="step-icon active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 0 1 10 10"/></svg></span><span class="label">启动 WireGuard 服务</span></p>
+            <p class="step-row pending"><span class="step-icon pending">·</span><span class="label">验证握手</span></p>
+            <p class="step-row pending"><span class="step-icon pending">·</span><span class="label">验证出口 IP</span></p>
+            <p class="step-row pending"><span class="step-icon pending">·</span><span class="label">完成</span></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══ 设备 ══ -->
+      <div class="page-inner" id="page-devices" data-od-id="page-devices">
+        <div class="page-header">
+          <h2>设备管理</h2>
+          <button class="btn btn-primary" id="btn-add-device">+ 添加设备</button>
+        </div>
+
+        <div class="bento" data-od-id="device-list">
+          <div class="card hoverable span-3 stack" style="gap:12px;">
+            <div class="row-between">
+              <span style="font-weight:600;">MacBook Pro</span>
+              <span class="pill ok"><span class="pill-dot"></span>在线</span>
+            </div>
+            <p class="num meta">10.66.66.2 · 刚刚</p>
+            <p class="num meta">↓2.1GB ↑340MB</p>
+          </div>
+          <div class="card hoverable span-3 stack" style="gap:12px;">
+            <div class="row-between">
+              <span style="font-weight:600;">iPhone 15</span>
+              <span class="pill warn"><span class="pill-dot"></span>最近在线</span>
+            </div>
+            <p class="num meta">10.66.66.3 · 6 小时前</p>
+            <p class="num meta">↓820MB ↑95MB</p>
+          </div>
+          <div class="card hoverable span-3 stack" style="gap:12px;">
+            <div class="row-between">
+              <span style="font-weight:600;">Windows 台式机</span>
+              <span class="pill off"><span class="pill-dot"></span>离线</span>
+            </div>
+            <p class="num meta">10.66.66.4 · 3 天前</p>
+            <p class="num meta">↓12.4GB ↑1.8GB</p>
+          </div>
+          <div class="card hoverable span-3 stack" style="gap:12px;">
+            <div class="row-between">
+              <span style="font-weight:600;">备用平板</span>
+              <span class="pill off"><span class="pill-dot"></span>已禁用</span>
+            </div>
+            <p class="num meta">10.66.66.5 · 从未连接</p>
+            <p class="num meta">无</p>
+          </div>
+        </div>
+
+        <div class="card hoverable" data-od-id="device-detail">
+          <p class="row-between" style="margin-bottom: 16px;">
+            <span style="font-weight:600;">MacBook Pro · 详情</span>
+            <span class="pill ok"><span class="pill-dot"></span>在线</span>
+          </p>
+          <div class="bento" style="grid-template-columns: repeat(3,1fr);">
+            <p class="stack" style="gap:4px;"><span class="meta">虚拟 IP</span><span class="num">10.66.66.2</span></p>
+            <p class="stack" style="gap:4px;"><span class="meta">公钥指纹</span><span class="num">4F:2A:9C:E1</span></p>
+            <p class="stack" style="gap:4px;"><span class="meta">创建时间</span><span class="num">2026-06-02</span></p>
+            <p class="stack" style="gap:4px;"><span class="meta">DNS</span><span class="num">1.1.1.1</span></p>
+            <p class="stack" style="gap:4px;"><span class="meta">MTU</span><span class="num">1380</span></p>
+            <p class="stack" style="gap:4px;"><span class="meta">AllowedIPs</span><span class="num">0.0.0.0/0</span></p>
+          </div>
+          <hr class="rule" style="margin: 18px 0;" />
+          <div class="row" style="gap:10px;">
+            <button class="btn btn-secondary">导出配置 (.conf)</button>
+            <button class="btn btn-secondary">显示二维码</button>
+            <button class="btn btn-danger">删除设备</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══ 设置 ══ -->
+      <div class="page-inner" id="page-settings" data-od-id="page-settings">
+        <div class="bento">
+          <div class="card hoverable span-3" data-od-id="settings-credential">
+            <p style="font-weight:600; margin-bottom:14px;">凭据策略</p>
+            <div class="stack" style="gap:12px;">
+              <p class="row-between"><span>SSH 私钥存储位置</span><span class="meta">系统 Keychain</span></p>
+              <p class="row-between"><span>连接前二次确认</span><span class="meta">已开启</span></p>
+            </div>
+          </div>
+          <div class="card hoverable span-3" data-od-id="settings-default">
+            <p style="font-weight:600; margin-bottom:14px;">默认参数</p>
+            <div class="stack" style="gap:12px;">
+              <p class="row-between"><span>代理模式</span><span class="meta">全局模式</span></p>
+              <p class="row-between"><span>默认 DNS</span><span class="num">1.1.1.1</span></p>
+              <p class="row-between"><span>默认 MTU</span><span class="num">1380</span></p>
+            </div>
+          </div>
+          <div class="card hoverable span-3" data-od-id="settings-theme">
+            <p style="font-weight:600; margin-bottom:14px;">主题</p>
+            <div class="row" style="gap:10px;" id="theme-switch">
+              <button class="btn btn-secondary" data-theme-choice="light" id="theme-btn-light">浅色</button>
+              <button class="btn btn-primary" data-theme-choice="dark" id="theme-btn-dark">深色</button>
+            </div>
+          </div>
+          <div class="card hoverable span-3" data-od-id="settings-about">
+            <p style="font-weight:600; margin-bottom:14px;">关于</p>
+            <p class="meta">MiaoVPS v0.1.0 · 本地优先的私人 VPN 客户端 · 无需注册账户</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  (function() {
+    const saved = localStorage.getItem('miaovps-theme');
+    if (saved === 'light' || saved === 'dark') {
+      document.documentElement.setAttribute('data-theme', saved);
+    }
+  })();
+
+  function applyThemeButtons(theme) {
+    const lightBtn = document.getElementById('theme-btn-light');
+    const darkBtn = document.getElementById('theme-btn-dark');
+    if (!lightBtn || !darkBtn) return;
+    lightBtn.className = theme === 'light' ? 'btn btn-primary' : 'btn btn-secondary';
+    darkBtn.className = theme === 'dark' ? 'btn btn-primary' : 'btn btn-secondary';
+  }
+  applyThemeButtons(document.documentElement.getAttribute('data-theme') || 'dark');
+
+  const themeSwitch = document.getElementById('theme-switch');
+  if (themeSwitch) {
+    themeSwitch.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-theme-choice]');
+      if (!btn) return;
+      const theme = btn.dataset.themeChoice;
+      document.documentElement.setAttribute('data-theme', theme);
+      localStorage.setItem('miaovps-theme', theme);
+      applyThemeButtons(theme);
+    });
+  }
+
+  const navItems = document.querySelectorAll('.nav-item');
+  const pages = document.querySelectorAll('.page-inner');
+  navItems.forEach(item => {
+    item.addEventListener('click', () => {
+      const target = item.dataset.page;
+      navItems.forEach(n => n.classList.toggle('active', n === item));
+      pages.forEach(p => p.classList.toggle('active', p.id === 'page-' + target));
+    });
+  });
+
+  const disconnectBtn = document.getElementById('btn-disconnect');
+  const heroCard = document.getElementById('connection-card');
+  const heroPill = document.getElementById('hero-pill');
+  disconnectBtn.addEventListener('click', () => {
+    if (disconnectBtn.textContent === '断开连接') {
+      heroCard.classList.add('disconnected');
+      heroPill.className = 'pill off';
+      heroPill.innerHTML = '<span class="pill-dot"></span>未连接';
+      disconnectBtn.textContent = '重新连接';
+      disconnectBtn.className = 'btn btn-primary';
+    } else {
+      heroCard.classList.remove('disconnected');
+      heroPill.className = 'pill ok';
+      heroPill.innerHTML = '<span class="pill-dot"></span>已连接';
+      disconnectBtn.textContent = '断开连接';
+      disconnectBtn.className = 'btn btn-danger';
+    }
+  });
+</script>
+</body>
+</html>

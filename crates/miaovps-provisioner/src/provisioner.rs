@@ -4,7 +4,7 @@
 //! 所有操作通过 russh 执行远端命令，不安装长期 Agent。
 
 use crate::deploy::{DeploymentOptions, DeploymentProgress, StepResult, StepSender};
-use crate::detect::{DetectStatus, ServerReport};
+use crate::detect::{DetectKey, DetectStatus, ServerReport};
 use crate::error::{AppError, ErrorCode};
 use miaovps_core::DeploymentStep;
 use miaovps_ssh::SshSession;
@@ -240,93 +240,93 @@ impl SshProvisioner {
         let version = if os.contains("24.04") { "24.04" } else if os.contains("22.04") { "22.04" } else { "unknown" };
 
         if is_ubuntu && version != "unknown" {
-            report.add_item("操作系统", DetectStatus::Pass, &format!("Ubuntu {}", version), None);
+            report.add_item(DetectKey::Os, DetectStatus::Pass, &format!("Ubuntu {}", version), None);
         } else if is_ubuntu {
-            report.add_item("操作系统", DetectStatus::Warning, "Ubuntu 但版本非 22.04/24.04", Some("建议使用 Ubuntu 22.04 或 24.04 LTS"));
+            report.add_item(DetectKey::Os, DetectStatus::Warning, "Ubuntu 但版本非 22.04/24.04", Some("建议使用 Ubuntu 22.04 或 24.04 LTS"));
         } else {
-            report.add_item("操作系统", DetectStatus::Blocked, &format!("不支持的系统: {}", os.lines().next().unwrap_or("unknown")), Some("需要 Ubuntu 22.04 或 24.04"));
+            report.add_item(DetectKey::Os, DetectStatus::Blocked, &format!("不支持的系统: {}", os.lines().next().unwrap_or("unknown")), Some("需要 Ubuntu 22.04 或 24.04"));
         }
 
         // 2. 架构
         let arch = self.exec("uname -m").await.unwrap_or_default().trim().to_string();
         match arch.as_str() {
-            "x86_64" | "aarch64" => report.add_item("架构", DetectStatus::Pass, &arch, None),
-            _ => report.add_item("架构", DetectStatus::Blocked, &arch, Some("需要 x86_64 或 arm64")),
+            "x86_64" | "aarch64" => report.add_item(DetectKey::Arch, DetectStatus::Pass, &arch, None),
+            _ => report.add_item(DetectKey::Arch, DetectStatus::Blocked, &arch, Some("需要 x86_64 或 arm64")),
         }
 
         // 3. root/sudo 权限
         let whoami = self.exec("whoami").await.unwrap_or_default().trim().to_string();
         if whoami == "root" {
-            report.add_item("权限", DetectStatus::Pass, "root 用户", None);
+            report.add_item(DetectKey::Privilege, DetectStatus::Pass, "root 用户", None);
         } else {
             let sudo = self.exec("sudo -n true 2>/dev/null && echo ok || echo no").await.unwrap_or_default();
             if sudo.contains("ok") {
-                report.add_item("权限", DetectStatus::Pass, "免交互 sudo", None);
+                report.add_item(DetectKey::Privilege, DetectStatus::Pass, "免交互 sudo", None);
             } else {
-                report.add_item("权限", DetectStatus::Blocked, "需要 root 或免交互 sudo", Some("请使用 root 登录或配置 NOPASSWD sudo"));
+                report.add_item(DetectKey::Privilege, DetectStatus::Blocked, "需要 root 或免交互 sudo", Some("请使用 root 登录或配置 NOPASSWD sudo"));
             }
         }
 
         // 4. 公网 IPv4
         let ip = self.exec("curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo 'unknown'").await.unwrap_or_default().trim().to_string();
         if ip != "unknown" && !ip.is_empty() {
-            report.add_item("公网 IPv4", DetectStatus::Pass, &ip, None);
+            report.add_item(DetectKey::PublicIpv4, DetectStatus::Pass, &ip, None);
         } else {
-            report.add_item("公网 IPv4", DetectStatus::Warning, "无法检测公网 IP", Some("可能影响 VPN 连通性"));
+            report.add_item(DetectKey::PublicIpv4, DetectStatus::Warning, "无法检测公网 IP", Some("可能影响 VPN 连通性"));
         }
 
         // 5. WireGuard 安装状态
         let wg = self.exec("which wg 2>/dev/null && wg --version 2>/dev/null || echo 'not-installed'").await.unwrap_or_default();
         if wg.contains("not-installed") {
-            report.add_item("WireGuard", DetectStatus::Pass, "可安装", None);
+            report.add_item(DetectKey::WireGuard, DetectStatus::Pass, "可安装", None);
         } else {
-            report.add_item("WireGuard", DetectStatus::Pass, &format!("已安装: {}", wg.trim()), None);
+            report.add_item(DetectKey::WireGuard, DetectStatus::Pass, &format!("已安装: {}", wg.trim()), None);
         }
 
         // 6. systemd
         let systemd = self.exec("systemctl --version 2>/dev/null | head -1 || echo 'no'").await.unwrap_or_default();
         if systemd.contains("systemd") {
-            report.add_item("systemd", DetectStatus::Pass, systemd.trim(), None);
+            report.add_item(DetectKey::Systemd, DetectStatus::Pass, systemd.trim(), None);
         } else {
-            report.add_item("systemd", DetectStatus::Blocked, "systemd 不可用", Some("需要 systemd 管理 WireGuard 服务"));
+            report.add_item(DetectKey::Systemd, DetectStatus::Blocked, "systemd 不可用", Some("需要 systemd 管理 WireGuard 服务"));
         }
 
         // 7. IP Forward
         let forward = self.exec("sysctl net.ipv4.ip_forward 2>/dev/null").await.unwrap_or_default();
         if forward.contains("= 1") {
-            report.add_item("网络转发", DetectStatus::Pass, "已开启", None);
+            report.add_item(DetectKey::IpForward, DetectStatus::Pass, "已开启", None);
         } else {
-            report.add_item("网络转发", DetectStatus::Pass, "可配置", None);
+            report.add_item(DetectKey::IpForward, DetectStatus::Pass, "可配置", None);
         }
 
         // 8. 防火墙
         let fw = self.exec("which ufw 2>/dev/null && ufw status 2>/dev/null || which iptables 2>/dev/null && echo 'iptables' || echo 'none'").await.unwrap_or_default();
-        report.add_item("防火墙", DetectStatus::Pass, fw.trim(), None);
+        report.add_item(DetectKey::Firewall, DetectStatus::Pass, fw.trim(), None);
 
         // 9. UDP 端口
         let port_check = self.exec("ss -uln | grep ':51820 ' 2>/dev/null && echo 'occupied' || echo 'free'").await.unwrap_or_default();
         if port_check.contains("free") {
-            report.add_item("UDP 端口", DetectStatus::Pass, "51820 可用", None);
+            report.add_item(DetectKey::UdpPort, DetectStatus::Pass, "51820 可用", None);
         } else {
-            report.add_item("UDP 端口", DetectStatus::Blocked, "51820 已被占用", Some("请更换 WireGuard 监听端口或释放该端口"));
+            report.add_item(DetectKey::UdpPort, DetectStatus::Blocked, "51820 已被占用", Some("请更换 WireGuard 监听端口或释放该端口"));
         }
 
         // 10. 磁盘
         let disk = self.exec("df -BM / | tail -1 | awk '{print $4}' 2>/dev/null || echo '0'").await.unwrap_or_default().trim().to_string();
         let disk_mb: u64 = disk.trim_end_matches('M').parse().unwrap_or(0);
         if disk_mb > 200 {
-            report.add_item("磁盘空间", DetectStatus::Pass, &format!("{}MB 可用", disk_mb), None);
+            report.add_item(DetectKey::Disk, DetectStatus::Pass, &format!("{}MB 可用", disk_mb), None);
         } else {
-            report.add_item("磁盘空间", DetectStatus::Blocked, &format!("仅 {}MB", disk_mb), Some("需要至少 200MB"));
+            report.add_item(DetectKey::Disk, DetectStatus::Blocked, &format!("仅 {}MB", disk_mb), Some("需要至少 200MB"));
         }
 
         // 11. 内存
         let mem = self.exec("free -m | grep Mem | awk '{print $7}' 2>/dev/null || echo '0'").await.unwrap_or_default().trim().to_string();
         let mem_mb: u64 = mem.parse().unwrap_or(0);
         if mem_mb > 256 {
-            report.add_item("内存", DetectStatus::Pass, &format!("{}MB 可用", mem_mb), None);
+            report.add_item(DetectKey::Memory, DetectStatus::Pass, &format!("{}MB 可用", mem_mb), None);
         } else {
-            report.add_item("内存", DetectStatus::Blocked, &format!("仅 {}MB", mem_mb), Some("需要至少 256MB"));
+            report.add_item(DetectKey::Memory, DetectStatus::Blocked, &format!("仅 {}MB", mem_mb), Some("需要至少 256MB"));
         }
 
         report.finalize();

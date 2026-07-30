@@ -7,6 +7,10 @@
 pub mod credentials;
 pub mod service;
 pub mod session;
+pub mod tunnel;
+pub mod tunnel_ctl;
 
 pub use service::AppService;
-pub use session::ServiceError;
+pub use session::{ErrorDto, ServiceError};
+pub use tunnel::{TunnelMode, TunnelState, TunnelStatus};
+pub use tunnel_ctl::{TunnelCtl, TunnelCtlError};

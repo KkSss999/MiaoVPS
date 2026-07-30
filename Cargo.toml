@@ -11,6 +11,7 @@ members = [
     "crates/miaovps-connect",
     "crates/miaovps-app",
     "crates/miaovps-cli",
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]

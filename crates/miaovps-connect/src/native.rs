@@ -47,8 +47,8 @@ const MAX_FLUSH_PACKETS: usize = 16;
 /// 新 session — 旧 session 的在途包（keepalive）会被发到新端口，
 /// 而本地 `Tunn` 只持有新 session 的密钥，必然解不开。
 ///
-/// 这类瞬态无害。但**持续**的解密错误意味着密钥不匹配或包注入，
-/// 必须能和瞬态区分开，所以宽限期后升级为 warn。
+/// 这类瞬态无害。宽限期只对**可疑**错误有意义 ——
+/// 会话轮换类错误（见 `is_session_churn`）在整个生命周期都是正常的。
 const DECRYPT_GRACE: Duration = Duration::from_secs(3);
 /// 解密错误的日志抑制间隔 — 防止异常状态下刷屏
 const DECRYPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -207,8 +207,13 @@ pub struct TunnelStats {
     pub tx_bytes: AtomicU64,
     /// 入站明文字节数（VPS → TUN）
     pub rx_bytes: AtomicU64,
-    /// 解密错误计数
+    /// 可疑解密错误计数 —— index 对上但解不开（密钥不匹配 / 包注入）
+    ///
+    /// 不含会话轮换丢包，那些计入 `session_churn`。混在一起会让
+    /// 正常长连接看起来像遭到攻击。
     pub decrypt_errors: AtomicU64,
+    /// 会话轮换丢包 —— 旧 session 的在途包，正常现象
+    pub session_churn: AtomicU64,
     /// 因网络不可用而丢弃的出站包数
     pub tx_dropped: AtomicU64,
     /// 重连次数 — boringtun 放弃后我们强制复活的次数
@@ -233,6 +238,11 @@ impl TunnelStats {
 
     pub fn reconnects(&self) -> u64 {
         self.reconnects.load(Ordering::Relaxed)
+    }
+
+    /// 会话轮换丢包数 —— 正常现象，仅用于诊断
+    pub fn session_churn(&self) -> u64 {
+        self.session_churn.load(Ordering::Relaxed)
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -378,10 +388,15 @@ impl NativeTunnel {
         }
         let dropped = self.stats.tx_dropped.load(Ordering::Relaxed);
         if dropped > 0 {
-            line.push_str(&format!(" · 丢包 {dropped}"));
+            line.push_str(&format!(" · 断网丢包 {dropped}"));
         }
+        let churn = self.stats.session_churn();
+        if churn > 0 {
+            line.push_str(&format!(" · 换钥丢包 {churn}"));
+        }
+        // 只有这一项代表异常 —— 措辞上要和上面几个正常计数区分开
         if errs > 0 {
-            line.push_str(&format!(" · 解密错误 {errs}"));
+            line.push_str(&format!(" · ⚠ 解密错误 {errs}"));
         }
         line
     }
@@ -606,8 +621,14 @@ fn spawn_inbound(
                             }
                         }
                         TunnResult::Err(e) => {
-                            let total =
-                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                            // 会话轮换和真正的解密失败分开计数 —— 前者是
+                            // 长连接的正常产物，混在一起会掩盖真问题
+                            let counter = if is_session_churn(&e) {
+                                &stats.session_churn
+                            } else {
+                                &stats.decrypt_errors
+                            };
+                            let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             log_decrypt_error(
                                 &e,
                                 total,
@@ -644,19 +665,53 @@ fn mark_healthy(stats: &Arc<TunnelStats>) {
     }
 }
 
-/// 按「瞬态 vs 持续」分级记录解密错误
+/// 会话轮换导致的解密失败 —— 正常现象，不是安全问题
 ///
-/// 宽限期内降为 debug（会话交接残留），之后按间隔抑制地报 warn 并带上累计数 —
-/// 累计数是判断「一次性残留」还是「密钥不匹配」的关键信息。
+/// boringtun 只保留最近 8 个 session，槽位是 `session_index % 8`
+/// （见其 `noise/mod.rs` 的 `N_SESSIONS`）。每次握手都会取一个新的本地
+/// index，重连和每 120s 的 rekey 都会产生新 session。新 session 落到
+/// 某个槽位后，服务端**仍在用旧 session 加密的在途包**到达时，
+/// 槽里已经是新 session 了 —— `receive_packet_data` 比对
+/// `receiver_idx != self.receiving_index` 直接返回 `WrongIndex`。
+///
+/// 换句话说：每次会话轮换都会丢掉「旧密钥的在途包」，
+/// 数量取决于轮换瞬间链路上有多少包在飞。高带宽 + 高 RTT 链路上
+/// 一次轮换掉几十个包是正常的，TCP 自己会重传。
+///
+/// 这几类都属于此类：
+/// - `WrongIndex` — 槽位已被新 session 覆盖
+/// - `NoCurrentSession` — 槽位还没建立 session
+/// - `DuplicateCounter` / `InvalidCounter` 之外的重放窗口抖动
+///
+/// **真正可疑**的是 `InvalidAeadTag` / `WrongKey` / `InvalidMac`：
+/// index 对上了但解不开，才意味着密钥不匹配或有人注入包。
+fn is_session_churn(err: &boringtun::noise::errors::WireGuardError) -> bool {
+    use boringtun::noise::errors::WireGuardError as E;
+    matches!(
+        err,
+        E::WrongIndex | E::NoCurrentSession | E::DuplicateCounter | E::UnexpectedPacket
+    )
+}
+
+/// 按「会话轮换 vs 可疑」分级记录解密错误
+///
+/// 之前这里对所有错误都报 `持续出现说明密钥不匹配或存在包注入`，
+/// 但绝大多数是 `WrongIndex` —— 会话轮换的正常产物。在长连接上
+/// 每 120s rekey 一次，累计几百次 WrongIndex 完全正常，
+/// 却让日志看起来像遭到攻击。
 fn log_decrypt_error(
     err: &boringtun::noise::errors::WireGuardError,
     total: u64,
     started_at: Instant,
     last_log: &mut Option<Instant>,
 ) {
-    let elapsed = started_at.elapsed();
+    // 会话轮换类错误全生命周期都是 debug —— 它们不代表任何异常
+    if is_session_churn(err) {
+        tracing::debug!("[隧道] 会话轮换丢包 (正常): {err:?} — 累计 {total} 次");
+        return;
+    }
 
-    if elapsed < DECRYPT_GRACE {
+    if started_at.elapsed() < DECRYPT_GRACE {
         tracing::debug!("[隧道] 会话交接期解密失败 (预期): {err:?}");
         return;
     }
@@ -669,7 +724,7 @@ fn log_decrypt_error(
         *last_log = Some(Instant::now());
         tracing::warn!(
             "[隧道] 解密失败: {err:?} — 累计 {total} 次。\
-             持续出现说明密钥不匹配或存在包注入",
+             index 对上但解不开，说明密钥不匹配或存在包注入",
         );
     }
 }
@@ -976,5 +1031,52 @@ mod tests {
         assert_eq!(fmt_bytes(512), "512B");
         assert_eq!(fmt_bytes(1536), "1.5KiB");
         assert_eq!(fmt_bytes(3 * 1024 * 1024), "3.0MiB");
+    }
+
+    // ── 解密错误分类 ──
+    //
+    // 之前所有解密错误都报「密钥不匹配或存在包注入」。实际上长连接上
+    // 绝大多数是 WrongIndex —— 每 120s rekey 一次，旧 session 的在途包
+    // 必然解不开。误报会让用户以为遭到攻击。
+
+    #[test]
+    fn wrong_index_is_session_churn_not_attack() {
+        use boringtun::noise::errors::WireGuardError as E;
+        // 槽位被新 session 覆盖 —— rekey 和重连的必然产物
+        assert!(is_session_churn(&E::WrongIndex));
+        assert!(is_session_churn(&E::NoCurrentSession));
+        assert!(is_session_churn(&E::DuplicateCounter));
+    }
+
+    /// index 对上却解不开才是真问题 —— 这几类必须报警
+    #[test]
+    fn crypto_failures_are_suspicious() {
+        use boringtun::noise::errors::WireGuardError as E;
+        assert!(!is_session_churn(&E::InvalidAeadTag));
+        assert!(!is_session_churn(&E::WrongKey));
+        assert!(!is_session_churn(&E::InvalidMac));
+        assert!(!is_session_churn(&E::InvalidCounter));
+    }
+
+    #[test]
+    fn churn_and_errors_use_separate_counters() {
+        let stats = TunnelStats::default();
+        stats.session_churn.store(400, Ordering::Relaxed);
+        stats.decrypt_errors.store(2, Ordering::Relaxed);
+
+        assert_eq!(stats.session_churn(), 400);
+        // snapshot 的第三项只统计可疑错误，不含换钥丢包
+        assert_eq!(stats.snapshot().2, 2);
+    }
+
+    /// 健康行必须让「正常丢包」和「异常」在措辞上可区分
+    #[test]
+    fn health_line_marks_only_real_errors() {
+        let stats = TunnelStats::default();
+        stats.session_churn.store(400, Ordering::Relaxed);
+        // 换钥丢包不带警示符号
+        assert!(!format!(" · 换钥丢包 {}", stats.session_churn()).contains('⚠'));
+        // 解密错误带警示符号
+        assert!(format!(" · ⚠ 解密错误 {}", 2).contains('⚠'));
     }
 }

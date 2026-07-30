@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MiaoVPS · 前端原型概览</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Albert+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg:      #000000;
+    --surface: #0a0a0a;
+    --surface-2: #111111;
+    --fg:      #ffffff;
+    --muted:   #7a7a7a;
+    --border:  #242424;
+    --accent:  #63fe13;
+    --accent-secondary: #26251e;
+    --font-display: 'Albert Sans', system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+    --font-body:    'Albert Sans', system-ui, -apple-system, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+    --font-mono:    'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background: var(--bg); color: var(--fg); font-family: var(--font-body); display:grid; place-items:center; min-height:100vh; padding: 40px 20px; }
+  .wrap { max-width: 720px; width:100%; text-align:center; }
+  .brand { display:flex; align-items:center; justify-content:center; gap:12px; margin-bottom: 28px; }
+  .brand img { width:36px; height:36px; border-radius:8px; }
+  .brand span { font-family: var(--font-display); font-weight:700; font-size:22px; letter-spacing:-0.01em; }
+  h1 { font-family: var(--font-display); font-size: clamp(24px,4vw,32px); margin: 0 0 10px; letter-spacing:-0.01em; }
+  p.lead { color: var(--muted); margin: 0 0 36px; font-size:15px; }
+  .links { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+  @media (max-width:560px) { .links { grid-template-columns: 1fr; } }
+  a.card { display:block; background: var(--surface); border:1px solid var(--border); border-radius:8px; padding:28px 20px; text-decoration:none; color: var(--fg); transition: border-color .2s ease, transform .2s ease, background .2s ease; }
+  a.card:hover { border-color: color-mix(in oklch, var(--fg) 25%, var(--border)); transform: translateY(-2px); background: var(--surface-2); }
+  a.card .eyebrow { font-family: var(--font-mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase; color: var(--accent); margin: 0 0 8px; }
+  a.card h2 { font-size:18px; margin:0 0 6px; }
+  a.card p { color: var(--muted); font-size:13px; margin:0; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">
+      <img src="../public/miaovps-head.png" alt="MiaoVPS" />
+      <span>MiaoVPS</span>
+    </div>
+    <h1>前端原型 · v0.1.0</h1>
+    <p class="lead">本地优先的私人 VPN 客户端 · 桌面端 / 移动端两套高保真原型</p>
+    <div class="links">
+      <a class="card" href="desktop.html" data-od-id="link-desktop">
+        <p class="eyebrow">Desktop</p>
+        <h2>桌面端原型</h2>
+        <p>顶部导航 · 首页状态 · 节点部署 · 设备管理 · 设置</p>
+      </a>
+      <a class="card" href="mobile.html" data-od-id="link-mobile">
+        <p class="eyebrow">Mobile</p>
+        <h2>移动端原型</h2>
+        <p>iPhone 外框 · 底部 Tab · 4 个核心页面</p>
+      </a>
+    </div>
+  </div>
+</body>
+</html>

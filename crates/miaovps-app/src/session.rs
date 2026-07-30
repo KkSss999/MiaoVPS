@@ -37,6 +37,49 @@ impl ServiceError {
     pub fn other(msg: impl Into<String>) -> Self {
         ServiceError::Other(msg.into())
     }
+
+    /// 机器可读错误码 —— 前端按此分支处理，不要匹配错误文案
+    pub fn code(&self) -> &'static str {
+        match self {
+            ServiceError::App(_) => "app_error",
+            ServiceError::Ssh(_) => "ssh_error",
+            ServiceError::Cred(_) => "credential_error",
+            ServiceError::Storage(_) => "storage_error",
+            ServiceError::ServerNotFound(_) => "server_not_found",
+            ServiceError::DeviceNotFound(_) => "device_not_found",
+            ServiceError::WgNodeNotFound => "wg_node_not_found",
+            ServiceError::Other(_) => "other",
+        }
+    }
+}
+
+/// 可序列化错误 DTO —— Tauri command 的 Err 必须能过 IPC
+///
+/// `ServiceError` 内层包着 `SshError` 等不实现 Serialize 的类型，
+/// 所以走这层转换而不是给 ServiceError 直接 derive。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ErrorDto {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<ServiceError> for ErrorDto {
+    fn from(e: ServiceError) -> Self {
+        Self {
+            code: e.code().to_string(),
+            message: e.to_string(),
+        }
+    }
+}
+
+impl serde::Serialize for ServiceError {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        ErrorDto {
+            code: self.code().to_string(),
+            message: self.to_string(),
+        }
+        .serialize(s)
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
