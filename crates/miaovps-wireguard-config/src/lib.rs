@@ -89,7 +89,7 @@ pub fn generate_server_config(params: ServerConfigParams) -> String {
     if let Some(mtu) = params.mtu {
         config.push_str(&format!("MTU = {}\n", mtu));
     }
-    config.push_str("\n");
+    config.push('\n');
 
     for peer in &params.peers {
         config.push_str(&format!(

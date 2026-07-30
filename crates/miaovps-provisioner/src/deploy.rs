@@ -23,6 +23,8 @@ pub struct DeploymentProgress {
     pub status: DeploymentStatus,
     pub current_step: Option<DeploymentStep>,
     pub steps: HashMap<DeploymentStep, StepResult>,
+    /// 服务器 WireGuard 公钥 —— 客户端连接必需，部署成功后必然有值
+    pub server_public_key: Option<String>,
 }
 
 impl DeploymentProgress {
@@ -36,6 +38,7 @@ impl DeploymentProgress {
             status: DeploymentStatus::Pending,
             current_step: None,
             steps,
+            server_public_key: None,
         }
     }
 

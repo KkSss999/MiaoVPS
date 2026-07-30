@@ -174,7 +174,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
 
-        rows.iter().map(|r| row_to_server(r)).collect()
+        rows.iter().map(row_to_server).collect()
     }
 
     pub async fn update_server_status(&self, id: &str, status: &ServerStatus) -> Result<(), StorageError> {
@@ -236,7 +236,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
 
-        rows.iter().map(|r| row_to_device(r)).collect()
+        rows.iter().map(row_to_device).collect()
     }
 
     pub async fn get_device(&self, id: &str) -> Result<Option<Device>, StorageError> {

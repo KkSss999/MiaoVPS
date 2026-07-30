@@ -11,22 +11,17 @@ use serde::{Deserialize, Serialize};
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 路由策略
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingPolicy {
     /// 全局隧道：接管全部流量 (AllowedIPs = 0.0.0.0/0, ::/0)
+    #[default]
     FullTunnel,
     /// 分流模式：仅指定路由走隧道
     SplitTunnel {
         included_routes: Vec<String>,
         excluded_routes: Vec<String>,
     },
-}
-
-impl Default for RoutingPolicy {
-    fn default() -> Self {
-        RoutingPolicy::FullTunnel
-    }
 }
 
 impl RoutingPolicy {

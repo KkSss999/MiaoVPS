@@ -14,14 +14,160 @@ use tracing::{debug, info};
 //  SshProvisioner
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// 远端命令的提权方式
+#[derive(Debug, Clone, Default)]
+pub enum Privilege {
+    /// 已是 root，无需提权
+    #[default]
+    Root,
+    /// 免交互 sudo（NOPASSWD）
+    SudoNoPassword,
+    /// 需要密码的 sudo — 密码经 stdin 传给 `sudo -S`
+    SudoPassword(String),
+}
+
+impl Privilege {
+    /// 把命令包装成具备 root 权限的形式
+    ///
+    /// `sudo -S` 从 stdin 读密码，所以整条命令必须通过 `sudo -S sh -c '...'`
+    /// 执行，且**命令本身不能再占用 stdin**（heredoc 会和密码抢 stdin，
+    /// 曾导致密码被写进配置文件）。这里改用 `printf | base64 -d | sh` 传递
+    /// 脚本内容，彻底避开 stdin 争抢。
+    fn wrap(&self, cmd: &str) -> String {
+        match self {
+            Privilege::Root => cmd.to_string(),
+            Privilege::SudoNoPassword => format!("sudo -n sh -c {}", shell_quote(cmd)),
+            Privilege::SudoPassword(pw) => {
+                // 密码 + 换行喂给 sudo -S；脚本经 base64 传入，不碰 stdin
+                let b64 = base64_encode(cmd.as_bytes());
+                format!(
+                    "printf '%s\\n' {} | sudo -S -p '' sh -c \"echo {} | base64 -d | sh\"",
+                    shell_quote(pw),
+                    b64
+                )
+            }
+        }
+    }
+
+    /// 用于日志的脱敏描述
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Privilege::Root => "root",
+            Privilege::SudoNoPassword => "sudo (NOPASSWD)",
+            Privilege::SudoPassword(_) => "sudo (密码)",
+        }
+    }
+}
+
+/// 命令过长时截断，用于日志与错误信息
+fn elide(cmd: &str) -> String {
+    let one: String = cmd.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if one.chars().count() <= 100 {
+        one
+    } else {
+        format!("{}…", one.chars().take(100).collect::<String>())
+    }
+}
+
+/// 把 SshError 转成 AppError，保留命令上下文
+fn ssh_err(cmd: &str, e: miaovps_ssh::SshError) -> AppError {
+    AppError::new(
+        ErrorCode::InternalError,
+        "远程命令执行失败",
+        format!("{e}"),
+    )
+    .with_technical(format!("命令: {cmd}"))
+}
+
+/// 单引号包裹并转义，供 sh -c 使用
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// 最小 base64 编码 —— 避免为此引入依赖
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 pub struct SshProvisioner {
     session: SshSession,
     server_id: String,
+    privilege: Privilege,
 }
 
 impl SshProvisioner {
     pub fn new(session: SshSession, server_id: String) -> Self {
-        Self { session, server_id }
+        Self { session, server_id, privilege: Privilege::Root }
+    }
+
+    /// 指定提权方式（非 root 登录时必需）
+    pub fn with_privilege(mut self, privilege: Privilege) -> Self {
+        self.privilege = privilege;
+        self
+    }
+
+    /// 自动探测可用的提权方式
+    ///
+    /// `sudo_password` 为 None 时只尝试 root / NOPASSWD。
+    pub async fn detect_privilege(
+        session: &SshSession,
+        sudo_password: Option<&str>,
+    ) -> Result<Privilege, AppError> {
+        let whoami = session
+            .exec_lenient("whoami")
+            .await
+            .map_err(|e| ssh_err("whoami", e))?;
+        if whoami.trim() == "root" {
+            return Ok(Privilege::Root);
+        }
+
+        let nopass = session
+            .exec_lenient("sudo -n true 2>/dev/null && echo ok")
+            .await
+            .map_err(|e| ssh_err("sudo -n", e))?;
+        if nopass.contains("ok") {
+            return Ok(Privilege::SudoNoPassword);
+        }
+
+        let Some(pw) = sudo_password else {
+            return Err(AppError::new(
+                ErrorCode::SudoRequired,
+                "需要 root 权限",
+                format!("登录用户是 {}，且未配置免密 sudo", whoami.trim()),
+            )
+            .with_suggestion("请用 root 登录、配置 NOPASSWD sudo，或提供 sudo 密码"));
+        };
+
+        // 验证密码可用 —— 否则后续每一步都会失败且原因不明
+        let probe = Privilege::SudoPassword(pw.to_string());
+        let check = session
+            .exec_lenient(&probe.wrap("whoami"))
+            .await
+            .map_err(|e| ssh_err("sudo -S", e))?;
+        if check.contains("root") {
+            Ok(probe)
+        } else {
+            Err(AppError::new(
+                ErrorCode::SudoRequired,
+                "sudo 密码无效",
+                "提供的 sudo 密码被拒绝".to_string(),
+            )
+            .with_suggestion("确认密码正确，或改用 root 登录"))
+        }
     }
 
     /// 在远端执行命令（空输入），返回 stdout
@@ -30,18 +176,54 @@ impl SshProvisioner {
             AppError::new(
                 ErrorCode::InternalError,
                 "命令执行失败",
-                format!("远程命令执行出错"),
+                "远程命令执行出错".to_string(),
             )
             .with_technical(format!("{}: {}", cmd, e))
         })
     }
 
-    /// 执行命令并检查 exit code，返回 (stdout, stderr)
+    /// 以 root 权限执行命令，非零退出码即报错
+    ///
+    /// 部署的每一步都必须走这里 —— 原实现直接用 `exec` 且不加提权，
+    /// 非 root 登录时每步都会因权限不足失败。
+    async fn exec_root(&self, cmd: &str, step: &str) -> Result<String, AppError> {
+        // 日志里不能出现 wrap 后的命令 —— sudo 密码在里面
+        info!(target: "provisioner", server=%self.server_id, step, "执行: {}", elide(cmd));
+        let wrapped = self.privilege.wrap(cmd);
+        let out = self
+            .session
+            .exec_raw(&wrapped)
+            .await
+            .map_err(|e| ssh_err(&elide(cmd), e))?;
+
+        debug!(target: "provisioner", step, code=?out.exit_status,
+               output=%out.stdout.chars().take(200).collect::<String>());
+
+        if !out.success() {
+            let detail = if out.stderr.trim().is_empty() {
+                out.stdout.trim().to_string()
+            } else {
+                out.stderr.trim().to_string()
+            };
+            return Err(AppError::new(
+                ErrorCode::InternalError,
+                format!("步骤失败: {step}"),
+                detail.chars().take(400).collect::<String>(),
+            )
+            .with_technical(format!(
+                "命令: {} · 退出码: {:?} · 提权: {}",
+                elide(cmd),
+                out.exit_status,
+                self.privilege.describe()
+            )));
+        }
+        Ok(out.stdout)
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //  兼容旧调用名
     async fn exec_checked(&self, cmd: &str, step: &str) -> Result<String, AppError> {
-        info!(target: "provisioner", server=%self.server_id, step, "executing: {cmd}");
-        let output = self.exec(cmd).await?;
-        debug!(target: "provisioner", output=%output.chars().take(200).collect::<String>());
-        Ok(output)
+        self.exec_root(cmd, step).await
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -104,7 +286,7 @@ impl SshProvisioner {
         // 6. systemd
         let systemd = self.exec("systemctl --version 2>/dev/null | head -1 || echo 'no'").await.unwrap_or_default();
         if systemd.contains("systemd") {
-            report.add_item("systemd", DetectStatus::Pass, &systemd.trim().to_string(), None);
+            report.add_item("systemd", DetectStatus::Pass, systemd.trim(), None);
         } else {
             report.add_item("systemd", DetectStatus::Blocked, "systemd 不可用", Some("需要 systemd 管理 WireGuard 服务"));
         }
@@ -119,7 +301,7 @@ impl SshProvisioner {
 
         // 8. 防火墙
         let fw = self.exec("which ufw 2>/dev/null && ufw status 2>/dev/null || which iptables 2>/dev/null && echo 'iptables' || echo 'none'").await.unwrap_or_default();
-        report.add_item("防火墙", DetectStatus::Pass, &fw.trim().to_string(), None);
+        report.add_item("防火墙", DetectStatus::Pass, fw.trim(), None);
 
         // 9. UDP 端口
         let port_check = self.exec("ss -uln | grep ':51820 ' 2>/dev/null && echo 'occupied' || echo 'free'").await.unwrap_or_default();
@@ -194,7 +376,10 @@ impl SshProvisioner {
         match self.exec_checked(install_cmd, "install-wg").await {
             Ok(o) if o.contains("already-installed") => progress.update_step(DeploymentStep::InstallWireGuard, StepResult::Success),
             Ok(o) if o.contains("installed") => progress.update_step(DeploymentStep::InstallWireGuard, StepResult::Success),
-            Ok(_) => progress.fail(DeploymentStep::InstallWireGuard, "安装 WireGuard 失败".into()),
+            Ok(_) => {
+                progress.fail(DeploymentStep::InstallWireGuard, "安装 WireGuard 失败".into());
+                return Ok(progress);
+            }
             Err(e) => {
                 progress.fail(DeploymentStep::InstallWireGuard, e.to_string());
                 return Ok(progress);
@@ -213,12 +398,46 @@ impl SshProvisioner {
             }
         }
 
-        // 获取服务器公钥
-        let _server_pubkey = self.exec("cat /etc/wireguard/public.key 2>/dev/null || echo 'unknown'").await.unwrap_or_default().trim().to_string();
+        // 获取服务器公钥 —— 客户端连接必须用它，不能丢弃
+        let server_pubkey = match self.exec_root("cat /etc/wireguard/public.key", "read-pubkey").await
+        {
+            Ok(k) => k.trim().to_string(),
+            Err(e) => {
+                progress.fail(DeploymentStep::GenerateServerKeys, e.to_string());
+                return Ok(progress);
+            }
+        };
+        if server_pubkey.is_empty() {
+            progress.fail(
+                DeploymentStep::GenerateServerKeys,
+                "服务器公钥为空 —— 密钥生成疑似失败".into(),
+            );
+            return Ok(progress);
+        }
+        progress.server_public_key = Some(server_pubkey);
 
         // Step 5: 配置虚拟网络（原子写入）
         progress.update_step(DeploymentStep::ConfigureInterface, StepResult::Running);
-        let server_private = self.exec("cat /etc/wireguard/private.key").await.unwrap_or_default().trim().to_string();
+
+        // 私钥读取失败绝不能静默继续 —— 原实现 unwrap_or_default() 会把
+        // 空字符串写进 wg0.conf，部署"成功"但服务永远起不来
+        let server_private = match self
+            .exec_root("cat /etc/wireguard/private.key", "read-privkey")
+            .await
+        {
+            Ok(k) => k.trim().to_string(),
+            Err(e) => {
+                progress.fail(DeploymentStep::ConfigureInterface, e.to_string());
+                return Ok(progress);
+            }
+        };
+        if server_private.is_empty() {
+            progress.fail(
+                DeploymentStep::ConfigureInterface,
+                "服务器私钥为空 —— 拒绝写入无效配置".into(),
+            );
+            return Ok(progress);
+        }
         let wg_conf = format!(
             "[Interface]\nPrivateKey = {}\nListenPort = {}\nAddress = {}\n",
             server_private, options.wireguard_port, options.vpn_cidr
@@ -244,20 +463,30 @@ WGCONF
         progress.update_step(DeploymentStep::ConfigureRouting, StepResult::Running);
 
         // IP Forward
-        let forward_cmd = format!(
-            "echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-miaovps.conf && sysctl -p /etc/sysctl.d/99-miaovps.conf >/dev/null 2>&1"
-        );
-        let _ = self.exec_checked(&forward_cmd, "ip-forward").await;
+        let forward_cmd = "echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-miaovps.conf && sysctl -p /etc/sysctl.d/99-miaovps.conf >/dev/null 2>&1";
+        if let Err(e) = self.exec_checked(forward_cmd, "ip-forward").await {
+            progress.fail(DeploymentStep::ConfigureRouting, e.to_string());
+            return Ok(progress);
+        }
 
         // NAT (iptables)
         let nat_cmd = "iptables -t nat -C POSTROUTING -o $(ip route show default | awk '{print $5}') -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o $(ip route show default | awk '{print $5}') -j MASQUERADE";
-        let _ = self.exec_checked(nat_cmd, "nat").await;
+        if let Err(e) = self.exec_checked(nat_cmd, "nat").await {
+            progress.fail(DeploymentStep::ConfigureRouting, e.to_string());
+            return Ok(progress);
+        }
 
         // FORWARD rules
         let fwd1 = "iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT";
+        if let Err(e) = self.exec_checked(fwd1, "forward-wg0-in").await {
+            progress.fail(DeploymentStep::ConfigureRouting, e.to_string());
+            return Ok(progress);
+        }
         let fwd2 = "iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -j ACCEPT";
-        let _ = self.exec_checked(fwd1, "forward-wg0-in").await;
-        let _ = self.exec_checked(fwd2, "forward-wg0-out").await;
+        if let Err(e) = self.exec_checked(fwd2, "forward-wg0-out").await {
+            progress.fail(DeploymentStep::ConfigureRouting, e.to_string());
+            return Ok(progress);
+        }
 
         progress.update_step(DeploymentStep::ConfigureRouting, StepResult::Success);
 
