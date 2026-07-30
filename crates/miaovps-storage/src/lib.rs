@@ -5,7 +5,7 @@
 
 pub mod keychain;
 
-use miaovps_core::{Device, DeviceType, Server, ServerStatus};
+use miaovps_core::{Device, DeviceType, Server, ServerStatus, ServiceStatus, WireGuardNode};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use std::path::Path;
@@ -120,6 +120,25 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS wg_nodes (
+                server_id           TEXT PRIMARY KEY,
+                interface_name      TEXT NOT NULL DEFAULT 'wg0',
+                listen_port         INTEGER NOT NULL,
+                vpn_cidr            TEXT NOT NULL,
+                server_public_key   TEXT NOT NULL,
+                dns                 TEXT NOT NULL,
+                mtu                 INTEGER,
+                ipv6_enabled        INTEGER NOT NULL DEFAULT 0,
+                service_status      TEXT NOT NULL DEFAULT 'unknown',
+                FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 }
@@ -191,6 +210,34 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_server(&self, server: &Server) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            UPDATE servers SET name = ?1, host = ?2, ssh_port = ?3, ssh_user = ?4,
+                               auth_type = ?5, credential_ref = ?6, os_name = ?7,
+                               os_version = ?8, architecture = ?9, public_ipv4 = ?10,
+                               status = ?11, updated_at = ?12
+            WHERE id = ?13
+            "#,
+        )
+        .bind(&server.name)
+        .bind(&server.host)
+        .bind(server.ssh_port as i64)
+        .bind(&server.ssh_user)
+        .bind(serde_json::to_string(&server.auth_type).unwrap_or_default())
+        .bind(&server.credential_ref)
+        .bind(&server.os_name)
+        .bind(&server.os_version)
+        .bind(&server.architecture)
+        .bind(&server.public_ipv4)
+        .bind(serde_json::to_string(&server.status).unwrap_or_default())
+        .bind(server.updated_at)
+        .bind(&server.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn delete_server(&self, id: &str) -> Result<(), StorageError> {
         sqlx::query("DELETE FROM servers WHERE id = ?1")
             .bind(id)
@@ -201,8 +248,59 @@ impl Database {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-//  Device CRUD
+//  WireGuardNode CRUD
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+impl Database {
+    pub async fn upsert_wg_node(&self, node: &WireGuardNode) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO wg_nodes (server_id, interface_name, listen_port, vpn_cidr,
+                                  server_public_key, dns, mtu, ipv6_enabled, service_status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(server_id) DO UPDATE SET
+                interface_name    = excluded.interface_name,
+                listen_port       = excluded.listen_port,
+                vpn_cidr          = excluded.vpn_cidr,
+                server_public_key = excluded.server_public_key,
+                dns               = excluded.dns,
+                mtu               = excluded.mtu,
+                ipv6_enabled      = excluded.ipv6_enabled,
+                service_status    = excluded.service_status
+            "#,
+        )
+        .bind(&node.server_id)
+        .bind(&node.interface_name)
+        .bind(node.listen_port as i64)
+        .bind(&node.vpn_cidr)
+        .bind(&node.server_public_key)
+        .bind(serde_json::to_string(&node.dns).unwrap_or_default())
+        .bind(node.mtu.map(|m| m as i64))
+        .bind(node.ipv6_enabled as i64)
+        .bind(match &node.service_status {
+            ServiceStatus::Running => "running",
+            ServiceStatus::Stopped => "stopped",
+            ServiceStatus::Unknown => "unknown",
+        })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_wg_node(&self, server_id: &str) -> Result<Option<WireGuardNode>, StorageError> {
+        let row = sqlx::query("SELECT * FROM wg_nodes WHERE server_id = ?1")
+            .bind(server_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(r) => Ok(Some(row_to_wg_node(&r)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+
 
 impl Database {
     pub async fn insert_device(&self, device: &Device) -> Result<(), StorageError> {
@@ -323,6 +421,28 @@ impl Database {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  行转换
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+fn row_to_wg_node(r: &sqlx::sqlite::SqliteRow) -> Result<WireGuardNode, StorageError> {
+    use sqlx::Row;
+    let dns_str: String = r.try_get("dns")?;
+    let dns: Vec<String> = serde_json::from_str(&dns_str).unwrap_or_default();
+    let service_status = match r.try_get::<&str, _>("service_status").unwrap_or("unknown") {
+        "running" => ServiceStatus::Running,
+        "stopped" => ServiceStatus::Stopped,
+        _ => ServiceStatus::Unknown,
+    };
+    Ok(WireGuardNode {
+        server_id: r.try_get("server_id")?,
+        interface_name: r.try_get("interface_name")?,
+        listen_port: r.try_get::<i64, _>("listen_port")? as u16,
+        vpn_cidr: r.try_get("vpn_cidr")?,
+        server_public_key: r.try_get("server_public_key")?,
+        dns,
+        mtu: r.try_get::<Option<i64>, _>("mtu")?.map(|m| m as u16),
+        ipv6_enabled: r.try_get::<i64, _>("ipv6_enabled")? != 0,
+        service_status,
+    })
+}
 
 fn row_to_server(r: &sqlx::sqlite::SqliteRow) -> Result<Server, StorageError> {
     let auth_str: String = r.try_get("auth_type")?;
@@ -470,6 +590,58 @@ mod tests {
         db.delete_server("srv-1").await.unwrap();
         let devices = db.list_devices("srv-1").await.unwrap();
         assert!(devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_server_persists_inspect_results() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.insert_server(&test_server()).await.unwrap();
+
+        let mut srv = db.get_server("srv-1").await.unwrap().unwrap();
+        srv.os_name = Some("Ubuntu 24.04".into());
+        srv.public_ipv4 = Some("9.9.9.9".into());
+        srv.status = ServerStatus::Online;
+        srv.updated_at = 2000;
+        db.update_server(&srv).await.unwrap();
+
+        let reloaded = db.get_server("srv-1").await.unwrap().unwrap();
+        assert_eq!(reloaded.os_name.as_deref(), Some("Ubuntu 24.04"));
+        assert_eq!(reloaded.public_ipv4.as_deref(), Some("9.9.9.9"));
+        assert_eq!(reloaded.status, ServerStatus::Online);
+        assert_eq!(reloaded.updated_at, 2000);
+    }
+
+    /// 重复部署必须覆盖而不是报主键冲突 —— 服务端重新生成密钥后公钥会变
+    #[tokio::test]
+    async fn upsert_wg_node_overwrites_on_redeploy() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.insert_server(&test_server()).await.unwrap();
+
+        let mut node = WireGuardNode::new(
+            "srv-1".into(),
+            51820,
+            "10.66.66.0/24".into(),
+            "pubkey-v1".into(),
+            vec!["1.1.1.1".into()],
+        );
+        db.upsert_wg_node(&node).await.unwrap();
+
+        node.server_public_key = "pubkey-v2".into();
+        node.service_status = ServiceStatus::Running;
+        db.upsert_wg_node(&node).await.unwrap();
+
+        let got = db.get_wg_node("srv-1").await.unwrap().unwrap();
+        assert_eq!(got.server_public_key, "pubkey-v2");
+        assert_eq!(got.service_status, ServiceStatus::Running);
+        assert_eq!(got.dns, vec!["1.1.1.1".to_string()]);
+        assert_eq!(got.mtu, Some(1380));
+    }
+
+    #[tokio::test]
+    async fn wg_node_absent_before_deploy() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.insert_server(&test_server()).await.unwrap();
+        assert!(db.get_wg_node("srv-1").await.unwrap().is_none());
     }
 
     #[tokio::test]

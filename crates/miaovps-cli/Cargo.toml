@@ -22,6 +22,7 @@ miaovps-wireguard-config = { path = "../miaovps-wireguard-config" }
 miaovps-provisioner = { path = "../miaovps-provisioner" }
 miaovps-storage = { path = "../miaovps-storage" }
 miaovps-connect = { path = "../miaovps-connect" }
+miaovps-app = { path = "../miaovps-app" }
 base64 = "0.22"
 x25519-dalek.workspace = true
 libc = "0.2"

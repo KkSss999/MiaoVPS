@@ -3,7 +3,7 @@
 //! 通过 SSH 在 VPS 上执行 WireGuard 的检测、安装、配置和管理。
 //! 所有操作通过 russh 执行远端命令，不安装长期 Agent。
 
-use crate::deploy::{DeploymentOptions, DeploymentProgress, StepResult};
+use crate::deploy::{DeploymentOptions, DeploymentProgress, StepResult, StepSender};
 use crate::detect::{DetectStatus, ServerReport};
 use crate::error::{AppError, ErrorCode};
 use miaovps_core::DeploymentStep;
@@ -339,8 +339,22 @@ impl SshProvisioner {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     pub async fn deploy(&mut self, options: &DeploymentOptions) -> Result<DeploymentProgress, AppError> {
+        self.deploy_reporting(options, None).await
+    }
+
+    /// 一键部署，`events` 非空时实时推送每一步的状态变更
+    ///
+    /// CLI 用它打印进度，前端把事件转成 Tauri event。
+    pub async fn deploy_reporting(
+        &mut self,
+        options: &DeploymentOptions,
+        events: Option<StepSender>,
+    ) -> Result<DeploymentProgress, AppError> {
         let deployment_id = uuid::Uuid::new_v4().to_string();
         let mut progress = DeploymentProgress::new(deployment_id);
+        if let Some(tx) = events {
+            progress.set_sink(tx);
+        }
         info!(target: "provisioner", server=%self.server_id, "开始部署");
 
         // Step 1: 建立连接
@@ -556,5 +570,67 @@ WGCONF
     /// 获取服务器公钥
     pub async fn get_server_public_key(&mut self) -> Result<String, AppError> {
         self.exec_checked("cat /etc/wireguard/public.key 2>/dev/null || echo ''", "get-pubkey").await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_passes_command_through_unchanged() {
+        assert_eq!(Privilege::Root.wrap("wg show wg0"), "wg show wg0");
+    }
+
+    #[test]
+    fn sudo_nopassword_wraps_in_sh() {
+        let out = Privilege::SudoNoPassword.wrap("wg show wg0");
+        assert_eq!(out, "sudo -n sh -c 'wg show wg0'");
+    }
+
+    /// 带 heredoc 的脚本必须经 base64 传递 —— 明文拼进去会和 `sudo -S` 抢 stdin，
+    /// 曾导致密码被写进目标配置文件
+    #[test]
+    fn sudo_password_never_inlines_script_text() {
+        let script = "cat > /etc/wireguard/wg0.conf <<'EOF'\nPrivateKey = abc\nEOF";
+        let out = Privilege::SudoPassword("pw123".into()).wrap(script);
+
+        assert!(!out.contains("PrivateKey"), "脚本内容不能明文出现: {out}");
+        assert!(!out.contains("<<'EOF'"), "heredoc 不能进命令行: {out}");
+        assert!(out.contains("base64 -d"));
+        assert!(out.contains(&base64_encode(script.as_bytes())));
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quotes() {
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    /// describe() 会进日志，必须不含密码
+    #[test]
+    fn describe_does_not_leak_password() {
+        let p = Privilege::SudoPassword("topsecret".into());
+        assert!(!p.describe().contains("topsecret"));
+        assert_eq!(p.describe(), "sudo (密码)");
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn elide_collapses_newlines_and_truncates() {
+        assert_eq!(elide("a\nb"), "a b");
+        let long = "x".repeat(200);
+        let out = elide(&long);
+        assert_eq!(out.chars().count(), 101); // 100 + 省略号
+        assert!(out.ends_with('…'));
     }
 }

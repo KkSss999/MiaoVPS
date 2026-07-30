@@ -10,8 +10,11 @@ use anyhow::Result;
 use miaovps_connect::native::NativeTunnel;
 use miaovps_connect::tun::{TunConfig, TunInterface};
 use miaovps_connect::ConnectionValidator;
-use miaovps_core::{DeploymentStep, Device, DeviceType, Server, SshAuthType};
-use miaovps_provisioner::DeploymentOptions;
+use miaovps_app::credentials::ServerCredential;
+use miaovps_app::session::auth_type_hint;
+use miaovps_app::AppService;
+use miaovps_core::{DeploymentStatus, DeploymentStep, Device, DeviceType, Server, SshAuthType};
+use miaovps_provisioner::{DeploymentOptions, DetectStatus, StepEvent, StepResult};
 use miaovps_storage::Database;
 use miaovps_wireguard_config as wg;
 use profile::{decode_key, derive_public_key, ConnectionProfile};
@@ -123,25 +126,81 @@ fn print_help() {
 //  add-server
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async fn cmd_add_server(args: &[String]) -> Result<()> {
-    let name = args.get(2).cloned().unwrap_or_else(|| "My VPS".into());
-    let host = args.get(3).cloned().unwrap_or_else(|| {
-        eprintln!("错误: 需要提供服务器 IP 或域名");
-        std::process::exit(1);
-    });
-    let port: u16 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(22);
-    let user = args.get(5).cloned().unwrap_or_else(|| "root".into());
+/// 打开应用服务层 —— 所有需要 SSH 的命令都从这里拿入口
+async fn open_service() -> Result<AppService> {
+    let dir = data_dir();
+    let db = Database::open(dir.join("miaovps.db")).await?;
+    Ok(AppService::new(db, dir.join("credentials")))
+}
 
-    let server = Server::new(name.clone(), host.clone(), port, user.clone(), SshAuthType::Password);
-    let db = Database::open(data_dir().join("miaovps.db")).await?;
-    db.insert_server(&server).await?;
+async fn cmd_add_server(args: &[String]) -> Result<()> {
+    let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
+    let name = positional.first().map(|s| s.to_string()).unwrap_or_else(|| "My VPS".into());
+    let Some(host) = positional.get(1).map(|s| s.to_string()) else {
+        eprintln!("用法: miaovps add-server <name> <host> [port] [user] --password <pw> | --key <path>");
+        std::process::exit(1);
+    };
+    let port: u16 = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(22);
+    let user = positional.get(3).map(|s| s.to_string()).unwrap_or_else(|| "root".into());
+
+    // 凭据必须给 —— 不给的话服务器记录建了也连不上，后面 inspect/deploy 全失败
+    let password = flag_value(args, "--password");
+    let key_path = flag_value(args, "--key");
+    let passphrase = flag_value(args, "--passphrase");
+
+    let (auth_type, credential) = match (password, key_path) {
+        (Some(_), Some(_)) => {
+            eprintln!("错误: --password 与 --key 只能选一个");
+            std::process::exit(1);
+        }
+        (Some(pw), None) => (
+            SshAuthType::Password,
+            ServerCredential::Password { password: pw },
+        ),
+        (None, Some(path)) => (
+            SshAuthType::PrivateKey,
+            ServerCredential::PrivateKey { key_path: path, passphrase },
+        ),
+        (None, None) => {
+            eprintln!("错误: 需要提供 --password <pw> 或 --key <私钥路径>");
+            eprintln!("      凭据存到 ~/.miaovps/credentials/<server-id>.json (0600)");
+            std::process::exit(1);
+        }
+    };
+
+    let svc = open_service().await?;
+    let server = svc
+        .add_server(name.clone(), host.clone(), port, user.clone(), auth_type, credential)
+        .await?;
 
     println!("✓ 服务器已添加");
     println!("  ID:   {}", server.id);
     println!("  名称: {}", name);
     println!("  地址: {}:{}", host, port);
     println!("  用户: {}", user);
+    println!("  认证: {}", auth_type_hint(&server.auth_type));
+    println!("\n下一步: miaovps inspect {}", &server.id[..8]);
     Ok(())
+}
+
+/// 取 `--flag value` 形式的参数值
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+}
+
+/// 按 ID 前缀查服务器 —— 命令行里让用户敲完整 UUID 不现实
+async fn resolve_server_id(svc: &AppService, prefix: &str) -> Result<String> {
+    let servers = svc.list_servers().await?;
+    let matches: Vec<&Server> = servers.iter().filter(|s| s.id.starts_with(prefix)).collect();
+    match matches.len() {
+        0 => anyhow::bail!("服务器不存在: {prefix}（用 list-servers 查看）"),
+        1 => Ok(matches[0].id.clone()),
+        n => anyhow::bail!("{prefix} 匹配到 {n} 台服务器，请提供更长的 ID 前缀"),
+    }
 }
 
 async fn cmd_list_servers() -> Result<()> {
@@ -167,28 +226,44 @@ async fn cmd_list_servers() -> Result<()> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_inspect(args: &[String]) -> Result<()> {
-    let server_id = args.get(2).cloned().unwrap_or_else(|| {
+    let Some(prefix) = args.get(2) else {
         eprintln!("用法: miaovps inspect <server-id>");
         std::process::exit(1);
-    });
+    };
 
-    let db = Database::open(data_dir().join("miaovps.db")).await?;
-    let server = db.get_server(&server_id).await?.ok_or_else(|| {
-        anyhow::anyhow!("服务器不存在: {}", server_id)
-    })?;
+    let svc = open_service().await?;
+    let server_id = resolve_server_id(&svc, prefix).await?;
+    let server = svc
+        .list_servers()
+        .await?
+        .into_iter()
+        .find(|s| s.id == server_id)
+        .expect("resolve_server_id 已确认存在");
 
-    println!("正在检测 {} ({})...\n", server.name, server.host);
+    println!("正在检测 {} ({}:{})...\n", server.name, server.host, server.ssh_port);
 
-    // 实际使用需要通过 SSH 连接，此处展示接口
-    // let config = SshConnectionConfig { ... };
-    // let session = SshSession::connect_password(&config, "password").await?;
-    // let mut provisioner = SshProvisioner::new(session, server_id.clone());
-    // let report = provisioner.inspect().await?;
+    let report = svc.inspect_server(server_id).await?;
 
-    println!("环境检测需要 SSH 连接。");
-    println!("请在 MiaoVPS 桌面端中运行以使用完整功能。");
-    println!("服务器: {} ({}:{}@{})", server.name, server.ssh_user, server.host, server.ssh_port);
+    for item in &report.items {
+        let icon = match item.status {
+            DetectStatus::Pass => "✅",
+            DetectStatus::Warning => "⚠️ ",
+            DetectStatus::Blocked => "❌",
+        };
+        println!("  {} {:<12} {}", icon, item.name, item.message);
+        if let Some(sug) = &item.suggestion {
+            println!("       → {}", sug);
+        }
+    }
 
+    println!();
+    if report.blocked {
+        println!("❌ 存在阻塞项，部署前需要先解决上面标 ❌ 的问题。");
+    } else if report.all_passed {
+        println!("🎉 全部通过，可以部署: miaovps deploy {}", &prefix);
+    } else {
+        println!("⚠️  有警告项但不阻塞部署。");
+    }
     Ok(())
 }
 
@@ -197,32 +272,65 @@ async fn cmd_inspect(args: &[String]) -> Result<()> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_deploy(args: &[String]) -> Result<()> {
-    let server_id = args.get(2).cloned().unwrap_or_else(|| {
+    let Some(prefix) = args.get(2) else {
         eprintln!("用法: miaovps deploy <server-id>");
         std::process::exit(1);
-    });
+    };
 
-    let db = Database::open(data_dir().join("miaovps.db")).await?;
-    let server = db.get_server(&server_id).await?.ok_or_else(|| {
-        anyhow::anyhow!("服务器不存在: {}", server_id)
-    })?;
-
-    println!("即将部署 WireGuard 到 {} ({})", server.name, server.host);
-    println!();
+    let svc = open_service().await?;
+    let server_id = resolve_server_id(&svc, prefix).await?;
+    let server = svc
+        .list_servers()
+        .await?
+        .into_iter()
+        .find(|s| s.id == server_id)
+        .expect("resolve_server_id 已确认存在");
 
     let options = DeploymentOptions::default();
+    println!("即将部署 WireGuard 到 {} ({})\n", server.name, server.host);
     println!("部署配置:");
     println!("  WireGuard 端口: {}", options.wireguard_port);
     println!("  VPN 子网:       {}", options.vpn_cidr);
     println!("  DNS:            {}", options.dns.join(", "));
     println!("  MTU:            {}", options.mtu.unwrap_or(1380));
+    println!("\n开始部署 (共 9 步):");
 
-    println!("\n部署步骤 (共 9 步):");
-    for step in DeploymentStep::all_steps() {
-        println!("  {}  {}", if step == DeploymentStep::Connect { "→" } else { " " }, step.label());
+    // 事件通道实时打印进度 —— 部署要跑几十秒，不能等结束才出结果
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StepEvent>();
+    let printer = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            match ev.result {
+                StepResult::Running => println!("  ⏳ {}", ev.step.label()),
+                StepResult::Success => println!("  ✅ {}", ev.step.label()),
+                StepResult::Warning(w) => println!("  ⚠️  {} — {}", ev.step.label(), w),
+                StepResult::Failed(e) => println!("  ❌ {} — {}", ev.step.label(), e),
+                StepResult::Pending => {}
+            }
+        }
+    });
+
+    let progress = svc.deploy_server(server_id, Some(options), Some(tx)).await?;
+    // tx 已被 deploy_server 消费并 drop，printer 会自然收尾
+    let _ = printer.await;
+
+    println!();
+    match progress.status {
+        DeploymentStatus::Success => {
+            println!("🎉 部署成功");
+            if let Some(pk) = &progress.server_public_key {
+                println!("  服务器公钥: {}", pk);
+            }
+            println!("\n下一步: miaovps add-device {} <设备名>", prefix);
+        }
+        _ => {
+            println!("❌ 部署未完成 (状态: {:?})", progress.status);
+            for step in DeploymentStep::all_steps() {
+                if let Some(StepResult::Failed(e)) = progress.steps.get(&step) {
+                    println!("  失败步骤: {} — {}", step.label(), e);
+                }
+            }
+        }
     }
-
-    println!("\n部署需要 SSH 连接。请在 MiaoVPS 桌面端中运行。");
     Ok(())
 }
 
@@ -231,10 +339,10 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_add_device(args: &[String]) -> Result<()> {
-    let server_id = args.get(2).cloned().unwrap_or_else(|| {
+    let Some(prefix) = args.get(2) else {
         eprintln!("用法: miaovps add-device <server-id> <name> [type]");
         std::process::exit(1);
-    });
+    };
     let name = args.get(3).cloned().unwrap_or_else(|| "My Device".into());
     let dtype = match args.get(4).map(|s| s.as_str()) {
         Some("mac") | Some("Mac") => DeviceType::Mac,
@@ -245,26 +353,20 @@ async fn cmd_add_device(args: &[String]) -> Result<()> {
         _ => DeviceType::Other,
     };
 
-    // 生成密钥对
-    let keypair = wg::generate_keypair();
-    let vpn_address = format!("10.66.66.{}/32", 2); // 简化分配
+    let svc = open_service().await?;
+    let server_id = resolve_server_id(&svc, prefix).await?;
+    let (device, config) = svc.add_device(server_id, name.clone(), dtype.clone()).await?;
 
-    let _device = Device::new(
-        server_id.clone(),
-        name.clone(),
-        dtype.clone(),
-        keypair.public_key,
-        vpn_address,
-    );
-
-    println!("✓ 设备已创建");
+    println!("✓ 设备已创建并注册为服务端 peer");
+    println!("  ID:     {}", device.id);
     println!("  名称:   {}", name);
     println!("  类型:   {:?}", dtype);
-    println!("  公钥:   {}", wg::generate_keypair().public_key); // demo
-    println!("  地址:   10.66.66.2/32");
-    println!("\n⚠ 私钥已生成并应存储到系统 Keychain。");
-    println!("  下一步: 运行 'miaovps export-config <device-id>' 导出配置");
-
+    println!("  公钥:   {}", device.public_key);
+    println!("  地址:   {}", device.vpn_address);
+    println!("\nWireGuard 配置:\n");
+    println!("{}", config);
+    println!("私钥已存入系统 Keychain，可随时用以下命令重新导出:");
+    println!("  miaovps export-config {}", &device.id[..8]);
     Ok(())
 }
 
@@ -296,20 +398,57 @@ async fn cmd_list_devices(args: &[String]) -> Result<()> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_status(args: &[String]) -> Result<()> {
-    let _server_id = args.get(2).cloned().unwrap_or_else(|| {
+    let Some(prefix) = args.get(2) else {
         eprintln!("用法: miaovps status <server-id>");
         std::process::exit(1);
-    });
-    println!("状态查询需要 SSH 连接。请在 MiaoVPS 桌面端中运行。");
+    };
+
+    let svc = open_service().await?;
+    let server_id = resolve_server_id(&svc, prefix).await?;
+    let status = svc.server_status(server_id.clone()).await?;
+
+    if status.contains("not-running") {
+        println!("WireGuard 未运行。");
+    } else {
+        println!("{}", status.trim());
+    }
+
+    let devices = svc.list_devices(server_id).await?;
+    if !devices.is_empty() {
+        println!("\n已注册设备 ({} 台):", devices.len());
+        for d in &devices {
+            println!("  {}  {:<16} {}  {:?}", &d.id[..8], d.name, d.vpn_address, d.status());
+        }
+    }
     Ok(())
 }
 
 async fn cmd_export_config(args: &[String]) -> Result<()> {
-    let _device_id = args.get(2).cloned().unwrap_or_else(|| {
+    let Some(prefix) = args.get(2) else {
         eprintln!("用法: miaovps export-config <device-id>");
         std::process::exit(1);
-    });
-    println!("配置导出需要从 Keychain 读取私钥。请在 MiaoVPS 桌面端中运行。");
+    };
+
+    let svc = open_service().await?;
+    // 设备 ID 也支持前缀 —— 但需要遍历所有服务器的设备
+    let servers = svc.list_servers().await?;
+    let mut found: Option<Device> = None;
+    for s in &servers {
+        for d in svc.list_devices(s.id.clone()).await? {
+            if d.id.starts_with(prefix.as_str()) {
+                if found.is_some() {
+                    anyhow::bail!("{prefix} 匹配到多台设备，请提供更长的 ID 前缀");
+                }
+                found = Some(d);
+            }
+        }
+    }
+    let Some(device) = found else {
+        anyhow::bail!("设备不存在: {prefix}");
+    };
+
+    let config = svc.export_config(device.id).await?;
+    println!("{}", config);
     Ok(())
 }
 
@@ -1076,6 +1215,31 @@ fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_value_reads_following_token() {
+        let args = argv(&["miaovps", "add-server", "vps", "1.2.3.4", "--password", "pw"]);
+        assert_eq!(flag_value(&args, "--password").as_deref(), Some("pw"));
+        assert_eq!(flag_value(&args, "--key"), None);
+    }
+
+    /// `--password --key x` 里 password 没给值，不能把 `--key` 当成密码
+    #[test]
+    fn flag_value_rejects_adjacent_flag_as_value() {
+        let args = argv(&["miaovps", "add-server", "--password", "--key", "/tmp/id"]);
+        assert_eq!(flag_value(&args, "--password"), None);
+        assert_eq!(flag_value(&args, "--key").as_deref(), Some("/tmp/id"));
+    }
+
+    #[test]
+    fn flag_value_at_end_without_value_is_none() {
+        let args = argv(&["miaovps", "add-server", "vps", "1.2.3.4", "--password"]);
+        assert_eq!(flag_value(&args, "--password"), None);
+    }
 
     #[test]
     fn derives_vpn_network_from_gateway() {

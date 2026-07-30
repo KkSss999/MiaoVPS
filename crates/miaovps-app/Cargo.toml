@@ -1,0 +1,24 @@
+[package]
+name = "miaovps-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+miaovps-core.path = "../miaovps-core"
+miaovps-ssh.path = "../miaovps-ssh"
+miaovps-provisioner.path = "../miaovps-provisioner"
+miaovps-storage.path = "../miaovps-storage"
+miaovps-wireguard-config.path = "../miaovps-wireguard-config"
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# 文件权限设置
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -9,6 +9,7 @@ members = [
     "crates/miaovps-telemetry",
     "crates/miaovps-storage",
     "crates/miaovps-connect",
+    "crates/miaovps-app",
     "crates/miaovps-cli",
 ]
 
