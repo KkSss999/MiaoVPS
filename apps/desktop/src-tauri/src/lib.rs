@@ -6,6 +6,7 @@
 pub mod commands;
 pub mod profile;
 pub mod state;
+pub mod tray;
 
 use state::AppState;
 use tauri::Manager;
@@ -28,6 +29,14 @@ pub fn run() {
             let state = tauri::async_runtime::block_on(AppState::init())
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             app.manage(state);
+            app.manage(tray::TrayState::default());
+            tray::init(app.handle())?;
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = tray::refresh(&handle).await {
+                    tracing::warn!("初始化托盘菜单失败: {error}");
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -49,6 +58,7 @@ pub fn run() {
             commands::profile_summary,
             commands::use_device_as_local,
             commands::app_info,
+            commands::refresh_tray_menu,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

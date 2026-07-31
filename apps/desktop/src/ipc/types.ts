@@ -33,6 +33,8 @@ export type ErrorCode =
   | 'already_running'
   | 'external_tunnel'
   | 'profile_missing'
+  | 'inspection_required'
+  | 'tray_error'
   | 'other'
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -44,6 +46,7 @@ export type SshAuthType = 'password' | 'private_key' | 'ssh_agent'
 
 /** miaovps_core::ServerStatus */
 export type ServerStatus =
+  | 'pending_inspection'
   | 'added'
   | 'deploying'
   | 'online'

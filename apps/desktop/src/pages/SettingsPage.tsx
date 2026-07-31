@@ -7,15 +7,20 @@
 
 import { Alert } from '@/components/States'
 import { Pill } from '@/components/Pill'
+import { useMemo } from 'react'
 import { useTheme } from '@/hooks/useTheme'
 import { useAppInfo, useProfile, useTunnel } from '@/hooks/useTunnel'
+import { useServers } from '@/hooks/useServers'
 import { formatDate } from '@/lib/format'
+import { serverForProfile } from '@/lib/profileOwnership'
 
 export function SettingsPage() {
   const { theme, setTheme } = useTheme()
   const { data: info } = useAppInfo()
   const { data: profile } = useProfile()
   const { data: tunnel } = useTunnel()
+  const { data: servers } = useServers()
+  const managedProfile = useMemo(() => serverForProfile(servers, profile), [profile, servers])
 
   return (
     <div className="page-inner">
@@ -37,7 +42,7 @@ export function SettingsPage() {
         {/* ── 本机连接 ── */}
         <div className="card hoverable span-3">
           <p style={{ fontWeight: 600, marginBottom: 14 }}>本机连接</p>
-          {profile?.exists ? (
+          {managedProfile && profile?.exists ? (
             <div className="stack" style={{ gap: 12 }}>
               <Row label="服务器">
                 <span className="num truncate selectable">{profile.server_endpoint}</span>
@@ -60,6 +65,11 @@ export function SettingsPage() {
                 </Pill>
               </Row>
             </div>
+          ) : profile?.exists ? (
+            <p className="meta">
+              检测到未关联当前节点列表的旧 profile.json。它不会作为桌面端节点或一键连接使用；
+              在设备页面设为本机连接后会由新的受管配置替换。
+            </p>
           ) : (
             <p className="meta">尚未配置。在设备页面选一台设备「设为本机连接」。</p>
           )}

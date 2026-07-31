@@ -18,6 +18,7 @@ import { useServers } from '@/hooks/useServers'
 import { isIpcError } from '@/ipc/commands'
 import type { TunnelMode, TunnelState, TunnelStatus } from '@/ipc/types'
 import { formatBytes, formatDuration, formatRate } from '@/lib/format'
+import { serverForProfile } from '@/lib/profileOwnership'
 
 export function HomePage() {
   const toast = useToast()
@@ -32,12 +33,8 @@ export function HomePage() {
   const busy = connect.isPending || disconnect.isPending
   const view = useMemo(() => describeStatus(tunnel?.status), [tunnel?.status])
 
-  // profile 的 endpoint 是 IP:PORT，反查是哪台服务器
-  const nodeName = useMemo(() => {
-    if (!profile?.exists || !servers) return null
-    const host = profile.server_endpoint.split(':')[0]
-    return servers.find((s) => s.public_ipv4 === host || s.host === host)?.name ?? null
-  }, [profile, servers])
+  // profile 必须能反查到当前数据库中的节点，才允许作为桌面端本机连接使用。
+  const managedServer = useMemo(() => serverForProfile(servers, profile), [profile, servers])
 
   async function onConnect() {
     try {
@@ -71,6 +68,7 @@ export function HomePage() {
 
   const connected = tunnel?.status === 'connected'
   const hasProfile = profile?.exists === true
+  const hasManagedProfile = hasProfile && managedServer !== null
 
   return (
     <div className="page-inner">
@@ -92,13 +90,15 @@ export function HomePage() {
           所以看不到流量统计。要在这里管理连接，先在终端 Ctrl+C 停掉它。
         </Alert>
       )}
-      {!hasProfile && (
-        <Alert tone="info" title="尚未配置本机连接">
-          先在<Link to="/nodes" style={{ textDecoration: 'underline' }}>节点</Link>页面部署 VPS，
-          再到<Link to="/devices" style={{ textDecoration: 'underline' }}>设备</Link>页面添加本机设备并设为本机连接。
+      {!hasManagedProfile && (
+        <Alert tone={hasProfile ? 'warn' : 'info'} title={hasProfile ? '发现未关联的旧本机配置' : '尚未配置本机连接'}>
+          {hasProfile
+            ? '这份 profile.json 不属于当前节点列表，因此不会被当作 VPS 或用于一键连接。请在设备页面选择当前节点的设备并设为本机连接。'
+            : <>先在<Link to="/nodes" style={{ textDecoration: 'underline' }}>节点</Link>页面部署 VPS，
+              再到<Link to="/devices" style={{ textDecoration: 'underline' }}>设备</Link>页面添加本机设备并设为本机连接。</>}
         </Alert>
       )}
-      {profile?.exists && !profile.key_consistent && (
+      {hasManagedProfile && !profile.key_consistent && (
         <Alert tone="err" title="本机密钥不自洽">
           profile 中记录的公钥与私钥不匹配，握手会被服务端静默丢弃。
           请到设备页面重新设置本机连接。
@@ -114,7 +114,7 @@ export function HomePage() {
           <div style={{ flex: 1, minWidth: 0 }}>
             <div className="row" style={{ gap: 10, marginBottom: 3 }}>
               <h2 style={{ fontSize: 20 }} className="truncate">
-                {nodeName ?? (hasProfile ? '本机隧道' : '未配置节点')}
+                {managedServer?.name ?? '未配置节点'}
               </h2>
               <Pill tone={view.tone}>{view.label}</Pill>
               {tunnel?.mode && connected && (
@@ -122,7 +122,7 @@ export function HomePage() {
               )}
             </div>
             <p className="num selectable" style={{ color: 'var(--muted)', fontSize: 13 }}>
-              {hasProfile
+              {hasManagedProfile
                 ? `${profile.server_endpoint} · ${profile.client_ip} · MTU ${profile.mtu}`
                 : '添加节点后可一键连接'}
             </p>
@@ -160,8 +160,8 @@ export function HomePage() {
               <button
                 className="btn btn-primary"
                 onClick={tunnel?.status === 'stale' ? onDisconnect : onConnect}
-                disabled={busy || !hasProfile}
-                title={hasProfile ? undefined : '需要先配置本机连接'}
+                disabled={busy || !hasManagedProfile}
+                title={hasManagedProfile ? undefined : '需要先配置当前节点的本机连接'}
               >
                 {busy && <span className="spinner" aria-hidden />}
                 {tunnel?.status === 'stale' ? '清理残留' : '连接'}
@@ -178,7 +178,7 @@ export function HomePage() {
           <Metric label="重连次数" value={String(tunnel?.reconnects ?? 0)} />
           <Metric
             label="出口"
-            value={hasProfile ? (profile.server_endpoint.split(':')[0] ?? '—') : '—'}
+            value={hasManagedProfile ? (managedServer?.public_ipv4 ?? managedServer?.host ?? '—') : '—'}
             small
           />
         </div>
@@ -199,10 +199,10 @@ export function HomePage() {
           </Pill>
         </p>
         <div className="kv-grid">
-          <Kv label="本机地址" value={hasProfile ? profile.client_ip : '—'} />
-          <Kv label="网关" value={hasProfile ? profile.peer_ip : '—'} />
-          <Kv label="MTU" value={hasProfile ? String(profile.mtu) : '—'} />
-          <Kv label="DNS" value={hasProfile && profile.dns.length ? profile.dns.join(', ') : '—'} />
+          <Kv label="本机地址" value={hasManagedProfile ? profile.client_ip : '—'} />
+          <Kv label="网关" value={hasManagedProfile ? profile.peer_ip : '—'} />
+          <Kv label="MTU" value={hasManagedProfile ? String(profile.mtu) : '—'} />
+          <Kv label="DNS" value={hasManagedProfile && profile.dns.length ? profile.dns.join(', ') : '—'} />
           {/* 换钥丢包是每 120s rekey 的正常产物，与真正的解密错误分开显示 ——
               混在一起会让正常长连接看起来像遭到攻击 */}
           <Kv label="换钥丢包" value={`${tunnel?.session_churn ?? 0}（正常）`} />

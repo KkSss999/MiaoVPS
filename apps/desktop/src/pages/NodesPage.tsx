@@ -5,6 +5,7 @@
  */
 
 import { useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { Pill, type PillTone } from '@/components/Pill'
 import { StepList } from '@/components/StepList'
 import { EmptyState, ErrorState, SkeletonCard } from '@/components/States'
@@ -22,6 +23,9 @@ export function NodesPage() {
   const [showAdd, setShowAdd] = useState(false)
   const [inspecting, setInspecting] = useState<Server | null>(null)
   const [deployTarget, setDeployTarget] = useState<Server | null>(null)
+  const location = useLocation()
+  const traySelectedServerId = (location.state as { traySelectedServerId?: string } | null)
+    ?.traySelectedServerId
 
   const deploy = useDeployServer()
   const removeServer = useRemoveServer()
@@ -112,6 +116,7 @@ export function NodesPage() {
               server={server}
               busy={deploy.isPending && deployTarget?.id === server.id}
               anyDeploying={deploy.isPending}
+              selected={traySelectedServerId === server.id}
               onInspect={() => setInspecting(server)}
               onDeploy={() => onDeploy(server)}
               onRemove={() => onRemove(server)}
@@ -158,6 +163,7 @@ function NodeCard({
   server,
   busy,
   anyDeploying,
+  selected,
   onInspect,
   onDeploy,
   onRemove,
@@ -165,6 +171,7 @@ function NodeCard({
   server: Server
   busy: boolean
   anyDeploying: boolean
+  selected: boolean
   onInspect: () => void
   onDeploy: () => void
   onRemove: () => void
@@ -172,6 +179,12 @@ function NodeCard({
   const { data: node } = useWgNode(server.id)
   const view = describeServer(server.status, busy)
   const deployed = !!node
+  const canDeploy = ['added', 'online', 'incomplete'].includes(server.status)
+  const deployHint = canDeploy
+    ? undefined
+    : server.status === 'pending_inspection'
+      ? '请先完成环境检测'
+      : '检测尚未通过；请处理问题后重新检测'
 
   const subtitle = [
     server.public_ipv4 ?? server.host,
@@ -183,7 +196,7 @@ function NodeCard({
     .join(' · ')
 
   return (
-    <div className="card hoverable span-6 row-between">
+    <div className={`card hoverable span-6 row-between${selected ? ' selected' : ''}`}>
       <div className="list-row" style={{ minWidth: 0, flex: 1 }}>
         <span className={`dot ${view.dot}`} aria-hidden />
         <div style={{ minWidth: 0 }}>
@@ -200,7 +213,12 @@ function NodeCard({
         <button className="btn btn-secondary" onClick={onInspect} disabled={anyDeploying}>
           检测
         </button>
-        <button className="btn btn-secondary" onClick={onDeploy} disabled={anyDeploying}>
+        <button
+          className="btn btn-secondary"
+          onClick={onDeploy}
+          disabled={anyDeploying || !canDeploy}
+          title={deployHint}
+        >
           {busy && <span className="spinner" aria-hidden />}
           {deployed ? '重新部署' : '部署'}
         </button>
@@ -218,6 +236,8 @@ function describeServer(
 ): { tone: PillTone; label: string; dot: string } {
   if (busy) return { tone: 'busy', label: '部署中', dot: 'busy' }
   switch (status) {
+    case 'pending_inspection':
+      return { tone: 'off', label: '待检测', dot: 'off' }
     case 'online':
       return { tone: 'ok', label: 'WireGuard 就绪', dot: 'ok' }
     case 'deploying':

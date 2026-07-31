@@ -117,6 +117,13 @@ impl AppService {
             .await?
             .ok_or_else(|| ServiceError::ServerNotFound(server_id.clone()))?;
 
+        // 部署会改防火墙、路由和 WireGuard 配置；未做检测时不知道系统、
+        // 权限、端口和磁盘是否满足前提。UI 的禁用只是提示，这里才是
+        // 最终门禁，避免 IPC 或未来 CLI 调用绕过。
+        if !server.status.permits_deployment() {
+            return Err(ServiceError::InspectionRequired);
+        }
+
         info!(server_id=%server_id, "开始部署: {}", server.name);
         self.db
             .update_server_status(&server_id, &ServerStatus::Deploying)

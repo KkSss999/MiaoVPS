@@ -22,6 +22,8 @@ pub enum SshAuthType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerStatus {
+    /// 仅保存了 SSH 信息，尚未完成环境检测
+    PendingInspection,
     /// 已添加，未部署
     Added,
     /// 部署进行中
@@ -36,6 +38,14 @@ pub enum ServerStatus {
     ConfigBroken,
     /// 未完成部署
     Incomplete,
+}
+
+impl ServerStatus {
+    /// 只有完成成功检测、已部署或一次部署中断的节点才允许进入部署流程。
+    /// 其他状态必须先检测，避免把 SSH 可达误当作可安全修改远端网络。
+    pub fn permits_deployment(&self) -> bool {
+        matches!(self, Self::Added | Self::Online | Self::Incomplete)
+    }
 }
 
 /// VPS 服务器
@@ -73,7 +83,7 @@ impl Server {
             os_version: None,
             architecture: None,
             public_ipv4: None,
-            status: ServerStatus::Added,
+            status: ServerStatus::PendingInspection,
             created_at: now,
             updated_at: now,
         }
@@ -319,4 +329,23 @@ fn current_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Server, ServerStatus, SshAuthType};
+
+    #[test]
+    fn new_server_requires_inspection_before_deployment() {
+        let server = Server::new(
+            "new VPS".into(),
+            "203.0.113.10".into(),
+            22,
+            "root".into(),
+            SshAuthType::Password,
+        );
+        assert_eq!(server.status, ServerStatus::PendingInspection);
+        assert!(!server.status.permits_deployment());
+        assert!(ServerStatus::Added.permits_deployment());
+    }
 }

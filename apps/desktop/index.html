@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -11,7 +11,7 @@
       rel="stylesheet"
     />
     <script>
-      // 在首帧前套用主题，避免深色用户看到一闪白屏
+      // 在首帧前套用已保存主题；新用户默认浅色，避免首帧闪烁。
       try {
         var t = localStorage.getItem('miaovps-theme')
         if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t)
