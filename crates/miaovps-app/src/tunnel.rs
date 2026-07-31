@@ -19,6 +19,15 @@ use std::path::{Path, PathBuf};
 /// 状态文件名 —— 位于 data_dir 下
 pub const STATE_FILE: &str = "tunnel-state.json";
 
+/// 普通用户 App 向 root daemon 发出的停止请求。
+///
+/// 文件只表示一个布尔事件，不包含命令或用户输入。root daemon
+/// 只会检查它是否存在，所以不会形成任意特权命令通道。
+pub const STOP_REQUEST_FILE: &str = "tunnel-stop.request";
+
+/// 心跳超时（秒）—— 隧道每 5s 刷一次状态文件，取 12 倍余量
+pub const HEARTBEAT_TIMEOUT: i64 = 60;
+
 /// 隧道运行状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,7 +167,7 @@ impl TunnelState {
         let Ok(mut state) = serde_json::from_str::<Self>(&raw) else {
             return Self::probe_external(data_dir);
         };
-        if !process_alive(state.pid) {
+        if !process_alive(state.pid) || state.heartbeat_lost() {
             state.status = TunnelStatus::Stale;
             state.session_alive = false;
         }
@@ -187,6 +196,33 @@ impl TunnelState {
     pub fn clear(data_dir: &Path) {
         let _ = std::fs::remove_file(Self::path(data_dir));
         let _ = std::fs::remove_file(Self::path(data_dir).with_extension("json.tmp"));
+    }
+
+    /// 由普通用户 App 请求 root daemon 自行停止。
+    pub fn request_stop(data_dir: &Path) -> std::io::Result<()> {
+        std::fs::write(data_dir.join(STOP_REQUEST_FILE), b"stop\n")
+    }
+
+    /// root daemon 轮询停止请求。
+    pub fn stop_requested(data_dir: &Path) -> bool {
+        data_dir.join(STOP_REQUEST_FILE).is_file()
+    }
+
+    /// 启动前和正常退出后清理旧请求，避免下次连接立即退出。
+    pub fn clear_stop_request(data_dir: &Path) {
+        let _ = std::fs::remove_file(data_dir.join(STOP_REQUEST_FILE));
+    }
+
+    /// 心跳是否已丢失
+    ///
+    /// `EPERM` 当存活后，pid 判活不再能识别「pid 被系统回收给了别人」的情况。
+    /// 隧道每 5s 刷一次 `updated_at`，超过 `HEARTBEAT_TIMEOUT` 没更新就认定
+    /// 进程已经不在了。阈值取得比刷新间隔宽松很多，避免正常抖动误判。
+    fn heartbeat_lost(&self) -> bool {
+        if self.updated_at == 0 {
+            return false;
+        }
+        now_secs() - self.updated_at > HEARTBEAT_TIMEOUT
     }
 
     /// 连接时长（秒）
@@ -244,12 +280,22 @@ fn utun_has_address(addr: &str) -> bool {
 }
 
 /// 进程是否存活 —— `kill(pid, 0)` 不发信号，只做权限和存在性检查
+///
+/// **`EPERM` 必须算存活。** 隧道进程是 root 的，App 跑在普通用户下，
+/// `kill` 返回 `-1` + `EPERM`（进程在，但无权给它发信号），只有 `ESRCH`
+/// 才代表进程真的不存在。把 `EPERM` 当成死亡会让 App 把每一个正常运行的
+/// 隧道都判成 `Stale`：前端显示「异常退出」，而下一次 connect 因为
+/// `Stale` 分支会先跑一次 disconnect —— **把正在工作的隧道亲手拆掉**，
+/// 用户陷入「连上→显示崩溃→再连→真的断掉」的死循环。
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
     // Safety: signal 0 不投递信号，仅检查目标是否存在。无内存操作。
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 pub fn now_secs() -> i64 {
@@ -315,6 +361,58 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 隧道进程是 root 的，App 是普通用户 —— kill 返回 EPERM 不是死亡。
+    ///
+    /// 判错的后果不是显示错一个字：connect 的 Stale 分支会先 disconnect，
+    /// 于是 App 每次连接都会拆掉自己刚建好的隧道。
+    #[test]
+    fn root_owned_pid_is_alive_not_stale() {
+        // pid 1 (launchd) 属于 root，普通用户对它 kill(0) 必然 EPERM
+        assert!(
+            process_alive(1),
+            "对 root 进程 kill(0) 返回 EPERM，必须判为存活"
+        );
+    }
+
+    #[test]
+    fn pid_zero_and_missing_pid_are_dead() {
+        assert!(!process_alive(0));
+        assert!(!process_alive(999_999));
+    }
+
+    /// EPERM 当存活后，pid 回收给别人的情况只能靠心跳识别
+    #[test]
+    fn stale_heartbeat_becomes_stale_even_if_pid_alive() {
+        let dir = tmp_dir("heartbeat");
+        let mut state = TunnelState::connecting(TunnelMode::Full, "x".into(), "y".into());
+        state.status = TunnelStatus::Connected;
+        state.session_alive = true;
+        state.pid = 1; // 活着（root 的 launchd）
+        state.updated_at = now_secs() - HEARTBEAT_TIMEOUT - 5;
+        state.save(&dir).unwrap();
+
+        let loaded = TunnelState::load(&dir);
+        assert_eq!(loaded.status, TunnelStatus::Stale);
+        assert!(!loaded.session_alive);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_heartbeat_from_root_pid_stays_connected() {
+        let dir = tmp_dir("heartbeat-ok");
+        let mut state = TunnelState::connecting(TunnelMode::Full, "x".into(), "y".into());
+        state.status = TunnelStatus::Connected;
+        state.session_alive = true;
+        state.pid = 1;
+        state.updated_at = now_secs();
+        state.save(&dir).unwrap();
+
+        let loaded = TunnelState::load(&dir);
+        assert_eq!(loaded.status, TunnelStatus::Connected);
+        assert!(loaded.session_alive);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn corrupted_file_reads_as_disconnected() {
         let dir = tmp_dir("corrupt");
@@ -332,6 +430,20 @@ mod tests {
         TunnelState::clear(&dir);
         assert!(!TunnelState::path(&dir).exists());
         assert!(!TunnelState::path(&dir).with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_request_roundtrip() {
+        let dir = tmp_dir("stop-request");
+        TunnelState::clear_stop_request(&dir);
+        assert!(!TunnelState::stop_requested(&dir));
+
+        TunnelState::request_stop(&dir).unwrap();
+        assert!(TunnelState::stop_requested(&dir));
+
+        TunnelState::clear_stop_request(&dir);
+        assert!(!TunnelState::stop_requested(&dir));
         std::fs::remove_dir_all(&dir).ok();
     }
 

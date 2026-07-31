@@ -304,11 +304,31 @@ impl SshProvisioner {
         report.add_item(DetectKey::Firewall, DetectStatus::Pass, fw.trim(), None);
 
         // 9. UDP 端口
+        //
+        // 占用者是 wg0 自己时不算阻塞 —— 重新检测一台已经部署好的机器必然
+        // 撞上自己监听的 51820，报「阻塞」会让用户以为部署失败。
+        // WireGuard 是内核模块，socket 不挂在用户态进程上，所以只能反过来
+        // 问 wg：wg0 的 listen-port 是不是它。
         let port_check = self.exec("ss -uln | grep ':51820 ' 2>/dev/null && echo 'occupied' || echo 'free'").await.unwrap_or_default();
         if port_check.contains("free") {
             report.add_item(DetectKey::UdpPort, DetectStatus::Pass, "51820 可用", None);
         } else {
-            report.add_item(DetectKey::UdpPort, DetectStatus::Blocked, "51820 已被占用", Some("请更换 WireGuard 监听端口或释放该端口"));
+            // 走 exec_root：`wg show` 需要 root。`|| echo ''` 保证退出码为 0，
+            // 没有 wg0 时不会被 exec_root 的非零码检查判成失败。
+            let owner = self
+                .exec_root("wg show wg0 listen-port 2>/dev/null || echo ''", "detect-port")
+                .await
+                .unwrap_or_default();
+            if owner.trim() == "51820" {
+                report.add_item(
+                    DetectKey::UdpPort,
+                    DetectStatus::Pass,
+                    "51820 已被本机 wg0 占用（重新部署会复用）",
+                    None,
+                );
+            } else {
+                report.add_item(DetectKey::UdpPort, DetectStatus::Blocked, "51820 已被其他服务占用", Some("请更换 WireGuard 监听端口或释放该端口"));
+            }
         }
 
         // 10. 磁盘
@@ -461,6 +481,13 @@ impl SshProvisioner {
             r#"cat > /etc/wireguard/wg0.conf.tmp <<'WGCONF'
 {config}
 WGCONF
+# 重新部署时不能删掉已有设备。优先从内核运行态提取 Peer（它比磁盘配置
+# 更可信，也能修复旧版本已经覆盖过 wg0.conf 的情况）；首次部署则没有 Peer。
+if wg show wg0 >/dev/null 2>&1; then
+    wg showconf wg0 | awk '/^\[Peer\]/{{found=1}} found' >> /etc/wireguard/wg0.conf.tmp
+elif [ -f /etc/wireguard/wg0.conf ]; then
+    awk '/^\[Peer\]/{{found=1}} found' /etc/wireguard/wg0.conf >> /etc/wireguard/wg0.conf.tmp
+fi
 [ -s /etc/wireguard/wg0.conf.tmp ] && chmod 600 /etc/wireguard/wg0.conf.tmp && mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf && echo 'ok' || echo 'failed'"#,
             config = wg_conf
         );
@@ -506,11 +533,15 @@ WGCONF
 
         // Step 7: 启动 WireGuard
         progress.update_step(DeploymentStep::StartService, StepResult::Running);
-        let start_cmd = "systemctl enable wg-quick@wg0 2>/dev/null && systemctl start wg-quick@wg0 2>&1 && systemctl is-active wg-quick@wg0 || echo 'start-failed'";
+        // `start` 对已 active 的服务什么也不做，重新部署后的配置不会生效。
+        // Peer 已在上一步保留，因此这里可以安全 restart 并验证真实运行状态。
+        let start_cmd = "systemctl enable wg-quick@wg0 >/dev/null 2>&1 && systemctl restart wg-quick@wg0 && systemctl is-active --quiet wg-quick@wg0 && echo 'active'";
         match self.exec_checked(start_cmd, "start-service").await {
             Ok(o) if o.contains("active") => progress.update_step(DeploymentStep::StartService, StepResult::Success),
-            Ok(o) if o.contains("start-failed") => progress.fail(DeploymentStep::StartService, "WireGuard 启动失败".into()),
-            Ok(_) => progress.update_step(DeploymentStep::StartService, StepResult::Success),
+            Ok(_) => {
+                progress.fail(DeploymentStep::StartService, "WireGuard 启动后未进入 active 状态".into());
+                return Ok(progress);
+            }
             Err(e) => {
                 progress.fail(DeploymentStep::StartService, e.to_string());
                 return Ok(progress);
@@ -522,12 +553,13 @@ WGCONF
 
         // Step 9: 验证
         progress.update_step(DeploymentStep::Verify, StepResult::Running);
-        let verify = self.exec("wg show wg0 2>/dev/null | head -5").await.unwrap_or_default();
-        if verify.contains("interface: wg0") {
-            progress.update_step(DeploymentStep::Verify, StepResult::Success);
-            progress.complete();
-        } else {
-            progress.fail(DeploymentStep::Verify, "wg show 验证失败".into());
+        match self.exec_root("wg show wg0 | head -5", "verify-wg").await {
+            Ok(verify) if verify.contains("interface: wg0") => {
+                progress.update_step(DeploymentStep::Verify, StepResult::Success);
+                progress.complete();
+            }
+            Ok(_) => progress.fail(DeploymentStep::Verify, "wg show 未返回 wg0 接口".into()),
+            Err(e) => progress.fail(DeploymentStep::Verify, e.to_string()),
         }
 
         info!(target: "provisioner", server=%self.server_id, status=?progress.status, "部署完成");

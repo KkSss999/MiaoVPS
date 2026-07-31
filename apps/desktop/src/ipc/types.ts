@@ -45,13 +45,12 @@ export type SshAuthType = 'password' | 'private_key' | 'ssh_agent'
 /** miaovps_core::ServerStatus */
 export type ServerStatus =
   | 'added'
-  | 'detecting'
-  | 'ready'
   | 'deploying'
   | 'online'
   | 'offline'
   | 'config_broken'
   | 'needs_attention'
+  | 'incomplete'
 
 /** miaovps_core::Server */
 export interface Server {
@@ -128,40 +127,40 @@ export interface ServerReport {
 
 /** miaovps_core::DeploymentStep —— 9 步，顺序即部署顺序 */
 export type DeploymentStep =
-  | 'Detect'
+  | 'Connect'
   | 'Backup'
-  | 'Install'
-  | 'GenerateKeys'
-  | 'WriteConfig'
+  | 'InstallWireGuard'
+  | 'GenerateServerKeys'
+  | 'ConfigureInterface'
   | 'ConfigureRouting'
   | 'StartService'
-  | 'VerifyHandshake'
-  | 'Complete'
+  | 'CreateFirstDevice'
+  | 'Verify'
 
 /** 部署步骤的中文标签 —— 与 Rust 的 DeploymentStep::label() 一致 */
 export const STEP_LABELS: Record<DeploymentStep, string> = {
-  Detect: '环境检测',
-  Backup: '备份现有配置',
-  Install: '安装 WireGuard',
-  GenerateKeys: '生成密钥',
-  WriteConfig: '写入配置',
-  ConfigureRouting: '配置路由与 NAT',
-  StartService: '启动 WireGuard 服务',
-  VerifyHandshake: '验证握手',
-  Complete: '完成',
+  Connect: '建立安全连接',
+  Backup: '备份现有网络配置',
+  InstallWireGuard: '安装 WireGuard',
+  GenerateServerKeys: '生成服务器密钥',
+  ConfigureInterface: '配置虚拟网络',
+  ConfigureRouting: '配置路由和防火墙',
+  StartService: '启动 WireGuard',
+  CreateFirstDevice: '创建第一台设备',
+  Verify: '验证服务状态',
 }
 
 /** 部署步骤的固定顺序 —— UI 按此渲染，不依赖事件到达顺序 */
 export const STEP_ORDER: DeploymentStep[] = [
-  'Detect',
+  'Connect',
   'Backup',
-  'Install',
-  'GenerateKeys',
-  'WriteConfig',
+  'InstallWireGuard',
+  'GenerateServerKeys',
+  'ConfigureInterface',
   'ConfigureRouting',
   'StartService',
-  'VerifyHandshake',
-  'Complete',
+  'CreateFirstDevice',
+  'Verify',
 ]
 
 /**
@@ -195,17 +194,21 @@ export function parseStepResult(r: StepResult | undefined): {
 }
 
 /** miaovps_core::DeploymentStatus */
-export type DeploymentStatus = 'pending' | 'in_progress' | 'success' | 'failed' | 'rolled_back'
+export type DeploymentStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'success'
+  | 'warning'
+  | 'failed'
+  | 'rolled_back'
 
 /** miaovps_provisioner::DeploymentProgress */
 export interface DeploymentProgress {
-  server_id: string
+  deployment_id: string
   status: DeploymentStatus
   current_step: DeploymentStep | null
   steps: Partial<Record<DeploymentStep, StepResult>>
   server_public_key: string | null
-  started_at: number
-  finished_at: number | null
 }
 
 /** miaovps_provisioner::StepEvent —— 经 emit("deploy-progress") 推送 */
@@ -221,7 +224,7 @@ export interface DeploymentOptions {
   dns: string[]
   mtu: number | null
   ipv6_enabled: boolean
-  routing_policy: string
+  allow_peer_communication: boolean
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

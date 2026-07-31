@@ -639,6 +639,23 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         );
     }
 
+    let tunnel_mode = if full_tunnel { TunnelMode::Full } else { TunnelMode::Split };
+    let started_at = miaovps_app::tunnel::now_secs();
+
+    // 必须在创建 utun 之前先写出归属状态。否则前端在
+    // 「网卡已出现、状态文件尚未写」的窗口会误判为终端启动。
+    if is_daemon_child {
+        TunnelState::clear_stop_request(&data_dir());
+        let state = TunnelState::connecting(
+            tunnel_mode,
+            profile.server_endpoint.clone(),
+            profile.client_ip.clone(),
+        );
+        state
+            .save(&data_dir())
+            .context("无法写入隧道启动状态")?;
+    }
+
     println!("🔗 MiaoVPS 隧道 → {}", server_addr);
     println!("  客户端公钥: {}", short_key(&profile.client_public_key));
     println!("  服务器公钥: {}", short_key(&profile.server_public_key));
@@ -768,8 +785,6 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     println!();
 
     // daemon 模式向状态文件发布运行时状态供前端轮询
-    let tunnel_mode = if full_tunnel { TunnelMode::Full } else { TunnelMode::Split };
-    let started_at = miaovps_app::tunnel::now_secs();
     if is_daemon_child {
         publish_state(
             &data_dir(),
@@ -806,6 +821,10 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
                 break;
             }
             _ = tokio::time::sleep(TICK) => {
+                if is_daemon_child && TunnelState::stop_requested(&data_dir()) {
+                    println!("\n收到前端停止请求，开始收尾");
+                    break;
+                }
                 if let Some((old, new)) = gw_guard.reconcile() {
                     println!("  [网络] 默认网关 {old} → {new}，已重建 VPS 直连路由");
                     // 路由修好后立刻重绑定 —— 在此之前重绑定是无用功，
@@ -895,6 +914,7 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     // 状态文件必须在路由清理后删 —— 中间崩溃时留着文件才能被识别为 Stale
     if is_daemon_child {
         TunnelState::clear(&data_dir());
+        TunnelState::clear_stop_request(&data_dir());
     }
 
     println!("  流量: ↑{} ↓{}{}{}",
@@ -916,7 +936,7 @@ async fn cmd_disconnect(_args: &[String]) -> Result<()> {
 
     // 先停 daemon 隧道进程 —— 它还活着的话会把路由重新加回来
     // （VpsRouteGuard 每 5s 核对一次），先清路由就白清了
-    stop_daemon_if_running();
+    stop_daemon_if_running()?;
 
     // 上次异常退出（kill -9 / 崩溃）可能留下被改写的 DNS，优先还原
     if let Some(desc) = dns::restore_if_pending(&data_dir()) {
@@ -941,36 +961,117 @@ async fn cmd_disconnect(_args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// 发 SIGTERM 停掉 daemon 隧道进程并等它退出
+/// 停掉 daemon 隧道进程并等它退出。
 ///
 /// 隧道自己的 shutdown 会还原 DNS 并撤路由，比外部清理更准确
-/// （它知道当前是接管还是已回落状态）。所以优先让它自己收尾。
-fn stop_daemon_if_running() {
+/// （它知道当前是接管还是已回落状态）。所以先发 SIGTERM 让它自己收尾；
+/// 旧版 daemon 不响应 SIGTERM 时再升级为 SIGKILL，由本命令继续清理路由和 DNS。
+fn stop_daemon_if_running() -> Result<()> {
     let state = TunnelState::load(&data_dir());
     if state.status == TunnelStatus::Disconnected || state.pid == 0 {
-        return;
+        return Ok(());
     }
     if state.status == TunnelStatus::Stale {
         println!("  上次隧道异常退出 (pid {} 已不存在)", state.pid);
-        return;
+        return Ok(());
+    }
+
+    // 状态文件中的 PID 可能因崩溃后长期未清理而被系统复用。发信号前必须
+    // 核对完整进程参数，避免误杀无关进程。
+    let Some(command) = process_command(state.pid)? else {
+        println!("  隧道进程 {} 已退出", state.pid);
+        return Ok(());
+    };
+    if !is_miaovps_daemon_command(&command) {
+        anyhow::bail!(
+            "状态文件中的 pid {} 已被其他进程占用，拒绝终止: {}",
+            state.pid,
+            command
+        );
     }
 
     println!("  停止隧道进程 (pid {})...", state.pid);
-    // Safety: 仅向已知 pid 投递 SIGTERM，无内存操作
-    unsafe {
-        libc::kill(state.pid as i32, libc::SIGTERM);
+    if !send_signal(state.pid, libc::SIGTERM)? {
+        println!("  隧道进程已退出");
+        return Ok(());
     }
 
-    // 隧道 shutdown 最坏 500ms（三线程各自的轮询周期），给 5s 余量
-    for _ in 0..50 {
+    // 新版 daemon 会主动处理停止请求；这里仍保留 SIGTERM，兼容从终端启动的
+    // 旧版 daemon。给正常 shutdown 5s 收尾时间。
+    if wait_for_daemon_exit(state.pid, 50)? {
+        println!("  隧道进程已退出");
+        return Ok(());
+    }
+
+    // 再次核对命令，防止 TERM 后退出、PID 恰好被其他进程复用的极小竞态。
+    let Some(command) = process_command(state.pid)? else {
+        println!("  隧道进程已退出");
+        return Ok(());
+    };
+    if !is_miaovps_daemon_command(&command) {
+        println!("  隧道进程已退出 (pid 已被系统复用)");
+        return Ok(());
+    }
+
+    println!("  ⚠ SIGTERM 无响应，正在强制终止隧道进程 {}", state.pid);
+    if !send_signal(state.pid, libc::SIGKILL)? || wait_for_daemon_exit(state.pid, 50)? {
+        println!("  隧道进程已强制终止");
+        return Ok(());
+    }
+
+    anyhow::bail!("无法终止隧道进程 {}，已停止清理以避免误报", state.pid)
+}
+
+/// 读取指定 PID 的完整命令行；进程不存在时返回 None。
+fn process_command(pid: u32) -> Result<Option<String>> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .context("无法核对隧道进程")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!command.is_empty()).then_some(command))
+}
+
+/// 只认可 `miaovps connect ... --daemon`，避免状态文件 PID 被复用时误杀。
+fn is_miaovps_daemon_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(executable) = words.next() else {
+        return false;
+    };
+    let executable_matches = std::path::Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("miaovps");
+    let args: Vec<_> = words.collect();
+    executable_matches && args.contains(&"connect") && args.contains(&"--daemon")
+}
+
+/// 返回 false 表示进程已经不存在。
+fn send_signal(pid: u32, signal: i32) -> Result<bool> {
+    // Safety: kill 仅向已核验 PID 投递信号，无内存操作。
+    if unsafe { libc::kill(pid as i32, signal) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error).with_context(|| format!("无法向隧道进程 {pid} 发送停止信号"))
+}
+
+fn wait_for_daemon_exit(pid: u32, attempts: usize) -> Result<bool> {
+    for _ in 0..attempts {
         std::thread::sleep(Duration::from_millis(100));
-        // Safety: signal 0 只检查存在性
-        if unsafe { libc::kill(state.pid as i32, 0) } != 0 {
-            println!("  隧道进程已退出");
-            return;
+        match process_command(pid)? {
+            None => return Ok(true),
+            Some(command) if !is_miaovps_daemon_command(&command) => return Ok(true),
+            Some(_) => {}
         }
     }
-    println!("  ⚠ 隧道进程 {} 未在 5s 内退出，继续强制清理路由", state.pid);
+    Ok(false)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1416,6 +1517,20 @@ mod tests {
         assert_eq!(human_bytes(512), "512B");
         assert_eq!(human_bytes(2048), "2.0KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.0MiB");
+    }
+
+    #[test]
+    fn recognizes_only_miaovps_connect_daemons() {
+        assert!(is_miaovps_daemon_command(
+            "/Users/kerye/.cargo/bin/miaovps connect --full --daemon"
+        ));
+        assert!(is_miaovps_daemon_command(
+            "/Applications/MiaoVPS.app/Contents/MacOS/miaovps connect --daemon"
+        ));
+        assert!(!is_miaovps_daemon_command("/bin/sleep 100"));
+        assert!(!is_miaovps_daemon_command("/tmp/not-miaovps connect --daemon"));
+        assert!(!is_miaovps_daemon_command("/usr/local/bin/miaovps connect --full"));
+        assert!(!is_miaovps_daemon_command("/usr/local/bin/miaovps deploy --daemon"));
     }
 
     /// 构造一个不触碰真实系统的 overlay：没有 DNS 备份 → 不会调 networksetup；

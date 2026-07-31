@@ -4,7 +4,8 @@
 //!
 //! `osascript -e 'do shell script "..." with administrator privileges'`
 //! 弹出 macOS 原生授权框。相比自建 launchd helper 的好处是零安装、
-//! 无需签名；代价是每次连接授权一次。
+//! 无需签名；代价是每次连接授权一次。正常断开通过受限的停止请求
+//! 让 root daemon 自行收尾，不需要再授权。
 //!
 //! ## 命令注入防护
 //!
@@ -89,37 +90,77 @@ impl TunnelCtl {
             return Err(TunnelCtlError::ProfileMissing);
         }
 
-        // 崩溃残留：先清一次路由再重连，否则旧的 0/1 还挂在死掉的 utun 上
-        if current.status == TunnelStatus::Stale {
-            warn!("检测到上次隧道异常退出，先清理残留路由");
-            let _ = self.run_privileged(&self.build_shell_command("disconnect", None));
-            TunnelState::clear(&self.data_dir);
-        }
+        TunnelState::clear_stop_request(&self.data_dir);
 
-        let shell = self.build_shell_command("connect", mode.as_flag());
+        let connect_shell = self.build_shell_command("connect", mode.as_flag());
+        // 崩溃残留的清理和重连合并在同一次授权里，
+        // 否则一次点击会连续弹两次密码框。
+        let shell = if current.status == TunnelStatus::Stale {
+            warn!("检测到上次隧道异常退出，同一次授权内先清理再重连");
+            format!(
+                "{} && {}",
+                self.build_shell_command("disconnect", None),
+                connect_shell
+            )
+        } else {
+            connect_shell
+        };
         info!(?mode, "请求授权启动隧道");
         self.run_privileged(&shell)?;
 
-        // 隧道进程刚 fork，状态文件可能还没写出来 —— 轮询等它出现
-        for _ in 0..40 {
+        // 隧道进程刚 fork，要等到真正进入可管理运行态才返回。
+        // Connecting 只说明 daemon 已领取任务，不能让前端提前 toast 成功。
+        for _ in 0..300 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let state = self.status();
-            if state.status != TunnelStatus::Disconnected {
+            if launched_state_is_ready(state.status) {
                 return Ok(state);
+            }
+            if state.status == TunnelStatus::Stale {
+                return Err(TunnelCtlError::LaunchFailed(
+                    "隧道进程在建立期间退出，请查看 ~/.miaovps/tunnel.log".into(),
+                ));
             }
         }
         Err(TunnelCtlError::LaunchFailed(
-            "隧道进程已启动但未写出状态，请查看系统日志".into(),
+            "隧道进程已启动，但 30 秒内未进入可用状态，请查看 ~/.miaovps/tunnel.log"
+                .into(),
         ))
     }
 
     /// 断开隧道并清理路由
     pub fn disconnect(&self) -> Result<(), TunnelCtlError> {
-        let shell = self.build_shell_command("disconnect", None);
-        self.run_privileged(&shell)?;
-        TunnelState::clear(&self.data_dir);
-        info!("隧道已断开");
-        Ok(())
+        let current = self.status();
+        match current.status {
+            TunnelStatus::Disconnected => return Ok(()),
+            TunnelStatus::External => return Err(TunnelCtlError::ExternalTunnel),
+            TunnelStatus::Stale => {
+                // daemon 已死，无人能自行收尾，只能授权清理残留路由。
+                let shell = self.build_shell_command("disconnect", None);
+                self.run_privileged(&shell)?;
+                TunnelState::clear(&self.data_dir);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        // 正常运行的 root daemon 自己有权限还原 DNS/路由。App 只发一个
+        // 无参数停止事件，不再起第二次 osascript 授权。
+        TunnelState::request_stop(&self.data_dir)
+            .map_err(|e| TunnelCtlError::Other(format!("无法发出停止请求: {e}")))?;
+
+        for _ in 0..120 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if self.status().status == TunnelStatus::Disconnected {
+                TunnelState::clear_stop_request(&self.data_dir);
+                info!("隧道已断开");
+                return Ok(());
+            }
+        }
+        Err(TunnelCtlError::Other(
+            "隧道进程在 12 秒内未响应停止请求，请重试；若仍失败再使用 sudo miaovps disconnect"
+                .into(),
+        ))
     }
 
     /// 拼出要在 root 下执行的 shell 命令
@@ -169,6 +210,14 @@ impl TunnelCtl {
     }
 }
 
+/// connect command 只能在真实运行态返回成功。
+fn launched_state_is_ready(status: TunnelStatus) -> bool {
+    matches!(
+        status,
+        TunnelStatus::Connected | TunnelStatus::Reconnecting | TunnelStatus::FallbackDirect
+    )
+}
+
 /// 查找已安装的 miaovps 可执行文件
 fn locate_binary() -> Option<PathBuf> {
     // 1. 显式覆盖（开发时指向 target/debug/miaovps）
@@ -178,14 +227,24 @@ fn locate_binary() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    // 2. cargo install 的默认位置
+    // 2. 与桌面端同版本打包的 sidecar；`tauri dev` 时也是
+    // target/debug 下的同级文件。绝不能先找 cargo install 的旧版本。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("miaovps");
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+    // 3. cargo install 的默认位置（仅开发兜底）
     if let Some(home) = std::env::var_os("HOME") {
         let path = Path::new(&home).join(".cargo/bin/miaovps");
         if path.is_file() {
             return Some(path);
         }
     }
-    // 3. PATH 查找
+    // 4. PATH 查找
     let out = Command::new("which").arg("miaovps").output().ok()?;
     if !out.status.success() {
         return None;
@@ -241,6 +300,20 @@ mod tests {
         assert!(cmd.contains("disconnect"));
     }
 
+    #[test]
+    fn stale_reconnect_can_share_one_authorization_shell() {
+        let c = ctl("/tmp/d");
+        let combined = format!(
+            "{} && {}",
+            c.build_shell_command("disconnect", None),
+            c.build_shell_command("connect", Some("--full"))
+        );
+        let words: Vec<&str> = combined.split_whitespace().collect();
+        assert_eq!(words.iter().filter(|w| **w == "disconnect").count(), 1);
+        assert_eq!(words.iter().filter(|w| **w == "connect").count(), 1);
+        assert_eq!(combined.matches("--daemon").count(), 1);
+    }
+
     /// 路径里带空格是 macOS 常态（"Application Support"）
     #[test]
     fn quotes_paths_with_spaces() {
@@ -287,6 +360,43 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 正常断开必须只写停止请求，不能再调 osascript。
+    #[test]
+    fn managed_disconnect_needs_no_privileged_command() {
+        let dir = std::env::temp_dir().join(format!(
+            "miaovps-ctl-stop-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        TunnelState::clear(&dir);
+        TunnelState::clear_stop_request(&dir);
+
+        let mut state =
+            TunnelState::connecting(TunnelMode::Full, "1.2.3.4:51820".into(), "10.0.0.2".into());
+        state.status = TunnelStatus::Connected;
+        state.save(&dir).unwrap();
+
+        let watcher_dir = dir.clone();
+        let watcher = std::thread::spawn(move || {
+            for _ in 0..100 {
+                if TunnelState::stop_requested(&watcher_dir) {
+                    TunnelState::clear(&watcher_dir);
+                    TunnelState::clear_stop_request(&watcher_dir);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("未收到停止请求");
+        });
+
+        // /bin/false 确保测试若误走特权命令就会失败。
+        let ctl = TunnelCtl::with_binary(dir.clone(), PathBuf::from("/bin/false"));
+        ctl.disconnect().unwrap();
+        watcher.join().unwrap();
+        assert_eq!(ctl.status().status, TunnelStatus::Disconnected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 已连接时重复 connect 会有两个进程抢路由表
     #[test]
     fn connect_refuses_when_already_running() {
@@ -324,5 +434,15 @@ mod tests {
         assert_eq!(TunnelCtlError::AuthCancelled.code(), "auth_cancelled");
         assert_eq!(TunnelCtlError::ProfileMissing.code(), "profile_missing");
         assert_eq!(TunnelCtlError::AlreadyRunning(1).code(), "already_running");
+    }
+
+    #[test]
+    fn launch_waits_through_connecting_and_external_race() {
+        assert!(!launched_state_is_ready(TunnelStatus::Disconnected));
+        assert!(!launched_state_is_ready(TunnelStatus::Connecting));
+        assert!(!launched_state_is_ready(TunnelStatus::External));
+        assert!(launched_state_is_ready(TunnelStatus::Connected));
+        assert!(launched_state_is_ready(TunnelStatus::Reconnecting));
+        assert!(launched_state_is_ready(TunnelStatus::FallbackDirect));
     }
 }

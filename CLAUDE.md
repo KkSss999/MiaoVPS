@@ -183,6 +183,30 @@ CLI 修好路由后调 `NativeTunnel::notify_network_changed()`。
 MTU 默认 1380，**必须与服务端 wg0 一致**，否则大包静默丢弃
 （症状是"ping 通但传文件卡死"）。`TunInterface::create` 会校验 MTU 是否生效。
 
+### 陷阱：`kill(pid, 0)` 的 EPERM 不是「进程已死」
+
+隧道进程是 root 的，App 跑在普通用户下 —— `kill` 返回 `-1` + **`EPERM`**
+（进程在，但无权发信号），只有 `ESRCH` 才代表不存在。只判 `== 0` 会把
+每一个正常运行的隧道都认成 `Stale`，而 `TunnelCtl::connect` 的 `Stale`
+分支会先跑一次 disconnect 清残留 —— **App 亲手拆掉自己刚建好的隧道**，
+用户陷入「连上→显示崩溃→再连→真的断掉」的死循环。
+
+`EPERM` 当存活后 pid 判活无法识别「pid 被回收给别人」，用 `updated_at`
+心跳兜底（隧道每 5s 刷，超 `HEARTBEAT_TIMEOUT` 60s 判 `Stale`）。
+
+### 陷阱：Tauri 同步 command 跑在主线程
+
+`#[tauri::command]` 标注**非 async** 函数时，宏走 `body_blocking`，
+直接 inline 展开在 IPC handler 线程 —— macOS 上就是主线程。
+隧道控制要同步等 osascript 授权框（用户输密码几十秒）加轮询状态文件
+最多 4s，全程冻结主线程：UI 不重绘、点击无响应，授权框还可能被挡在
+僵死的窗口后面。表现为**「点了断开毫无反应，App 卡死关不掉」**。
+
+`async fn` 才会走 `respond_async_serialized` → `async_runtime::spawn`。
+但只改 async 不够 —— 阻塞调用会占满一个 tokio worker 直到用户输完密码。
+正确做法是 `async fn` + `spawn_blocking`（见 `commands.rs` 的 `blocking()`）。
+凡是要起子进程或等用户交互的 command 都必须这样写。
+
 ## 尚未接线的代码（不要误判为可用）
 
 - `miaovps-tunnel-api` 的 `TunnelBackend` trait **无任何实现**，

@@ -8,6 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "prepare:sidecar": "../../scripts/prepare-sidecar.sh release",
+    "prepare:sidecar:debug": "../../scripts/prepare-sidecar.sh debug",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"

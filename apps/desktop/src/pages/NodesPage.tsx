@@ -220,18 +220,16 @@ function describeServer(
   switch (status) {
     case 'online':
       return { tone: 'ok', label: 'WireGuard 就绪', dot: 'ok' }
-    case 'ready':
-      return { tone: 'ok', label: '检测通过', dot: 'ok' }
     case 'deploying':
       return { tone: 'busy', label: '部署中', dot: 'busy' }
-    case 'detecting':
-      return { tone: 'busy', label: '检测中', dot: 'busy' }
     case 'config_broken':
       return { tone: 'err', label: '配置异常', dot: 'err' }
     case 'needs_attention':
       return { tone: 'warn', label: '有警告项', dot: 'off' }
     case 'offline':
       return { tone: 'off', label: '离线', dot: 'off' }
+    case 'incomplete':
+      return { tone: 'warn', label: '部署未完成', dot: 'off' }
     default:
       return { tone: 'off', label: '待检测', dot: 'off' }
   }

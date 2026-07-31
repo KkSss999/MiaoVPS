@@ -36,6 +36,22 @@ impl From<TunnelCtlError> for ErrorDtoWrap {
 /// 本地 newtype —— 孤儿规则不允许直接给外部 ErrorDto 实现 From<外部错误>
 pub struct ErrorDtoWrap(pub ErrorDto);
 
+/// 在阻塞线程池上跑同步任务
+///
+/// 隧道控制要同步等 osascript 授权框和子进程退出，这种活既不能放在
+/// 主线程（冻结 UI），也不该占用 tokio worker（阻塞异步调度）。
+async fn blocking<T, F>(f: F) -> CmdResult<T>
+where
+    F: FnOnce() -> CmdResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        // JoinError 只在任务 panic 时出现 —— 隧道控制里 panic 属于 bug，
+        // 但不能让它把整个 App 拖崩，转成可见错误交给前端提示
+        .map_err(|e| dto("internal", format!("隧道控制线程异常: {e}")))?
+}
+
 impl From<profile::ProfileError> for ErrorDtoWrap {
     fn from(e: profile::ProfileError) -> Self {
         ErrorDtoWrap(dto("profile_error", e.to_string()))
@@ -252,21 +268,49 @@ pub async fn save_config_file(path: String, contents: String) -> CmdResult<()> {
 //  本机隧道
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// 隧道状态 —— 前端每 2s 轮询
+///
+/// 没有状态文件时 `load` 会走 `probe_external()` 起一个 `ifconfig` 子进程。
+/// 每 2s 在主线程 fork 一次进程虽不至于冻死 UI，但没有理由占着主线程。
 #[tauri::command]
-pub fn tunnel_status(state: State<'_, AppState>) -> TunnelState {
-    TunnelState::load(&state.data_dir)
+pub async fn tunnel_status(state: State<'_, AppState>) -> CmdResult<TunnelState> {
+    let data_dir = state.data_dir.clone();
+    Ok(tauri::async_runtime::spawn_blocking(move || TunnelState::load(&data_dir))
+        .await
+        // 读状态失败时报「未连接」是安全的默认值：前端会显示未受保护，
+        // 不会让用户以为流量还在隧道里
+        .unwrap_or_else(|_| TunnelState::disconnected()))
 }
 
+/// 连接 —— 必须 async + spawn_blocking，不能是同步 command
+///
+/// 同步 `#[tauri::command]` 由宏 inline 展开在 IPC handler 线程上执行，
+/// macOS 上那就是主线程。`connect` 内部要同步等 osascript 授权框
+/// （用户输密码可能几十秒）再轮询状态文件最多 4s —— 全程冻结主线程：
+/// UI 不重绘、点击无响应，授权框还可能被挡在僵死的窗口后面，
+/// 表现为「点了断开毫无反应，App 卡死关不掉」。
+///
+/// 也不能只标 `#[tauri::command(async)]`：那样阻塞调用会占满一个 tokio
+/// worker 直到用户输完密码。`spawn_blocking` 把它放到专用阻塞线程池。
 #[tauri::command]
-pub fn tunnel_connect(state: State<'_, AppState>, mode: TunnelMode) -> CmdResult<TunnelState> {
-    let ctl = TunnelCtl::new(state.data_dir.clone()).map_err(|e| ErrorDtoWrap::from(e).0)?;
-    ctl.connect(mode).map_err(|e| ErrorDtoWrap::from(e).0)
+pub async fn tunnel_connect(state: State<'_, AppState>, mode: TunnelMode) -> CmdResult<TunnelState> {
+    let data_dir = state.data_dir.clone();
+    blocking(move || {
+        let ctl = TunnelCtl::new(data_dir).map_err(|e| ErrorDtoWrap::from(e).0)?;
+        ctl.connect(mode).map_err(|e| ErrorDtoWrap::from(e).0)
+    })
+    .await
 }
 
+/// 断开 —— 同 `tunnel_connect`，必须离开主线程
 #[tauri::command]
-pub fn tunnel_disconnect(state: State<'_, AppState>) -> CmdResult<()> {
-    let ctl = TunnelCtl::new(state.data_dir.clone()).map_err(|e| ErrorDtoWrap::from(e).0)?;
-    ctl.disconnect().map_err(|e| ErrorDtoWrap::from(e).0)
+pub async fn tunnel_disconnect(state: State<'_, AppState>) -> CmdResult<()> {
+    let data_dir = state.data_dir.clone();
+    blocking(move || {
+        let ctl = TunnelCtl::new(data_dir).map_err(|e| ErrorDtoWrap::from(e).0)?;
+        ctl.disconnect().map_err(|e| ErrorDtoWrap::from(e).0)
+    })
+    .await
 }
 
 #[tauri::command]
