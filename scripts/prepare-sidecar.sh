@@ -9,22 +9,24 @@ esac
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
-host=$(rustc -vV | awk '/^host:/ { print $2 }')
+target="${MIAOVPS_SIDECAR_TARGET:-$(rustc -vV | awk '/^host:/ { print $2 }')}"
+cargo_bin="${CARGO:-cargo}"
+cargo_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 
 if [ "$profile" = "release" ]; then
-  cargo build --manifest-path "$repo_root/Cargo.toml" -p miaovps-cli --release
+  "$cargo_bin" build --manifest-path "$repo_root/Cargo.toml" -p miaovps-cli --release --target "$target"
 else
-  cargo build --manifest-path "$repo_root/Cargo.toml" -p miaovps-cli
+  "$cargo_bin" build --manifest-path "$repo_root/Cargo.toml" -p miaovps-cli --target "$target"
 fi
 
 extension=""
-case "$host" in
+case "$target" in
   *-windows-*) extension=".exe" ;;
 esac
 
-source_bin="$repo_root/target/$profile/miaovps$extension"
+source_bin="$cargo_target_dir/$target/$profile/miaovps$extension"
 sidecar_dir="$repo_root/apps/desktop/src-tauri/binaries"
-sidecar_bin="$sidecar_dir/miaovps-$host$extension"
+sidecar_bin="$sidecar_dir/miaovps-$target$extension"
 
 mkdir -p "$sidecar_dir"
 cp "$source_bin" "$sidecar_bin"

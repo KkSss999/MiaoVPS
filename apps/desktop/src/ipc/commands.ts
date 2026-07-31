@@ -198,6 +198,11 @@ export function appInfo(): Promise<AppInfo> {
   return call('app_info')
 }
 
+/** 请求 Rust 依据真实本地状态重建 macOS 菜单栏菜单。 */
+export function refreshTrayMenu(): Promise<void> {
+  return call('refresh_tray_menu')
+}
+
 /** 把配置写到用户选定的路径 */
 export function saveConfigFile(path: string, contents: string): Promise<void> {
   return call('save_config_file', { path, contents })

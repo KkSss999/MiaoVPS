@@ -133,9 +133,6 @@ MiaoVPS/
 ### 桌面应用（推荐）
 
 ```bash
-# 安装依赖
-cargo install --path crates/miaovps-cli   # 隧道进程依赖
-
 cd apps/desktop
 pnpm install
 pnpm tauri dev    # 开发模式
@@ -204,7 +201,7 @@ bash scripts/test-reconnect.sh    # 在 VPS 侧阻断 UDP 51820 共 130s
 ### 开发
 
 ```bash
-# 编译所有 crate + CLI
+# 编译工作区（自动构建并打包桌面端所需的 miaovps sidecar）
 cargo build
 
 # 全量测试（137 tests）

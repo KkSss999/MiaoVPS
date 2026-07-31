@@ -423,6 +423,14 @@ pub fn app_info(state: State<'_, AppState>) -> AppInfo {
     }
 }
 
+/// 前端查询状态变化后请求重建托盘菜单；菜单的节点与隧道状态仍由 Rust 读取。
+#[tauri::command]
+pub async fn refresh_tray_menu(app: AppHandle) -> CmdResult<()> {
+    crate::tray::refresh(&app)
+        .await
+        .map_err(|e| dto("tray_error", e))
+}
+
 fn which_miaovps() -> Option<String> {
     if let Some(home) = std::env::var_os("HOME") {
         let p = std::path::Path::new(&home).join(".cargo/bin/miaovps");

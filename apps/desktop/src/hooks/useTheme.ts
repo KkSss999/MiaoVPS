@@ -13,7 +13,7 @@ const KEY = 'miaovps-theme'
 
 function current(): Theme {
   const attr = document.documentElement.getAttribute('data-theme')
-  return attr === 'light' ? 'light' : 'dark'
+  return attr === 'dark' ? 'dark' : 'light'
 }
 
 export function useTheme() {

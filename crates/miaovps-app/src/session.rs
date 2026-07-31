@@ -29,6 +29,8 @@ pub enum ServiceError {
     DeviceNotFound(String),
     #[error("WireGuard 配置未找到，请先执行 deploy")]
     WgNodeNotFound,
+    #[error("请先完成环境检测并处理阻塞项，再部署 WireGuard")]
+    InspectionRequired,
     #[error("{0}")]
     Other(String),
 }
@@ -48,6 +50,7 @@ impl ServiceError {
             ServiceError::ServerNotFound(_) => "server_not_found",
             ServiceError::DeviceNotFound(_) => "device_not_found",
             ServiceError::WgNodeNotFound => "wg_node_not_found",
+            ServiceError::InspectionRequired => "inspection_required",
             ServiceError::Other(_) => "other",
         }
     }
