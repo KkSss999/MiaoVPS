@@ -1,8 +1,0 @@
-# pnpm 11 默认拦截依赖的 build script，只认这里的白名单
-# （package.json 里的 pnpm.onlyBuiltDependencies 会被忽略）。
-#
-# esbuild 的 postinstall 负责下载平台二进制（darwin-arm64 等），
-# 拦掉的话 Vite 起不来。显式放行，避免每台机器都要手动
-# 跑一次 `pnpm approve-builds`。
-allowBuilds:
-  esbuild: true

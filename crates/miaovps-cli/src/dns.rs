@@ -101,7 +101,11 @@ impl DnsBackup {
                 "DNS 还原失败: {}\n手动修复: sudo networksetup -setdnsservers {} {}",
                 String::from_utf8_lossy(&output.stderr).trim(),
                 self.service,
-                if self.servers.is_empty() { "Empty".into() } else { self.servers.join(" ") }
+                if self.servers.is_empty() {
+                    "Empty".into()
+                } else {
+                    self.servers.join(" ")
+                }
             );
         }
 
@@ -223,7 +227,10 @@ mod tests {
 
     #[test]
     fn describes_dhcp_state() {
-        let dhcp = DnsBackup { service: "Wi-Fi".into(), servers: vec![] };
+        let dhcp = DnsBackup {
+            service: "Wi-Fi".into(),
+            servers: vec![],
+        };
         assert_eq!(dhcp.describe(), "Wi-Fi (DHCP 自动)");
 
         let custom = DnsBackup {

@@ -93,7 +93,10 @@ impl serde::Serialize for ServiceError {
 fn build_config(server: &Server, cred: &ServerCredential) -> SshConnectionConfig {
     let auth = match cred {
         ServerCredential::Password { password } => SshAuthMethod::Password(password.clone()),
-        ServerCredential::PrivateKey { key_path, passphrase } => SshAuthMethod::PrivateKey {
+        ServerCredential::PrivateKey {
+            key_path,
+            passphrase,
+        } => SshAuthMethod::PrivateKey {
             key_path: key_path.clone(),
             passphrase: passphrase.clone(),
         },
@@ -118,11 +121,13 @@ pub async fn open_provisioner(
 
     let privilege = SshProvisioner::detect_privilege(&session, sudo_password)
         .await
-        .map_err(|e| ServiceError::App(AppError::new(
-            ErrorCode::SudoRequired,
-            "权限探测失败",
-            e.to_string(),
-        )))?;
+        .map_err(|e| {
+            ServiceError::App(AppError::new(
+                ErrorCode::SudoRequired,
+                "权限探测失败",
+                e.to_string(),
+            ))
+        })?;
 
     Ok(SshProvisioner::new(session, server.id.clone()).with_privilege(privilege))
 }

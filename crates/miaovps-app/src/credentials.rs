@@ -9,8 +9,13 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerCredential {
-    Password { password: String },
-    PrivateKey { key_path: String, passphrase: Option<String> },
+    Password {
+        password: String,
+    },
+    PrivateKey {
+        key_path: String,
+        passphrase: Option<String>,
+    },
 }
 
 impl ServerCredential {
@@ -44,7 +49,8 @@ mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("miaovps-cred-test-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("miaovps-cred-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -52,7 +58,9 @@ mod tests {
     #[test]
     fn password_roundtrip() {
         let dir = tmp_dir("pw");
-        let cred = ServerCredential::Password { password: "s3cret".into() };
+        let cred = ServerCredential::Password {
+            password: "s3cret".into(),
+        };
         cred.save(&dir, "srv-1").unwrap();
 
         match ServerCredential::load(&dir, "srv-1").unwrap() {
@@ -72,7 +80,10 @@ mod tests {
         cred.save(&dir, "srv-2").unwrap();
 
         match ServerCredential::load(&dir, "srv-2").unwrap() {
-            ServerCredential::PrivateKey { key_path, passphrase } => {
+            ServerCredential::PrivateKey {
+                key_path,
+                passphrase,
+            } => {
                 assert_eq!(key_path, "~/.ssh/id_ed25519");
                 assert_eq!(passphrase.as_deref(), Some("pp"));
             }
@@ -87,9 +98,11 @@ mod tests {
     fn saved_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp_dir("perm");
-        ServerCredential::Password { password: "x".into() }
-            .save(&dir, "srv-3")
-            .unwrap();
+        ServerCredential::Password {
+            password: "x".into(),
+        }
+        .save(&dir, "srv-3")
+        .unwrap();
 
         let path = ServerCredential::path(&dir, "srv-3");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();

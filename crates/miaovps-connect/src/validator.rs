@@ -92,7 +92,10 @@ impl ConnectionValidator {
             return ValidationResult {
                 step: step.into(),
                 success: false,
-                detail: format!("无法路由到 {}: {e}（检查本机网络/残留路由）", self.server_addr),
+                detail: format!(
+                    "无法路由到 {}: {e}（检查本机网络/残留路由）",
+                    self.server_addr
+                ),
                 duration_ms: start.elapsed().as_millis() as u64,
             };
         }
@@ -168,7 +171,10 @@ impl ConnectionValidator {
         ValidationResult {
             step: step.into(),
             success: false,
-            detail: format!("{MAX_RETRIES} 次尝试均失败: {last_error}"),
+            detail: format!(
+                "{MAX_RETRIES} 次尝试均失败: {last_error}。若 VPS 已收到请求但本机收不到回包，可能是本地网络对 UDP {} 的回程过滤；可在云防火墙放行其他 UDP 端口后，用 `miaovps deploy <server-id> --port <udp-port>` 迁移并重试。",
+                self.server_addr.port()
+            ),
             duration_ms: start.elapsed().as_millis() as u64,
         }
     }

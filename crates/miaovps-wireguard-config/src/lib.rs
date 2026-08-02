@@ -190,25 +190,23 @@ pub fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
             let value = value.trim();
 
             match current_section {
-                Some("Interface") => {
-                    match key.as_str() {
-                        "privatekey" => current_interface.private_key = Some(value.into()),
-                        "address" => current_interface.address = Some(value.into()),
-                        "listenport" => current_interface.listen_port = value.parse().ok(),
-                        "dns" => current_interface.dns = value.split(',').map(|s| s.trim().into()).collect(),
-                        "mtu" => current_interface.mtu = value.parse().ok(),
-                        _ => {}
+                Some("Interface") => match key.as_str() {
+                    "privatekey" => current_interface.private_key = Some(value.into()),
+                    "address" => current_interface.address = Some(value.into()),
+                    "listenport" => current_interface.listen_port = value.parse().ok(),
+                    "dns" => {
+                        current_interface.dns = value.split(',').map(|s| s.trim().into()).collect()
                     }
-                }
-                Some("Peer") => {
-                    match key.as_str() {
-                        "publickey" => current_peer.public_key = Some(value.into()),
-                        "endpoint" => current_peer.endpoint = Some(value.into()),
-                        "allowedips" => current_peer.allowed_ips = Some(value.into()),
-                        "persistentkeepalive" => current_peer.persistent_keepalive = value.parse().ok(),
-                        _ => {}
-                    }
-                }
+                    "mtu" => current_interface.mtu = value.parse().ok(),
+                    _ => {}
+                },
+                Some("Peer") => match key.as_str() {
+                    "publickey" => current_peer.public_key = Some(value.into()),
+                    "endpoint" => current_peer.endpoint = Some(value.into()),
+                    "allowedips" => current_peer.allowed_ips = Some(value.into()),
+                    "persistentkeepalive" => current_peer.persistent_keepalive = value.parse().ok(),
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -230,11 +228,16 @@ pub fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
 
 /// 生成配置内容的二维码（UTF-8 终端输出或 SVG）
 pub fn generate_qrcode_svg(content: &str) -> Result<String, ConfigError> {
-    use qrcode::QrCode;
     use qrcode::render::svg;
+    use qrcode::QrCode;
 
     let code = QrCode::new(content.as_bytes()).map_err(|e| ConfigError::QrError(e.to_string()))?;
-    Ok(code.render().min_dimensions(200, 200).dark_color(svg::Color("#000000")).light_color(svg::Color("#ffffff")).build())
+    Ok(code
+        .render()
+        .min_dimensions(200, 200)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build())
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

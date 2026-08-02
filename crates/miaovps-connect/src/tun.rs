@@ -22,9 +22,9 @@ use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
-use tun::Device as _;
 use tun::platform::macos::Device;
 use tun::platform::posix::{Reader, Writer};
+use tun::Device as _;
 
 use crate::error::ConnectError;
 
@@ -123,7 +123,13 @@ impl TunInterface {
             config.mtu
         );
 
-        Ok(Self { reader, writer, name, raw_fd, mtu: config.mtu })
+        Ok(Self {
+            reader,
+            writer,
+            name,
+            raw_fd,
+            mtu: config.mtu,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -141,8 +147,13 @@ impl TunInterface {
     /// 拆分为独立的读写半边，供数据平面双线程使用
     pub fn into_split(self) -> (TunReader, TunWriter) {
         (
-            TunReader { reader: self.reader, raw_fd: self.raw_fd },
-            TunWriter { writer: self.writer },
+            TunReader {
+                reader: self.reader,
+                raw_fd: self.raw_fd,
+            },
+            TunWriter {
+                writer: self.writer,
+            },
         )
     }
 }
@@ -167,9 +178,8 @@ impl TunReader {
         };
 
         // Safety: pfd 是本地有效的 pollfd，nfds=1 与之匹配
-        let rc = unsafe {
-            libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout.as_millis() as i32)
-        };
+        let rc =
+            unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout.as_millis() as i32) };
 
         match rc {
             -1 => {

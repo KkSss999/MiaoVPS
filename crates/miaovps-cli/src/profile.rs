@@ -79,8 +79,7 @@ impl ConnectionProfile {
         self.validate()?;
         let path = Self::path(data_dir);
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)
-            .with_context(|| format!("无法写入 {}", path.display()))?;
+        std::fs::write(&path, json).with_context(|| format!("无法写入 {}", path.display()))?;
 
         // 私钥文件必须限制权限
         #[cfg(unix)]
@@ -100,7 +99,10 @@ impl ConnectionProfile {
         self.server_endpoint
             .parse::<std::net::SocketAddr>()
             .with_context(|| {
-                format!("服务器端点格式错误 '{}'，应为 IP:PORT", self.server_endpoint)
+                format!(
+                    "服务器端点格式错误 '{}'，应为 IP:PORT",
+                    self.server_endpoint
+                )
             })?;
         self.client_ip
             .parse::<std::net::Ipv4Addr>()

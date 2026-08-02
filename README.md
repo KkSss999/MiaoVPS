@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange)](https://www.rust-lang.org)
 [![WireGuard](https://img.shields.io/badge/WireGuard-%F0%9F%94%92-blue)](https://www.wireguard.com)
 
-**本地优先的桌面端私人 VPN 客户端**。将 VPS 一键转换为 WireGuard 节点，系统级 TUN 接管全局流量，无需注册任何账户。
+**本地优先的私人 VPN 核心与 CLI**。将 VPS 一键转换为 WireGuard 节点，并提供可被独立桌面端复用的 Rust 能力，无需注册任何账户。
 
 ---
 
@@ -68,7 +68,7 @@ Full Tunnel (全局流量走 VPN)
 ## 开发进度
 
 ```
-v0.1.0 后端 ✅  macOS 隧道 ✅  桌面前端 ✅
+v0.1.0 后端 ✅  macOS 隧道 ✅  桌面端见同级 MiaoVPS-Desktop
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✅ miaovps-core             领域模型
 ✅ miaovps-wireguard-config 密钥·配置·二维码
@@ -80,7 +80,7 @@ v0.1.0 后端 ✅  macOS 隧道 ✅  桌面前端 ✅
 ✅ miaovps-connect          三线程数据平面·验证器·断线重连·网络漫游
 ✅ miaovps-app              应用服务层（CLI 与前端的共同边界）
 ✅ miaovps-cli              14 命令（含 profile / connect --full --daemon）
-✅ apps/desktop             Tauri 2 + React 18 + TS（4 路由·18 command）
+✅ MiaoVPS-Desktop          独立维护的 Tauri 2 + React 18 桌面客户端
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    137 tests · clippy 0 warnings
 ```
@@ -117,33 +117,19 @@ MiaoVPS/
 │   ├── miaovps-connect/           数据平面 (boringtun + 分步验证)
 │   ├── miaovps-app/               应用服务层（IPC 边界）
 │   └── miaovps-cli/               命令行工具
-├── apps/
-│   └── desktop/                   Tauri 2 + React 18 桌面应用
-│       ├── src/                   前端源码
-│       └── src-tauri/             Rust 后端（Tauri commands）
-├── miaovps-frontend/              HTML 设计原型（视觉基线，只读）
 ├── scripts/
 │   ├── bootstrap-server.sh        手动部署脚本（VPS 侧）
 │   └── test-reconnect.sh          断线重连验证
-└── pubilc/                        品牌素材
+└── target/                        Cargo 构建产物（不提交）
 ```
+
+桌面端位于同级仓库 `../MiaoVPS-Desktop`，包含 React/Tauri 代码、设计原型和桌面品牌资源。
 
 ## 快速开始
 
-### 桌面应用（推荐）
+### 桌面应用
 
-```bash
-cd apps/desktop
-pnpm install
-pnpm tauri dev    # 开发模式
-pnpm tauri build  # 打包 .app
-```
-
-App 内流程：**节点页添加 VPS** → **检测** → **部署** →
-**设备页添加本机设备** → **设为本机连接** → **首页一键连接**。
-
-连接时弹 macOS 系统授权框（隧道进程需要 root）。授权后
-`tunnel-state.json` 存放隧道状态，App 每 2s 轮询显示实时信息。
+桌面端请进入同级仓库 `../MiaoVPS-Desktop`，详见其 README。桌面端通过 sidecar 调用本仓库构建的 `miaovps-cli`。
 
 ### 命令行（高级 / 调试）
 
@@ -164,12 +150,33 @@ miaovps validate <VPS_IP>:51820 <客户端私钥> <服务器公钥>  # 分步验
 
 sudo miaovps connect          # Split Tunnel
 sudo miaovps connect --full   # Full Tunnel（全局流量 + DNS 接管）
+sudo miaovps connect --full --port 443  # 临时覆盖 WireGuard UDP 端口，不修改 profile
 sudo miaovps connect --full --daemon  # 后台模式（App 使用此模式）
 sudo miaovps disconnect       # 清理路由 + 还原 DNS
 ```
 
 验证连通性：Split Tunnel 下 `ping 10.66.66.1`；
 Full Tunnel 下 `curl ifconfig.me` 应返回 VPS 公网 IP。
+
+### 当前链路测速
+
+连接 Full Tunnel 后运行以下只读脚本，可查看实际出口 IP、VPN 网关 ICMP、
+延迟/抖动/丢包，以及经隧道的 Cloudflare 上下行测速。默认消耗约 48 MiB 流量，
+不改动路由、DNS 或隧道配置。
+
+```bash
+bash scripts/test-tunnel-health.sh
+# 加大下行样本至 64 MiB（上行为其中一半）
+bash scripts/test-tunnel-health.sh --vps 203.0.113.10 --bytes 67108864
+# GitHub 默认做 6 次目的地采样并输出中位数
+bash scripts/test-tunnel-health.sh --samples 10
+```
+
+出口 IP 等于 VPS 公网 IP 才代表 Full Tunnel 已生效。部分 VPS 会禁止对
+`10.66.66.1` 的 ICMP 回应；此时网关 ping 失败本身不能判定隧道断开，应以出口
+IP 和测速能否完成作为数据面依据。
+GitHub 目的地测速的中位数应与 Cloudflare 下行分开判断：前者明显低而后者正常，
+优先怀疑 GitHub 出口路径；两者都低，才优先排查本机到 VPS 的隧道数据面。
 
 ### 断线重连与网络切换
 
@@ -201,7 +208,7 @@ bash scripts/test-reconnect.sh    # 在 VPS 侧阻断 UDP 51820 共 130s
 ### 开发
 
 ```bash
-# 编译工作区（自动构建并打包桌面端所需的 miaovps sidecar）
+# 编译核心工作区（只构建 Rust crate 与 CLI）
 cargo build
 
 # 全量测试（137 tests）
@@ -210,11 +217,8 @@ cargo test --workspace
 # Lint
 cargo clippy --all-targets --all-features
 
-# 前端
-cd apps/desktop
-pnpm typecheck   # 类型检查
-pnpm build       # 生产构建
-pnpm tauri dev   # 开发模式（热重载）
+# 桌面端：在 ../MiaoVPS-Desktop 执行
+# pnpm typecheck && pnpm build && pnpm tauri dev
 ```
 
 ## CLI 命令
@@ -233,7 +237,7 @@ pnpm tauri dev   # 开发模式（热重载）
 | `validate` | **分步验证（不切路由，安全）** |
 | `profile init` | **保存连接配置（稳定密钥）** |
 | `profile show` | **查看配置 + 公私钥自洽校验** |
-| `connect [--full]` | **建立隧道，需 sudo** |
+| `connect [server-id] --device <device-id> [--full]` | **按节点/设备建立隧道，需 sudo**（不指定时使用当前 profile） |
 | `disconnect` | **清理路由 + 还原 DNS** |
 
 ## 产品原则

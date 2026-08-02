@@ -38,7 +38,7 @@ pub fn fingerprint_public_key(key: &str) -> String {
     if key.len() <= 12 {
         return key.to_string();
     }
-    format!("{}…{}", &key[..4], &key[key.len()-4..])
+    format!("{}…{}", &key[..4], &key[key.len() - 4..])
 }
 
 /// 截断长字符串用于日志

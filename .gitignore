@@ -5,5 +5,3 @@
 .pmem/pmem.db-wal
 .miaovps-data/
 node_modules/
-apps/desktop/dist/
-apps/desktop/src-tauri/binaries/

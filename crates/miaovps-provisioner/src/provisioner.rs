@@ -61,7 +61,10 @@ impl Privilege {
 
 /// 命令过长时截断，用于日志与错误信息
 fn elide(cmd: &str) -> String {
-    let one: String = cmd.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let one: String = cmd
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     if one.chars().count() <= 100 {
         one
     } else {
@@ -71,12 +74,37 @@ fn elide(cmd: &str) -> String {
 
 /// 把 SshError 转成 AppError，保留命令上下文
 fn ssh_err(cmd: &str, e: miaovps_ssh::SshError) -> AppError {
-    AppError::new(
-        ErrorCode::InternalError,
-        "远程命令执行失败",
-        format!("{e}"),
-    )
-    .with_technical(format!("命令: {cmd}"))
+    AppError::new(ErrorCode::InternalError, "远程命令执行失败", format!("{e}"))
+        .with_technical(format!("命令: {cmd}"))
+}
+
+/// 从 VPN 网段计算服务端网关地址。`10.66.66.0/24` 的网段地址不能作为
+/// wg0 的主机地址；服务端约定使用第一个可用地址 `10.66.66.1/24`。
+fn gateway_address(cidr: &str) -> Result<String, AppError> {
+    let (raw_ip, raw_prefix) = cidr.split_once('/').ok_or_else(|| {
+        AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段无效", cidr)
+    })?;
+    let ip: std::net::Ipv4Addr = raw_ip.parse().map_err(|_| {
+        AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段无效", cidr)
+    })?;
+    let prefix: u8 = raw_prefix.parse().map_err(|_| {
+        AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段前缀无效", cidr)
+    })?;
+    if prefix > 30 {
+        return Err(AppError::new(
+            ErrorCode::ConfigWriteFailed,
+            "VPN 网段过小",
+            "网段前缀必须不大于 /30",
+        ));
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let network = u32::from(ip) & mask;
+    let gateway = std::net::Ipv4Addr::from(network + 1);
+    Ok(format!("{gateway}/{prefix}"))
 }
 
 /// 单引号包裹并转义，供 sh -c 使用
@@ -97,8 +125,16 @@ fn base64_encode(input: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -111,7 +147,19 @@ pub struct SshProvisioner {
 
 impl SshProvisioner {
     pub fn new(session: SshSession, server_id: String) -> Self {
-        Self { session, server_id, privilege: Privilege::Root }
+        Self {
+            session,
+            server_id,
+            privilege: Privilege::Root,
+        }
+    }
+
+    /// 结束短命部署命令持有的 SSH 会话。
+    pub async fn disconnect(self) -> Result<(), AppError> {
+        self.session
+            .disconnect()
+            .await
+            .map_err(|e| ssh_err("disconnect", e))
     }
 
     /// 指定提权方式（非 root 登录时必需）
@@ -235,64 +283,147 @@ impl SshProvisioner {
         info!(target: "provisioner", server=%self.server_id, "开始环境检测");
 
         // 1. 操作系统
-        let os = self.exec("cat /etc/os-release 2>/dev/null || cat /etc/lsb-release 2>/dev/null").await.unwrap_or_default();
+        let os = self
+            .exec("cat /etc/os-release 2>/dev/null || cat /etc/lsb-release 2>/dev/null")
+            .await
+            .unwrap_or_default();
         let is_ubuntu = os.contains("Ubuntu") || os.contains("ubuntu");
-        let version = if os.contains("24.04") { "24.04" } else if os.contains("22.04") { "22.04" } else { "unknown" };
+        let version = if os.contains("24.04") {
+            "24.04"
+        } else if os.contains("22.04") {
+            "22.04"
+        } else {
+            "unknown"
+        };
 
         if is_ubuntu && version != "unknown" {
-            report.add_item(DetectKey::Os, DetectStatus::Pass, &format!("Ubuntu {}", version), None);
+            report.add_item(
+                DetectKey::Os,
+                DetectStatus::Pass,
+                &format!("Ubuntu {}", version),
+                None,
+            );
         } else if is_ubuntu {
-            report.add_item(DetectKey::Os, DetectStatus::Warning, "Ubuntu 但版本非 22.04/24.04", Some("建议使用 Ubuntu 22.04 或 24.04 LTS"));
+            report.add_item(
+                DetectKey::Os,
+                DetectStatus::Warning,
+                "Ubuntu 但版本非 22.04/24.04",
+                Some("建议使用 Ubuntu 22.04 或 24.04 LTS"),
+            );
         } else {
-            report.add_item(DetectKey::Os, DetectStatus::Blocked, &format!("不支持的系统: {}", os.lines().next().unwrap_or("unknown")), Some("需要 Ubuntu 22.04 或 24.04"));
+            report.add_item(
+                DetectKey::Os,
+                DetectStatus::Blocked,
+                &format!("不支持的系统: {}", os.lines().next().unwrap_or("unknown")),
+                Some("需要 Ubuntu 22.04 或 24.04"),
+            );
         }
 
         // 2. 架构
-        let arch = self.exec("uname -m").await.unwrap_or_default().trim().to_string();
+        let arch = self
+            .exec("uname -m")
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         match arch.as_str() {
-            "x86_64" | "aarch64" => report.add_item(DetectKey::Arch, DetectStatus::Pass, &arch, None),
-            _ => report.add_item(DetectKey::Arch, DetectStatus::Blocked, &arch, Some("需要 x86_64 或 arm64")),
+            "x86_64" | "aarch64" => {
+                report.add_item(DetectKey::Arch, DetectStatus::Pass, &arch, None)
+            }
+            _ => report.add_item(
+                DetectKey::Arch,
+                DetectStatus::Blocked,
+                &arch,
+                Some("需要 x86_64 或 arm64"),
+            ),
         }
 
         // 3. root/sudo 权限
-        let whoami = self.exec("whoami").await.unwrap_or_default().trim().to_string();
+        let whoami = self
+            .exec("whoami")
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         if whoami == "root" {
             report.add_item(DetectKey::Privilege, DetectStatus::Pass, "root 用户", None);
         } else {
-            let sudo = self.exec("sudo -n true 2>/dev/null && echo ok || echo no").await.unwrap_or_default();
+            let sudo = self
+                .exec("sudo -n true 2>/dev/null && echo ok || echo no")
+                .await
+                .unwrap_or_default();
             if sudo.contains("ok") {
-                report.add_item(DetectKey::Privilege, DetectStatus::Pass, "免交互 sudo", None);
+                report.add_item(
+                    DetectKey::Privilege,
+                    DetectStatus::Pass,
+                    "免交互 sudo",
+                    None,
+                );
             } else {
-                report.add_item(DetectKey::Privilege, DetectStatus::Blocked, "需要 root 或免交互 sudo", Some("请使用 root 登录或配置 NOPASSWD sudo"));
+                report.add_item(
+                    DetectKey::Privilege,
+                    DetectStatus::Blocked,
+                    "需要 root 或免交互 sudo",
+                    Some("请使用 root 登录或配置 NOPASSWD sudo"),
+                );
             }
         }
 
         // 4. 公网 IPv4
-        let ip = self.exec("curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo 'unknown'").await.unwrap_or_default().trim().to_string();
+        let ip = self
+            .exec("curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || echo 'unknown'")
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         if ip != "unknown" && !ip.is_empty() {
             report.add_item(DetectKey::PublicIpv4, DetectStatus::Pass, &ip, None);
         } else {
-            report.add_item(DetectKey::PublicIpv4, DetectStatus::Warning, "无法检测公网 IP", Some("可能影响 VPN 连通性"));
+            report.add_item(
+                DetectKey::PublicIpv4,
+                DetectStatus::Warning,
+                "无法检测公网 IP",
+                Some("可能影响 VPN 连通性"),
+            );
         }
 
         // 5. WireGuard 安装状态
-        let wg = self.exec("which wg 2>/dev/null && wg --version 2>/dev/null || echo 'not-installed'").await.unwrap_or_default();
+        let wg = self
+            .exec("which wg 2>/dev/null && wg --version 2>/dev/null || echo 'not-installed'")
+            .await
+            .unwrap_or_default();
         if wg.contains("not-installed") {
             report.add_item(DetectKey::WireGuard, DetectStatus::Pass, "可安装", None);
         } else {
-            report.add_item(DetectKey::WireGuard, DetectStatus::Pass, &format!("已安装: {}", wg.trim()), None);
+            report.add_item(
+                DetectKey::WireGuard,
+                DetectStatus::Pass,
+                &format!("已安装: {}", wg.trim()),
+                None,
+            );
         }
 
         // 6. systemd
-        let systemd = self.exec("systemctl --version 2>/dev/null | head -1 || echo 'no'").await.unwrap_or_default();
+        let systemd = self
+            .exec("systemctl --version 2>/dev/null | head -1 || echo 'no'")
+            .await
+            .unwrap_or_default();
         if systemd.contains("systemd") {
             report.add_item(DetectKey::Systemd, DetectStatus::Pass, systemd.trim(), None);
         } else {
-            report.add_item(DetectKey::Systemd, DetectStatus::Blocked, "systemd 不可用", Some("需要 systemd 管理 WireGuard 服务"));
+            report.add_item(
+                DetectKey::Systemd,
+                DetectStatus::Blocked,
+                "systemd 不可用",
+                Some("需要 systemd 管理 WireGuard 服务"),
+            );
         }
 
         // 7. IP Forward
-        let forward = self.exec("sysctl net.ipv4.ip_forward 2>/dev/null").await.unwrap_or_default();
+        let forward = self
+            .exec("sysctl net.ipv4.ip_forward 2>/dev/null")
+            .await
+            .unwrap_or_default();
         if forward.contains("= 1") {
             report.add_item(DetectKey::IpForward, DetectStatus::Pass, "已开启", None);
         } else {
@@ -309,14 +440,20 @@ impl SshProvisioner {
         // 撞上自己监听的 51820，报「阻塞」会让用户以为部署失败。
         // WireGuard 是内核模块，socket 不挂在用户态进程上，所以只能反过来
         // 问 wg：wg0 的 listen-port 是不是它。
-        let port_check = self.exec("ss -uln | grep ':51820 ' 2>/dev/null && echo 'occupied' || echo 'free'").await.unwrap_or_default();
+        let port_check = self
+            .exec("ss -uln | grep ':51820 ' 2>/dev/null && echo 'occupied' || echo 'free'")
+            .await
+            .unwrap_or_default();
         if port_check.contains("free") {
             report.add_item(DetectKey::UdpPort, DetectStatus::Pass, "51820 可用", None);
         } else {
             // 走 exec_root：`wg show` 需要 root。`|| echo ''` 保证退出码为 0，
             // 没有 wg0 时不会被 exec_root 的非零码检查判成失败。
             let owner = self
-                .exec_root("wg show wg0 listen-port 2>/dev/null || echo ''", "detect-port")
+                .exec_root(
+                    "wg show wg0 listen-port 2>/dev/null || echo ''",
+                    "detect-port",
+                )
                 .await
                 .unwrap_or_default();
             if owner.trim() == "51820" {
@@ -327,26 +464,61 @@ impl SshProvisioner {
                     None,
                 );
             } else {
-                report.add_item(DetectKey::UdpPort, DetectStatus::Blocked, "51820 已被其他服务占用", Some("请更换 WireGuard 监听端口或释放该端口"));
+                report.add_item(
+                    DetectKey::UdpPort,
+                    DetectStatus::Blocked,
+                    "51820 已被其他服务占用",
+                    Some("请更换 WireGuard 监听端口或释放该端口"),
+                );
             }
         }
 
         // 10. 磁盘
-        let disk = self.exec("df -BM / | tail -1 | awk '{print $4}' 2>/dev/null || echo '0'").await.unwrap_or_default().trim().to_string();
+        let disk = self
+            .exec("df -BM / | tail -1 | awk '{print $4}' 2>/dev/null || echo '0'")
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let disk_mb: u64 = disk.trim_end_matches('M').parse().unwrap_or(0);
         if disk_mb > 200 {
-            report.add_item(DetectKey::Disk, DetectStatus::Pass, &format!("{}MB 可用", disk_mb), None);
+            report.add_item(
+                DetectKey::Disk,
+                DetectStatus::Pass,
+                &format!("{}MB 可用", disk_mb),
+                None,
+            );
         } else {
-            report.add_item(DetectKey::Disk, DetectStatus::Blocked, &format!("仅 {}MB", disk_mb), Some("需要至少 200MB"));
+            report.add_item(
+                DetectKey::Disk,
+                DetectStatus::Blocked,
+                &format!("仅 {}MB", disk_mb),
+                Some("需要至少 200MB"),
+            );
         }
 
         // 11. 内存
-        let mem = self.exec("free -m | grep Mem | awk '{print $7}' 2>/dev/null || echo '0'").await.unwrap_or_default().trim().to_string();
+        let mem = self
+            .exec("free -m | grep Mem | awk '{print $7}' 2>/dev/null || echo '0'")
+            .await
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let mem_mb: u64 = mem.parse().unwrap_or(0);
         if mem_mb > 256 {
-            report.add_item(DetectKey::Memory, DetectStatus::Pass, &format!("{}MB 可用", mem_mb), None);
+            report.add_item(
+                DetectKey::Memory,
+                DetectStatus::Pass,
+                &format!("{}MB 可用", mem_mb),
+                None,
+            );
         } else {
-            report.add_item(DetectKey::Memory, DetectStatus::Blocked, &format!("仅 {}MB", mem_mb), Some("需要至少 256MB"));
+            report.add_item(
+                DetectKey::Memory,
+                DetectStatus::Blocked,
+                &format!("仅 {}MB", mem_mb),
+                Some("需要至少 256MB"),
+            );
         }
 
         report.finalize();
@@ -358,7 +530,10 @@ impl SshProvisioner {
     //  一键部署
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    pub async fn deploy(&mut self, options: &DeploymentOptions) -> Result<DeploymentProgress, AppError> {
+    pub async fn deploy(
+        &mut self,
+        options: &DeploymentOptions,
+    ) -> Result<DeploymentProgress, AppError> {
         self.deploy_reporting(options, None).await
     }
 
@@ -389,15 +564,23 @@ impl SshProvisioner {
 
         // Step 2: 备份
         progress.update_step(DeploymentStep::Backup, StepResult::Running);
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let backup_dir = format!("/var/lib/miaovps/backups/{}", ts);
         let backup_cmd = format!(
             "mkdir -p {dir} && cp -r /etc/wireguard {dir}/ 2>/dev/null; cp -r /etc/sysctl.d {dir}/ 2>/dev/null; echo 'ok'",
             dir = backup_dir
         );
         match self.exec_checked(&backup_cmd, "backup").await {
-            Ok(o) if o.contains("ok") => progress.update_step(DeploymentStep::Backup, StepResult::Success),
-            Ok(_) => progress.update_step(DeploymentStep::Backup, StepResult::Warning("部分备份失败".into())),
+            Ok(o) if o.contains("ok") => {
+                progress.update_step(DeploymentStep::Backup, StepResult::Success)
+            }
+            Ok(_) => progress.update_step(
+                DeploymentStep::Backup,
+                StepResult::Warning("部分备份失败".into()),
+            ),
             Err(e) => {
                 progress.fail(DeploymentStep::Backup, e.to_string());
                 return Ok(progress);
@@ -408,10 +591,17 @@ impl SshProvisioner {
         progress.update_step(DeploymentStep::InstallWireGuard, StepResult::Running);
         let install_cmd = "which wg >/dev/null 2>&1 && echo 'already-installed' || (apt-get update -qq && apt-get install -y -qq wireguard-tools 2>&1 && echo 'installed')";
         match self.exec_checked(install_cmd, "install-wg").await {
-            Ok(o) if o.contains("already-installed") => progress.update_step(DeploymentStep::InstallWireGuard, StepResult::Success),
-            Ok(o) if o.contains("installed") => progress.update_step(DeploymentStep::InstallWireGuard, StepResult::Success),
+            Ok(o) if o.contains("already-installed") => {
+                progress.update_step(DeploymentStep::InstallWireGuard, StepResult::Success)
+            }
+            Ok(o) if o.contains("installed") => {
+                progress.update_step(DeploymentStep::InstallWireGuard, StepResult::Success)
+            }
             Ok(_) => {
-                progress.fail(DeploymentStep::InstallWireGuard, "安装 WireGuard 失败".into());
+                progress.fail(
+                    DeploymentStep::InstallWireGuard,
+                    "安装 WireGuard 失败".into(),
+                );
                 return Ok(progress);
             }
             Err(e) => {
@@ -424,7 +614,9 @@ impl SshProvisioner {
         progress.update_step(DeploymentStep::GenerateServerKeys, StepResult::Running);
         let key_cmd = "mkdir -p /etc/wireguard && [ -f /etc/wireguard/private.key ] && echo 'keys-exist' || (wg genkey | tee /etc/wireguard/private.key | wg pubkey > /etc/wireguard/public.key && chmod 600 /etc/wireguard/private.key && echo 'keys-generated')";
         match self.exec_checked(key_cmd, "generate-keys").await {
-            Ok(o) if o.contains("keys-exist") || o.contains("keys-generated") => progress.update_step(DeploymentStep::GenerateServerKeys, StepResult::Success),
+            Ok(o) if o.contains("keys-exist") || o.contains("keys-generated") => {
+                progress.update_step(DeploymentStep::GenerateServerKeys, StepResult::Success)
+            }
             Ok(_) => progress.fail(DeploymentStep::GenerateServerKeys, "生成密钥失败".into()),
             Err(e) => {
                 progress.fail(DeploymentStep::GenerateServerKeys, e.to_string());
@@ -433,7 +625,9 @@ impl SshProvisioner {
         }
 
         // 获取服务器公钥 —— 客户端连接必须用它，不能丢弃
-        let server_pubkey = match self.exec_root("cat /etc/wireguard/public.key", "read-pubkey").await
+        let server_pubkey = match self
+            .exec_root("cat /etc/wireguard/public.key", "read-pubkey")
+            .await
         {
             Ok(k) => k.trim().to_string(),
             Err(e) => {
@@ -472,9 +666,21 @@ impl SshProvisioner {
             );
             return Ok(progress);
         }
+        let mtu = options.mtu.unwrap_or(1380);
+        let mss = mtu.saturating_sub(40);
+        if mss < 536 {
+            progress.fail(
+                DeploymentStep::ConfigureInterface,
+                format!("MTU {} 过小，无法计算安全 TCP MSS", mtu),
+            );
+            return Ok(progress);
+        }
         let wg_conf = format!(
-            "[Interface]\nPrivateKey = {}\nListenPort = {}\nAddress = {}\n",
-            server_private, options.wireguard_port, options.vpn_cidr
+            "[Interface]\nPrivateKey = {}\nListenPort = {}\nAddress = {}\nMTU = {}\n",
+            server_private,
+            options.wireguard_port,
+            gateway_address(&options.vpn_cidr)?,
+            mtu
         );
         // 原子写入：写临时文件 → 验证 → 替换
         let write_conf_cmd = format!(
@@ -492,7 +698,9 @@ fi
             config = wg_conf
         );
         match self.exec_checked(&write_conf_cmd, "write-config").await {
-            Ok(o) if o.contains("ok") => progress.update_step(DeploymentStep::ConfigureInterface, StepResult::Success),
+            Ok(o) if o.contains("ok") => {
+                progress.update_step(DeploymentStep::ConfigureInterface, StepResult::Success)
+            }
             Ok(_) => progress.fail(DeploymentStep::ConfigureInterface, "写入配置失败".into()),
             Err(e) => {
                 progress.fail(DeploymentStep::ConfigureInterface, e.to_string());
@@ -529,6 +737,25 @@ fi
             return Ok(progress);
         }
 
+        // WireGuard 的隧道 MTU 默认是 1380。没有 MSS clamp 时，部分公网路径
+        // 会丢弃超过路径 MTU 的 TCP 分片，而 ICMP 太大报文又可能被过滤，最终
+        // 表现为握手正常但 HTTPS/GitHub 下载严重降速。规则必须幂等，避免每次
+        // 迁移端口或重新部署都重复追加。
+        let mss_to_wg = format!(
+            "iptables -t mangle -C FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null || iptables -t mangle -A FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
+        );
+        if let Err(e) = self.exec_checked(&mss_to_wg, "mss-clamp-to-wg").await {
+            progress.fail(DeploymentStep::ConfigureRouting, e.to_string());
+            return Ok(progress);
+        }
+        let mss_from_wg = format!(
+            "iptables -t mangle -C FORWARD -i wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null || iptables -t mangle -A FORWARD -i wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
+        );
+        if let Err(e) = self.exec_checked(&mss_from_wg, "mss-clamp-from-wg").await {
+            progress.fail(DeploymentStep::ConfigureRouting, e.to_string());
+            return Ok(progress);
+        }
+
         progress.update_step(DeploymentStep::ConfigureRouting, StepResult::Success);
 
         // Step 7: 启动 WireGuard
@@ -537,9 +764,14 @@ fi
         // Peer 已在上一步保留，因此这里可以安全 restart 并验证真实运行状态。
         let start_cmd = "systemctl enable wg-quick@wg0 >/dev/null 2>&1 && systemctl restart wg-quick@wg0 && systemctl is-active --quiet wg-quick@wg0 && echo 'active'";
         match self.exec_checked(start_cmd, "start-service").await {
-            Ok(o) if o.contains("active") => progress.update_step(DeploymentStep::StartService, StepResult::Success),
+            Ok(o) if o.contains("active") => {
+                progress.update_step(DeploymentStep::StartService, StepResult::Success)
+            }
             Ok(_) => {
-                progress.fail(DeploymentStep::StartService, "WireGuard 启动后未进入 active 状态".into());
+                progress.fail(
+                    DeploymentStep::StartService,
+                    "WireGuard 启动后未进入 active 状态".into(),
+                );
                 return Ok(progress);
             }
             Err(e) => {
@@ -553,12 +785,19 @@ fi
 
         // Step 9: 验证
         progress.update_step(DeploymentStep::Verify, StepResult::Running);
-        match self.exec_root("wg show wg0 | head -5", "verify-wg").await {
+        let verify_cmd = format!(
+            "test \"$(wg show wg0 listen-port 2>/dev/null)\" = \"{}\" && wg show wg0 | head -5",
+            options.wireguard_port
+        );
+        match self.exec_root(&verify_cmd, "verify-wg").await {
             Ok(verify) if verify.contains("interface: wg0") => {
                 progress.update_step(DeploymentStep::Verify, StepResult::Success);
                 progress.complete();
             }
-            Ok(_) => progress.fail(DeploymentStep::Verify, "wg show 未返回 wg0 接口".into()),
+            Ok(_) => progress.fail(
+                DeploymentStep::Verify,
+                format!("wg0 未监听请求端口 {}", options.wireguard_port),
+            ),
             Err(e) => progress.fail(DeploymentStep::Verify, e.to_string()),
         }
 
@@ -572,16 +811,14 @@ fi
 
     /// 添加 Peer（公钥 + AllowedIPs）
     pub async fn add_peer(&mut self, public_key: &str, allowed_ips: &str) -> Result<(), AppError> {
-        let cmd = format!(
-            "wg set wg0 peer {} allowed-ips {}",
-            public_key, allowed_ips
-        );
+        let cmd = format!("wg set wg0 peer {} allowed-ips {}", public_key, allowed_ips);
         self.exec_checked(&cmd, "add-peer").await?;
 
         // 持久化：追加到 wg0.conf
         let persist = format!(
             r#"echo -e "\n[Peer]\nPublicKey = {pk}\nAllowedIPs = {ips}" >> /etc/wireguard/wg0.conf"#,
-            pk = public_key, ips = allowed_ips
+            pk = public_key,
+            ips = allowed_ips
         );
         let _ = self.exec_checked(&persist, "persist-peer").await;
         Ok(())
@@ -596,18 +833,40 @@ fi
 
     /// 获取 WireGuard 状态
     pub async fn get_status(&mut self) -> Result<String, AppError> {
-        self.exec_checked("wg show wg0 2>/dev/null || echo 'not-running'", "wg-show").await
+        self.exec_checked("wg show wg0 2>/dev/null || echo 'not-running'", "wg-show")
+            .await
+    }
+
+    /// 获取便于机器解析的 WireGuard 运行指标。
+    ///
+    /// `wg show dump` 的 peer 行分别携带公钥、最近握手 Unix 时间戳、接收和
+    /// 发送字节数；不要解析面向人类的 `wg show` 文案，以免受语言和时间单位影响。
+    /// 不给命令追加 `|| echo`：接口不存在或命令失败时必须报错，调用方不能把
+    /// 一次 SSH/服务故障误写成所有设备“从未连接”。
+    pub async fn get_status_dump(&mut self) -> Result<String, AppError> {
+        self.exec_checked("wg show wg0 dump", "wg-show-dump").await
     }
 
     /// 获取服务器公钥
     pub async fn get_server_public_key(&mut self) -> Result<String, AppError> {
-        self.exec_checked("cat /etc/wireguard/public.key 2>/dev/null || echo ''", "get-pubkey").await
+        self.exec_checked(
+            "cat /etc/wireguard/public.key 2>/dev/null || echo ''",
+            "get-pubkey",
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_address_uses_first_host_not_network_address() {
+        assert_eq!(gateway_address("10.66.66.0/24").unwrap(), "10.66.66.1/24");
+        assert_eq!(gateway_address("192.168.10.128/25").unwrap(), "192.168.10.129/25");
+        assert!(gateway_address("10.0.0.0/31").is_err());
+    }
 
     #[test]
     fn root_passes_command_through_unchanged() {

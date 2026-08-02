@@ -69,7 +69,13 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(name: String, host: String, ssh_port: u16, ssh_user: String, auth_type: SshAuthType) -> Self {
+    pub fn new(
+        name: String,
+        host: String,
+        ssh_port: u16,
+        ssh_user: String,
+        auth_type: SshAuthType,
+    ) -> Self {
         let now = current_timestamp();
         Self {
             id: Uuid::new_v4().to_string(),

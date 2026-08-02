@@ -625,16 +625,22 @@ fn spawn_inbound(
                             // 长连接的正常产物，混在一起会掩盖真问题
                             let counter = if is_session_churn(&e) {
                                 &stats.session_churn
+                            } else if !should_count_decrypt_error(started_at.elapsed()) {
+                                // 隧道刚建立时，旧 session 的在途包可能晚到。
+                                // 这段交接噪声只记录 debug，不能污染用户可见的
+                                // decrypt_errors 统计（此前会固定显示「解密错误 4」）。
+                                log_decrypt_error(
+                                    &e,
+                                    stats.decrypt_errors.load(Ordering::Relaxed),
+                                    started_at,
+                                    &mut last_decrypt_log,
+                                );
+                                continue;
                             } else {
                                 &stats.decrypt_errors
                             };
                             let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                            log_decrypt_error(
-                                &e,
-                                total,
-                                started_at,
-                                &mut last_decrypt_log,
-                            );
+                            log_decrypt_error(&e, total, started_at, &mut last_decrypt_log);
                         }
                     }
                 }
@@ -691,6 +697,12 @@ fn is_session_churn(err: &boringtun::noise::errors::WireGuardError) -> bool {
         err,
         E::WrongIndex | E::NoCurrentSession | E::DuplicateCounter | E::UnexpectedPacket
     )
+}
+
+/// 只有离开启动宽限期后，可疑的加密错误才进入用户可见计数。
+/// 会话轮换类错误由调用方单独计入 `session_churn`。
+fn should_count_decrypt_error(elapsed: Duration) -> bool {
+    elapsed >= DECRYPT_GRACE
 }
 
 /// 按「会话轮换 vs 可疑」分级记录解密错误
@@ -1056,6 +1068,16 @@ mod tests {
         assert!(!is_session_churn(&E::WrongKey));
         assert!(!is_session_churn(&E::InvalidMac));
         assert!(!is_session_churn(&E::InvalidCounter));
+    }
+
+    #[test]
+    fn startup_grace_does_not_count_suspicious_decrypt_errors() {
+        // 启动初期的交接包即使被 boringtun 判定为 AEAD 错误，也不应让
+        // 健康行显示固定的「解密错误 4」；宽限期结束后才进入计数。
+        assert!(!should_count_decrypt_error(Duration::from_millis(0)));
+        assert!(!should_count_decrypt_error(Duration::from_secs(2)));
+        assert!(should_count_decrypt_error(DECRYPT_GRACE));
+        assert!(should_count_decrypt_error(Duration::from_secs(4)));
     }
 
     #[test]

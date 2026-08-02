@@ -13,7 +13,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub enum SshAuthMethod {
     Password(String),
-    PrivateKey { key_path: String, passphrase: Option<String> },
+    PrivateKey {
+        key_path: String,
+        passphrase: Option<String>,
+    },
     SshAgent,
 }
 
@@ -117,9 +120,10 @@ impl SshSession {
     pub async fn connect(config: &SshConnectionConfig) -> Result<Self, SshError> {
         match &config.auth {
             SshAuthMethod::Password(pw) => Self::connect_password(config, pw).await,
-            SshAuthMethod::PrivateKey { key_path, passphrase } => {
-                Self::connect_key(config, key_path, passphrase.as_deref()).await
-            }
+            SshAuthMethod::PrivateKey {
+                key_path,
+                passphrase,
+            } => Self::connect_key(config, key_path, passphrase.as_deref()).await,
             SshAuthMethod::SshAgent => Err(SshError::AuthFailed(
                 "ssh-agent 认证尚未实现，请使用密码或私钥".into(),
             )),
@@ -225,7 +229,11 @@ impl SshSession {
             }
         }
 
-        Ok(CommandOutput { stdout, stderr, exit_status })
+        Ok(CommandOutput {
+            stdout,
+            stderr,
+            exit_status,
+        })
     }
 
     /// 执行命令，非零退出码视为错误
@@ -253,6 +261,17 @@ impl SshSession {
     pub async fn exec_lenient(&self, command: &str) -> Result<String, SshError> {
         Ok(self.exec_raw(command).await?.stdout)
     }
+
+    /// 显式关闭 SSH 连接。
+    ///
+    /// russh 的客户端连接任务由内部 runtime 持有；仅丢弃 Handle 不一定会
+    /// 立即发送 disconnect，短命 CLI 因此可能在命令完成后仍保持进程不退出。
+    pub async fn disconnect(self) -> Result<(), SshError> {
+        self.session
+            .disconnect(Disconnect::ByApplication, "command complete", "en")
+            .await
+            .map_err(SshError::ConnectionFailed)
+    }
 }
 
 /// 展开路径开头的 `~`
@@ -267,7 +286,10 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 
 /// 命令过长时截断，避免错误信息里塞进整个脚本
 fn truncate_cmd(cmd: &str) -> String {
-    let one_line: String = cmd.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let one_line: String = cmd
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
     if one_line.chars().count() <= 80 {
         one_line
     } else {

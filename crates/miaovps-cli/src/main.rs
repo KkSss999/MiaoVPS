@@ -7,13 +7,13 @@ mod dns;
 mod profile;
 
 use anyhow::{Context, Result};
+use miaovps_app::credentials::ServerCredential;
+use miaovps_app::session::auth_type_hint;
 use miaovps_app::tunnel::{TunnelMode, TunnelState, TunnelStatus};
+use miaovps_app::AppService;
 use miaovps_connect::native::NativeTunnel;
 use miaovps_connect::tun::{TunConfig, TunInterface};
 use miaovps_connect::ConnectionValidator;
-use miaovps_app::credentials::ServerCredential;
-use miaovps_app::session::auth_type_hint;
-use miaovps_app::AppService;
 use miaovps_core::{DeploymentStatus, DeploymentStep, Device, DeviceType, Server, SshAuthType};
 use miaovps_provisioner::{DeploymentOptions, DetectStatus, StepEvent, StepResult};
 use miaovps_storage::Database;
@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
 
     match cmd {
         "add-server" => cmd_add_server(&args).await?,
+        "remove-server" => cmd_remove_server(&args).await?,
         "list-servers" => cmd_list_servers().await?,
         "inspect" => cmd_inspect(&args).await?,
         "deploy" => cmd_deploy(&args).await?,
@@ -85,6 +86,7 @@ async fn main() -> Result<()> {
         "generate-keypair" => cmd_generate_keypair(),
         "validate" => cmd_validate(&args).await?,
         "profile" => cmd_profile(&args).await?,
+        "__prepare-profile" => cmd_prepare_profile(&args).await?,
         "connect" => cmd_connect(&args).await?,
         "disconnect" => cmd_disconnect(&args).await?,
         _ => print_help(),
@@ -98,9 +100,10 @@ fn print_help() {
     println!("用法: miaovps <command> [args]\n");
     println!("命令:");
     println!("  add-server <name> <host> [port] [user]  添加 VPS 服务器");
+    println!("  remove-server <server-id>                删除本地 VPS 节点记录");
     println!("  list-servers                             列出所有服务器");
     println!("  inspect <server-id>                      环境检测");
-    println!("  deploy <server-id>                       一键部署 WireGuard");
+    println!("  deploy <server-id> [--port <udp-port>]  一键部署/迁移 WireGuard 端口");
     println!("  add-device <server-id> <name> [type]     添加 VPN 设备");
     println!("  list-devices <server-id>                 列出设备");
     println!("  status <server-id>                       查看服务状态");
@@ -112,7 +115,7 @@ fn print_help() {
     println!("  profile init <ip:port> <client-priv> <server-pub> [client-ip]");
     println!("                                                保存连接配置");
     println!("  profile show                                  查看当前配置");
-    println!("  connect [--full] [--skip-validate] [--daemon] 建立隧道 (需 sudo)");
+    println!("  connect [server-id] [--device <device-id>] [--full] [--port <udp-port>] [--skip-validate] [--daemon] 建立隧道 (需 sudo)");
     println!("                                                --daemon 后台运行并写状态文件");
     println!("  disconnect                                    停止隧道并清理路由");
     println!();
@@ -136,14 +139,26 @@ async fn open_service() -> Result<AppService> {
 }
 
 async fn cmd_add_server(args: &[String]) -> Result<()> {
-    let positional: Vec<&String> = args.iter().skip(2).filter(|a| !a.starts_with("--")).collect();
-    let name = positional.first().map(|s| s.to_string()).unwrap_or_else(|| "My VPS".into());
+    let positional: Vec<&String> = args
+        .iter()
+        .skip(2)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+    let name = positional
+        .first()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "My VPS".into());
     let Some(host) = positional.get(1).map(|s| s.to_string()) else {
-        eprintln!("用法: miaovps add-server <name> <host> [port] [user] --password <pw> | --key <path>");
+        eprintln!(
+            "用法: miaovps add-server <name> <host> [port] [user] --password <pw> | --key <path>"
+        );
         std::process::exit(1);
     };
     let port: u16 = positional.get(2).and_then(|s| s.parse().ok()).unwrap_or(22);
-    let user = positional.get(3).map(|s| s.to_string()).unwrap_or_else(|| "root".into());
+    let user = positional
+        .get(3)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "root".into());
 
     // 凭据必须给 —— 不给的话服务器记录建了也连不上，后面 inspect/deploy 全失败
     let password = flag_value(args, "--password");
@@ -161,7 +176,10 @@ async fn cmd_add_server(args: &[String]) -> Result<()> {
         ),
         (None, Some(path)) => (
             SshAuthType::PrivateKey,
-            ServerCredential::PrivateKey { key_path: path, passphrase },
+            ServerCredential::PrivateKey {
+                key_path: path,
+                passphrase,
+            },
         ),
         (None, None) => {
             eprintln!("错误: 需要提供 --password <pw> 或 --key <私钥路径>");
@@ -172,7 +190,14 @@ async fn cmd_add_server(args: &[String]) -> Result<()> {
 
     let svc = open_service().await?;
     let server = svc
-        .add_server(name.clone(), host.clone(), port, user.clone(), auth_type, credential)
+        .add_server(
+            name.clone(),
+            host.clone(),
+            port,
+            user.clone(),
+            auth_type,
+            credential,
+        )
         .await?;
 
     println!("✓ 服务器已添加");
@@ -182,6 +207,29 @@ async fn cmd_add_server(args: &[String]) -> Result<()> {
     println!("  用户: {}", user);
     println!("  认证: {}", auth_type_hint(&server.auth_type));
     println!("\n下一步: miaovps inspect {}", &server.id[..8]);
+    Ok(())
+}
+
+/// 删除本地节点记录、级联设备和本地 SSH 凭据；不连接远程服务器。
+async fn cmd_remove_server(args: &[String]) -> Result<()> {
+    let Some(prefix) = args.get(2) else {
+        anyhow::bail!("用法: miaovps remove-server <server-id>");
+    };
+    let svc = open_service().await?;
+    let server_id = resolve_server_id(&svc, prefix).await?;
+    let server = svc
+        .db
+        .get_server(&server_id)
+        .await?
+        .context("服务器不存在")?;
+    svc.db.delete_server(&server_id).await?;
+    let credential_path = ServerCredential::path(&svc.cred_dir, &server_id);
+    if credential_path.exists() {
+        std::fs::remove_file(&credential_path)
+            .with_context(|| format!("无法删除凭据文件 {}", credential_path.display()))?;
+    }
+    println!("✓ 已删除本地节点: {} ({})", server.name, server.host);
+    println!("  远程服务器未被连接或修改");
     Ok(())
 }
 
@@ -197,7 +245,10 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 /// 按 ID 前缀查服务器 —— 命令行里让用户敲完整 UUID 不现实
 async fn resolve_server_id(svc: &AppService, prefix: &str) -> Result<String> {
     let servers = svc.list_servers().await?;
-    let matches: Vec<&Server> = servers.iter().filter(|s| s.id.starts_with(prefix)).collect();
+    let matches: Vec<&Server> = servers
+        .iter()
+        .filter(|s| s.id.starts_with(prefix))
+        .collect();
     match matches.len() {
         0 => anyhow::bail!("服务器不存在: {prefix}（用 list-servers 查看）"),
         1 => Ok(matches[0].id.clone()),
@@ -217,8 +268,15 @@ async fn cmd_list_servers() -> Result<()> {
     println!("服务器列表:");
     for s in &servers {
         let status = serde_json::to_string(&s.status).unwrap_or_default();
-        println!("  {}  {}  {}:{}  {}  {}",
-            &s.id[..8], s.name, s.host, s.ssh_port, s.os_name.as_deref().unwrap_or("?"), status);
+        println!(
+            "  {}  {}  {}:{}  {}  {}",
+            &s.id[..8],
+            s.name,
+            s.host,
+            s.ssh_port,
+            s.os_name.as_deref().unwrap_or("?"),
+            status
+        );
     }
     Ok(())
 }
@@ -242,7 +300,10 @@ async fn cmd_inspect(args: &[String]) -> Result<()> {
         .find(|s| s.id == server_id)
         .expect("resolve_server_id 已确认存在");
 
-    println!("正在检测 {} ({}:{})...\n", server.name, server.host, server.ssh_port);
+    println!(
+        "正在检测 {} ({}:{})...\n",
+        server.name, server.host, server.ssh_port
+    );
 
     let report = svc.inspect_server(server_id).await?;
 
@@ -275,7 +336,7 @@ async fn cmd_inspect(args: &[String]) -> Result<()> {
 
 async fn cmd_deploy(args: &[String]) -> Result<()> {
     let Some(prefix) = args.get(2) else {
-        eprintln!("用法: miaovps deploy <server-id>");
+        eprintln!("用法: miaovps deploy <server-id> [--port <udp-port>]");
         std::process::exit(1);
     };
 
@@ -288,7 +349,11 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
         .find(|s| s.id == server_id)
         .expect("resolve_server_id 已确认存在");
 
-    let options = DeploymentOptions::default();
+    let mut options = DeploymentOptions::default();
+    if let Some(port) = deploy_port_arg(args)? {
+        options.wireguard_port = port;
+    }
+    let requested_wireguard_port = options.wireguard_port;
     println!("即将部署 WireGuard 到 {} ({})\n", server.name, server.host);
     println!("部署配置:");
     println!("  WireGuard 端口: {}", options.wireguard_port);
@@ -311,7 +376,9 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
         }
     });
 
-    let progress = svc.deploy_server(server_id, Some(options), Some(tx)).await?;
+    let progress = svc
+        .deploy_server(server_id, Some(options), Some(tx))
+        .await?;
     // tx 已被 deploy_server 消费并 drop，printer 会自然收尾
     let _ = printer.await;
 
@@ -322,6 +389,11 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
             if let Some(pk) = &progress.server_public_key {
                 println!("  服务器公钥: {}", pk);
             }
+            sync_profile_after_deploy(
+                &server.host,
+                requested_wireguard_port,
+                progress.server_public_key.as_deref(),
+            )?;
             println!("\n下一步: miaovps add-device {} <设备名>", prefix);
         }
         _ => {
@@ -332,6 +404,257 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// 部署成功后同步 CLI 共用的本地 profile，避免服务端端口变更而客户端仍
+/// 连接旧端点。没有 profile（例如首次仅部署服务器）时保持正常，不创建
+/// 一个没有设备密钥的伪配置。
+fn sync_profile_after_deploy(
+    server_host: &str,
+    wireguard_port: u16,
+    server_public_key: Option<&str>,
+) -> Result<()> {
+    let path = ConnectionProfile::path(&data_dir());
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut profile = ConnectionProfile::load(&data_dir())?;
+    let current = profile.server_addr()?;
+    if current.ip().to_string() != server_host {
+        println!(
+            "  ⚠ 未同步 profile：当前端点 {} 与部署目标 {} 不一致",
+            profile.server_endpoint, server_host
+        );
+        return Ok(());
+    }
+
+    let mut endpoint = current;
+    endpoint.set_port(wireguard_port);
+    profile.server_endpoint = endpoint.to_string();
+    if let Some(public_key) = server_public_key {
+        profile.server_public_key = public_key.to_string();
+    }
+    profile.save(&data_dir())?;
+    println!("  ✓ 已同步本地连接端点: {}", profile.server_endpoint);
+    Ok(())
+}
+
+/// WireGuard 是 UDP 协议；部分国内网络会对 51820 的回程流量做特殊处理。
+/// 端口不是写死的：用户可在云防火墙放行后，以 `deploy --port 443` 进行
+/// 事务化重部署。Provisioner 会保留运行中的 peer，成功后同步节点端口。
+fn deploy_port_arg(args: &[String]) -> Result<Option<u16>> {
+    let mut found = None;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--port" => {
+                let raw = args
+                    .get(index + 1)
+                    .context("--port 需要一个 UDP 端口，例如 --port 443")?;
+                let port = raw.parse::<u16>().context("--port 必须是 1-65535 的整数")?;
+                if port == 0 {
+                    anyhow::bail!("--port 必须是 1-65535 的整数");
+                }
+                if found.replace(port).is_some() {
+                    anyhow::bail!("--port 只能指定一次");
+                }
+                index += 2;
+            }
+            unknown => anyhow::bail!("未知 deploy 参数: {unknown}"),
+        }
+    }
+    Ok(found)
+}
+
+/// 连接时临时覆盖 WireGuard UDP 端口，不改 profile 文件。
+/// WireGuard 使用 UDP，不支持 HTTP/SOCKS `--proxy`；需要的是端点端口覆盖。
+fn connect_port_arg(args: &[String]) -> Result<Option<u16>> {
+    let mut found = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            value if index == 2 && !value.starts_with("--") => index += 1,
+            "--full" | "--skip-validate" | "--daemon" => index += 1,
+            "--device" => {
+                if args.get(index + 1).is_none() {
+                    anyhow::bail!("--device 需要设备 ID 或前缀");
+                }
+                index += 2;
+            }
+            "--port" => {
+                let raw = args
+                    .get(index + 1)
+                    .context("--port 需要一个 UDP 端口，例如 --port 443")?;
+                let port = raw.parse::<u16>().context("--port 必须是 1-65535 的整数")?;
+                if port == 0 {
+                    anyhow::bail!("--port 必须是 1-65535 的整数");
+                }
+                if found.replace(port).is_some() {
+                    anyhow::bail!("--port 只能指定一次");
+                }
+                index += 2;
+            }
+            "--proxy" => anyhow::bail!(
+                "WireGuard 使用 UDP，不支持 HTTP/SOCKS --proxy；请使用 --port <udp-port>"
+            ),
+            unknown => anyhow::bail!("未知 connect 参数: {unknown}"),
+        }
+    }
+    Ok(found)
+}
+
+/// 解析显式节点选择。设备 ID 用于确定客户端密钥；未指定设备时沿用当前 profile。
+fn connect_target_args(args: &[String]) -> Result<(Option<String>, Option<String>)> {
+    let server = args
+        .get(2)
+        .filter(|value| !value.starts_with("--"))
+        .cloned();
+    let mut device = None;
+    let mut index = if server.is_some() { 3 } else { 2 };
+    while index < args.len() {
+        match args[index].as_str() {
+            "--device" => {
+                let value = args
+                    .get(index + 1)
+                    .context("--device 需要设备 ID 或前缀")?;
+                if device.replace(value.clone()).is_some() {
+                    anyhow::bail!("--device 只能指定一次");
+                }
+                index += 2;
+            }
+            "--full" | "--skip-validate" | "--daemon" => index += 1,
+            "--port" => index += 2,
+            "--proxy" => anyhow::bail!(
+                "WireGuard 使用 UDP，不支持 HTTP/SOCKS --proxy；请使用 --port <udp-port>"
+            ),
+            unknown => anyhow::bail!("未知 connect 参数: {unknown}"),
+        }
+    }
+    Ok((server, device))
+}
+
+/// 在提权前把指定设备的 Keychain 配置物化为 root 可读的 profile.json。
+/// sudo 进程不能直接读取当前用户的 macOS Keychain，因此必须先完成这一步。
+async fn prepare_selected_profile(server_prefix: &str, device_prefix: Option<&str>) -> Result<()> {
+    let Some(device_prefix) = device_prefix else {
+        anyhow::bail!("显式连接节点时必须指定 --device <device-id>");
+    };
+    let svc = open_service().await?;
+    let server_id = resolve_server_id(&svc, server_prefix).await?;
+    let devices = svc.list_devices(server_id.clone()).await?;
+    let matches: Vec<_> = devices
+        .iter()
+        .filter(|device| device.id.starts_with(device_prefix))
+        .collect();
+    let device = match matches.as_slice() {
+        [device] => *device,
+        [] => anyhow::bail!("设备不存在: {device_prefix}"),
+        _ => anyhow::bail!("设备 ID 前缀不唯一: {device_prefix}"),
+    };
+    let config = svc.export_config(device.id.clone()).await?;
+    let parsed = wg::parse_config(&config)
+        .map_err(|error| anyhow::anyhow!("设备 WireGuard 配置解析失败: {error}"))?;
+    let interface = parsed
+        .interface
+        .ok_or_else(|| anyhow::anyhow!("设备配置缺少 [Interface]"))?;
+    let peer = parsed
+        .peers
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("设备配置缺少 [Peer]"))?;
+    let private_key = interface.private_key.context("设备配置缺少客户端私钥")?;
+    let client_ip = interface
+        .address
+        .context("设备配置缺少客户端地址")?
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let node = svc
+        .db
+        .get_wg_node(&server_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("节点尚未部署 WireGuard"))?;
+    let profile = ConnectionProfile {
+        client_public_key: derive_public_key(&decode_key(&private_key, "客户端私钥")?),
+        client_private_key: private_key,
+        server_public_key: peer.public_key.context("设备配置缺少服务器公钥")?,
+        server_endpoint: peer.endpoint.context("设备配置缺少 VPS 端点")?,
+        client_ip,
+        peer_ip: gateway_from_cidr(&node.vpn_cidr)?,
+        netmask: "255.255.255.0".into(),
+        mtu: interface.mtu.or(node.mtu).unwrap_or(1380),
+        dns: interface.dns,
+    };
+    let path = profile.save(&data_dir())?;
+    println!("✓ 已选择节点 {} / 设备 {}", server_prefix, &device.id[..8]);
+    println!("  连接 profile: {}", path.display());
+    Ok(())
+}
+
+/// 以原始桌面用户身份准备显式节点 profile。
+///
+/// `sudo miaovps connect <server> --device ...` 会让当前进程一开始就
+/// 处于 root 身份，无法读取桌面用户的 Keychain。通过一个只做 profile
+/// 准备的内部子命令回到 SUDO_USER，完成后仍由当前 root 进程建立隧道。
+fn prepare_selected_profile_as_user(
+    server_prefix: &str,
+    device_prefix: Option<&str>,
+) -> Result<()> {
+    let user = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|value| !value.is_empty() && value != "root")
+        .context("无法识别 sudo 调用用户；请不要以 root shell 直接运行显式节点连接")?;
+    let device_prefix = device_prefix.context("显式连接节点时必须指定 --device")?;
+    let exe = std::env::current_exe().context("无法获取 miaovps 可执行文件路径")?;
+    let status = Command::new("sudo")
+        .args(["-u", &user, "-H"])
+        .arg(exe)
+        .arg("__prepare-profile")
+        .arg(server_prefix)
+        .arg("--device")
+        .arg(device_prefix)
+        .status()
+        .context("无法切换到桌面用户准备连接 profile")?;
+    if !status.success() {
+        anyhow::bail!("桌面用户 profile 准备失败，状态码 {:?}", status.code());
+    }
+    Ok(())
+}
+
+async fn cmd_prepare_profile(args: &[String]) -> Result<()> {
+    let server_prefix = args
+        .get(2)
+        .filter(|value| !value.starts_with("--"))
+        .context("内部命令缺少服务器 ID")?;
+    let (_, device_prefix) = connect_target_args(args)?;
+    prepare_selected_profile(server_prefix, device_prefix.as_deref()).await
+}
+
+fn gateway_from_cidr(cidr: &str) -> Result<String> {
+    let (raw_ip, raw_prefix) = cidr.split_once('/').context("VPN 网段格式错误")?;
+    let ip: std::net::Ipv4Addr = raw_ip.parse().context("VPN 网段地址无效")?;
+    let prefix: u8 = raw_prefix.parse().context("VPN 网段前缀无效")?;
+    if prefix > 30 {
+        anyhow::bail!("VPN 网段前缀必须不大于 /30");
+    }
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    Ok(std::net::Ipv4Addr::from((u32::from(ip) & mask) + 1).to_string())
+}
+
+fn spawn_elevated(args: &[String]) -> Result<()> {
+    let exe = std::env::current_exe().context("无法获取自身路径")?;
+    let status = Command::new("sudo")
+        .arg(exe)
+        .args(&args[1..])
+        .env("MIAOVPS_DATA_DIR", data_dir())
+        .status()
+        .context("无法通过 sudo 启动连接")?;
+    if !status.success() {
+        anyhow::bail!("sudo 连接进程退出，状态码 {:?}", status.code());
     }
     Ok(())
 }
@@ -357,7 +680,9 @@ async fn cmd_add_device(args: &[String]) -> Result<()> {
 
     let svc = open_service().await?;
     let server_id = resolve_server_id(&svc, prefix).await?;
-    let (device, config) = svc.add_device(server_id, name.clone(), dtype.clone()).await?;
+    let (device, config) = svc
+        .add_device(server_id, name.clone(), dtype.clone())
+        .await?;
 
     println!("✓ 设备已创建并注册为服务端 peer");
     println!("  ID:     {}", device.id);
@@ -389,8 +714,14 @@ async fn cmd_list_devices(args: &[String]) -> Result<()> {
     println!("设备列表:");
     for d in &devices {
         let status = d.status();
-        println!("  {}  {}  {}  {:?}  {}",
-            &d.id[..8], d.name, d.vpn_address, status, d.public_key);
+        println!(
+            "  {}  {}  {}  {:?}  {}",
+            &d.id[..8],
+            d.name,
+            d.vpn_address,
+            status,
+            d.public_key
+        );
     }
     Ok(())
 }
@@ -419,7 +750,13 @@ async fn cmd_status(args: &[String]) -> Result<()> {
     if !devices.is_empty() {
         println!("\n已注册设备 ({} 台):", devices.len());
         for d in &devices {
-            println!("  {}  {:<16} {}  {:?}", &d.id[..8], d.name, d.vpn_address, d.status());
+            println!(
+                "  {}  {:<16} {}  {:?}",
+                &d.id[..8],
+                d.name,
+                d.vpn_address,
+                d.status()
+            );
         }
     }
     Ok(())
@@ -468,14 +805,16 @@ fn cmd_generate_keypair() {
 
 async fn cmd_validate(args: &[String]) -> Result<()> {
     if args.len() < 5 {
-        eprintln!("用法: miaovps validate <server-ip:port> <client-private-key> <server-public-key>");
+        eprintln!(
+            "用法: miaovps validate <server-ip:port> <client-private-key> <server-public-key>"
+        );
         eprintln!("示例: miaovps validate 203.0.113.10:51820 OGuo5... A2xHn...");
         std::process::exit(1);
     }
 
-    let server_addr: SocketAddr = args[2].parse().map_err(|e| {
-        anyhow::anyhow!("服务器地址格式错误 (应为 IP:PORT): {e}")
-    })?;
+    let server_addr: SocketAddr = args[2]
+        .parse()
+        .map_err(|e| anyhow::anyhow!("服务器地址格式错误 (应为 IP:PORT): {e}"))?;
     let client_priv_b64 = &args[3];
     let server_pub_b64 = &args[4];
 
@@ -490,11 +829,7 @@ async fn cmd_validate(args: &[String]) -> Result<()> {
     println!();
     println!("正在分步验证链路（不会切换路由，安全）...\n");
 
-    let validator = ConnectionValidator::new(
-        server_addr,
-        client_private_key,
-        server_public_key,
-    );
+    let validator = ConnectionValidator::new(server_addr, client_private_key, server_public_key);
 
     let results = validator.validate_all().await;
 
@@ -595,6 +930,11 @@ fn publish_state(
 
 async fn cmd_connect(args: &[String]) -> Result<()> {
     let flags: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
+    let (server_prefix, device_prefix) = connect_target_args(args)?;
+    let port_override = connect_port_arg(args)?;
+    if server_prefix.is_some() != device_prefix.is_some() {
+        anyhow::bail!("显式连接节点时必须同时指定 server-id 和 --device <device-id>");
+    }
     let skip_validate = flags.contains(&"--skip-validate");
     let full_tunnel = flags.contains(&"--full");
     let daemon = flags.contains(&"--daemon");
@@ -602,11 +942,31 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     // 权限先查 — 创建 TUN 和改路由都需要 root，
     // 没有权限就别让用户白等几秒验证
     if !is_root() {
+        if let Some(server_prefix) = server_prefix.as_deref() {
+            prepare_selected_profile(server_prefix, device_prefix.as_deref()).await?;
+            return spawn_elevated(args);
+        }
         anyhow::bail!(
             "创建 TUN 接口和修改路由需要 root 权限。\n\
-             请使用: sudo miaovps connect{}",
-            if full_tunnel { " --full" } else { "" }
+             请使用: sudo miaovps connect{}{}",
+            if full_tunnel { " --full" } else { "" },
+            port_override
+                .map(|port| format!(" --port {port}"))
+                .unwrap_or_default()
         );
+    }
+
+    // 兼容用户直接写 `sudo miaovps connect <server> --device ...` 的用法。
+    // 不能在 root 进程中直接访问原用户 Keychain，否则会沿用旧 profile。
+    if let Some(server_prefix) = server_prefix.as_deref() {
+        if std::env::var_os("SUDO_USER").is_some() {
+            prepare_selected_profile_as_user(server_prefix, device_prefix.as_deref())?;
+        } else {
+            anyhow::bail!(
+                "显式节点连接需要桌面用户的 Keychain。请以普通用户运行命令（CLI 会自动 sudo），\n\
+                 或使用 `sudo` 从当前桌面用户启动，而不是在 root shell 中运行。"
+            );
+        }
     }
 
     // ── daemon 模式：父进程 re-exec 自己后立刻退出 ──
@@ -619,7 +979,12 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
 
     let is_daemon_child = daemon && std::env::var_os(DAEMON_MARKER).is_some();
 
-    let profile = ConnectionProfile::load(&data_dir())?;
+    let mut profile = ConnectionProfile::load(&data_dir())?;
+    if let Some(port) = port_override {
+        let mut endpoint = profile.server_addr()?;
+        endpoint.set_port(port);
+        profile.server_endpoint = endpoint.to_string();
+    }
     let server_addr = profile.server_addr()?;
     let client_priv = profile.client_private_bytes()?;
     let server_pub = profile.server_public_bytes()?;
@@ -639,7 +1004,11 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         );
     }
 
-    let tunnel_mode = if full_tunnel { TunnelMode::Full } else { TunnelMode::Split };
+    let tunnel_mode = if full_tunnel {
+        TunnelMode::Full
+    } else {
+        TunnelMode::Split
+    };
     let started_at = miaovps_app::tunnel::now_secs();
 
     // 必须在创建 utun 之前先写出归属状态。否则前端在
@@ -651,15 +1020,20 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
             profile.server_endpoint.clone(),
             profile.client_ip.clone(),
         );
-        state
-            .save(&data_dir())
-            .context("无法写入隧道启动状态")?;
+        state.save(&data_dir()).context("无法写入隧道启动状态")?;
     }
 
     println!("🔗 MiaoVPS 隧道 → {}", server_addr);
     println!("  客户端公钥: {}", short_key(&profile.client_public_key));
     println!("  服务器公钥: {}", short_key(&profile.server_public_key));
-    println!("  模式: {}", if full_tunnel { "Full Tunnel (全局)" } else { "Split Tunnel (仅 VPN 网段)" });
+    println!(
+        "  模式: {}",
+        if full_tunnel {
+            "Full Tunnel (全局)"
+        } else {
+            "Split Tunnel (仅 VPN 网段)"
+        }
+    );
     println!();
 
     // ── 1. 验证 ──
@@ -669,7 +1043,12 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         println!("[1/4] 验证链路...");
         let validator = ConnectionValidator::new(server_addr, client_priv, server_pub);
         for r in &validator.validate_all().await {
-            println!("  {} {} ({}ms)", if r.success { "✅" } else { "❌" }, r.step, r.duration_ms);
+            println!(
+                "  {} {} ({}ms)",
+                if r.success { "✅" } else { "❌" },
+                r.step,
+                r.duration_ms
+            );
             if !r.success {
                 println!("     {}", r.detail);
                 anyhow::bail!(
@@ -691,7 +1070,10 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     )?;
     let tun = TunInterface::create(&tun_config)?;
     let tun_name = tun.name().to_string();
-    println!("  {} — {} → {} mtu {}", tun_name, profile.client_ip, profile.peer_ip, profile.mtu);
+    println!(
+        "  {} — {} → {} mtu {}",
+        tun_name, profile.client_ip, profile.peer_ip, profile.mtu
+    );
 
     // ── 3. 路由 + DNS ──
     println!("[3/4] 设置路由...");
@@ -770,7 +1152,14 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
 
     println!();
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  ✅ 隧道已建立 ({})", if full_tunnel { "Full Tunnel" } else { "Split Tunnel" });
+    println!(
+        "  ✅ 隧道已建立 ({})",
+        if full_tunnel {
+            "Full Tunnel"
+        } else {
+            "Split Tunnel"
+        }
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
     if full_tunnel {
@@ -917,11 +1306,21 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         TunnelState::clear_stop_request(&data_dir());
     }
 
-    println!("  流量: ↑{} ↓{}{}{}",
+    println!(
+        "  流量: ↑{} ↓{}{}{}",
         human_bytes(tx),
         human_bytes(rx),
-        if reconnects > 0 { format!("  重连: {reconnects} 次") } else { String::new() },
-        if errs > 0 { format!("  解密错误: {errs}") } else { String::new() });
+        if reconnects > 0 {
+            format!("  重连: {reconnects} 次")
+        } else {
+            String::new()
+        },
+        if errs > 0 {
+            format!("  解密错误: {errs}")
+        } else {
+            String::new()
+        }
+    );
     println!("✅ 已断开");
 
     Ok(())
@@ -1084,7 +1483,9 @@ async fn cmd_profile(args: &[String]) -> Result<()> {
         Some("show") => cmd_profile_show(),
         _ => {
             println!("用法:");
-            println!("  miaovps profile init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]");
+            println!(
+                "  miaovps profile init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]"
+            );
             println!("  miaovps profile show");
             Ok(())
         }
@@ -1125,7 +1526,10 @@ fn cmd_profile_init(args: &[String]) -> Result<()> {
     println!("  MTU:        {}", profile.mtu);
     println!();
     println!("⚠ 确认此公钥已注册到 VPS 的 peer 列表:");
-    println!("    sudo wg set wg0 peer {} allowed-ips {}/32", client_public_key, profile.client_ip);
+    println!(
+        "    sudo wg set wg0 peer {} allowed-ips {}/32",
+        client_public_key, profile.client_ip
+    );
     println!("  然后: sudo miaovps connect");
 
     Ok(())
@@ -1133,11 +1537,17 @@ fn cmd_profile_init(args: &[String]) -> Result<()> {
 
 fn cmd_profile_show() -> Result<()> {
     let profile = ConnectionProfile::load(&data_dir())?;
-    println!("连接配置 ({})", ConnectionProfile::path(&data_dir()).display());
+    println!(
+        "连接配置 ({})",
+        ConnectionProfile::path(&data_dir()).display()
+    );
     println!("  服务器:     {}", profile.server_endpoint);
     println!("  服务器公钥: {}", profile.server_public_key);
     println!("  客户端公钥: {}", profile.client_public_key);
-    println!("  客户端私钥: {} (已隐藏)", short_key(&profile.client_private_key));
+    println!(
+        "  客户端私钥: {} (已隐藏)",
+        short_key(&profile.client_private_key)
+    );
     println!("  VPN 地址:   {} → {}", profile.client_ip, profile.peer_ip);
     println!("  掩码/MTU:   {} / {}", profile.netmask, profile.mtu);
     println!("  DNS:        {}", profile.dns.join(", "));
@@ -1179,11 +1589,17 @@ enum RouteVia {
 
 impl RouteSpec {
     fn gateway(destination: String, gw: &str) -> Self {
-        Self { destination, via: RouteVia::Gateway(gw.to_string()) }
+        Self {
+            destination,
+            via: RouteVia::Gateway(gw.to_string()),
+        }
     }
 
     fn interface(destination: String, iface: &str) -> Self {
-        Self { destination, via: RouteVia::Interface(iface.to_string()) }
+        Self {
+            destination,
+            via: RouteVia::Interface(iface.to_string()),
+        }
     }
 
     fn add(&self) -> Result<()> {
@@ -1261,7 +1677,9 @@ fn remove_tunnel_routes(vps_ip: &str, vpn_net: &str) {
 
 /// 获取当前默认网关 IP
 fn get_default_gateway() -> Result<String> {
-    let output = Command::new("route").args(["-n", "get", "default"]).output()?;
+    let output = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     let gw = stdout
@@ -1269,9 +1687,7 @@ fn get_default_gateway() -> Result<String> {
         .find_map(|l| l.trim().strip_prefix("gateway:"))
         .map(|g| g.trim().to_string())
         .filter(|g| !g.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("无法获取默认网关 — 当前可能没有可用网络连接")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("无法获取默认网关 — 当前可能没有可用网络连接"))?;
 
     Ok(gw)
 }
@@ -1306,7 +1722,13 @@ impl FullTunnelOverlay {
         dns_backup: Option<dns::DnsBackup>,
         data_dir: PathBuf,
     ) -> Self {
-        Self { tun_name, dns_servers, dns_backup, data_dir, engaged: true }
+        Self {
+            tun_name,
+            dns_servers,
+            dns_backup,
+            data_dir,
+            engaged: true,
+        }
     }
 
     fn is_engaged(&self) -> bool {
@@ -1403,7 +1825,10 @@ struct VpsRouteGuard {
 
 impl VpsRouteGuard {
     fn new(vps_ip: String, gw: String) -> Self {
-        Self { vps_ip, pinned_gw: gw }
+        Self {
+            vps_ip,
+            pinned_gw: gw,
+        }
     }
 
     /// 检查网关是否变化；变了就重建 VPS 主机路由。
@@ -1480,7 +1905,14 @@ mod tests {
 
     #[test]
     fn flag_value_reads_following_token() {
-        let args = argv(&["miaovps", "add-server", "vps", "1.2.3.4", "--password", "pw"]);
+        let args = argv(&[
+            "miaovps",
+            "add-server",
+            "vps",
+            "1.2.3.4",
+            "--password",
+            "pw",
+        ]);
         assert_eq!(flag_value(&args, "--password").as_deref(), Some("pw"));
         assert_eq!(flag_value(&args, "--key"), None);
     }
@@ -1500,6 +1932,65 @@ mod tests {
     }
 
     #[test]
+    fn deploy_port_accepts_a_non_default_udp_port() {
+        let args = argv(&["miaovps", "deploy", "server-1", "--port", "443"]);
+        assert_eq!(deploy_port_arg(&args).unwrap(), Some(443));
+    }
+
+    #[test]
+    fn deploy_port_rejects_missing_or_invalid_values() {
+        assert!(deploy_port_arg(&argv(&["miaovps", "deploy", "server-1", "--port"])).is_err());
+        assert!(deploy_port_arg(&argv(&["miaovps", "deploy", "server-1", "--port", "0"])).is_err());
+        assert!(deploy_port_arg(&argv(&["miaovps", "deploy", "server-1", "--other"])).is_err());
+    }
+
+    #[test]
+    fn connect_port_can_override_profile_without_proxy_semantics() {
+        let args = argv(&[
+            "miaovps",
+            "connect",
+            "--full",
+            "--port",
+            "443",
+            "--daemon",
+        ]);
+        assert_eq!(connect_port_arg(&args).unwrap(), Some(443));
+        assert!(connect_port_arg(&argv(&["miaovps", "connect", "--proxy", "http://x"])).is_err());
+    }
+
+    #[test]
+    fn connect_accepts_explicit_server_and_device() {
+        let args = argv(&[
+            "miaovps",
+            "connect",
+            "77ce8561",
+            "--device",
+            "aabbccdd",
+            "--full",
+            "--port",
+            "443",
+        ]);
+        assert_eq!(
+            connect_target_args(&args).unwrap(),
+            (Some("77ce8561".into()), Some("aabbccdd".into()))
+        );
+        assert_eq!(connect_port_arg(&args).unwrap(), Some(443));
+    }
+
+    #[test]
+    fn gateway_from_cidr_uses_first_host() {
+        assert_eq!(gateway_from_cidr("10.66.66.0/24").unwrap(), "10.66.66.1");
+        assert!(gateway_from_cidr("10.0.0.0/31").is_err());
+    }
+
+    #[test]
+    fn connect_port_rejects_missing_or_invalid_values() {
+        assert!(connect_port_arg(&argv(&["miaovps", "connect", "--port"])).is_err());
+        assert!(connect_port_arg(&argv(&["miaovps", "connect", "--port", "0"])).is_err());
+        assert!(connect_port_arg(&argv(&["miaovps", "connect", "--port", "443", "--port", "51820"])).is_err());
+    }
+
+    #[test]
     fn derives_vpn_network_from_gateway() {
         assert_eq!(vpn_network_cidr("10.66.66.1").unwrap(), "10.66.66.0/24");
         assert_eq!(vpn_network_cidr("192.168.9.1").unwrap(), "192.168.9.0/24");
@@ -1508,7 +1999,10 @@ mod tests {
 
     #[test]
     fn truncates_keys_for_display() {
-        assert_eq!(short_key("fRp9SCOP2pu780jn15LbDFbxPwJJleAjODXjzcOgZFs="), "fRp9SCOP2pu7…");
+        assert_eq!(
+            short_key("fRp9SCOP2pu780jn15LbDFbxPwJJleAjODXjzcOgZFs="),
+            "fRp9SCOP2pu7…"
+        );
         assert_eq!(short_key("short"), "…");
     }
 
@@ -1528,9 +2022,15 @@ mod tests {
             "/Applications/MiaoVPS.app/Contents/MacOS/miaovps connect --daemon"
         ));
         assert!(!is_miaovps_daemon_command("/bin/sleep 100"));
-        assert!(!is_miaovps_daemon_command("/tmp/not-miaovps connect --daemon"));
-        assert!(!is_miaovps_daemon_command("/usr/local/bin/miaovps connect --full"));
-        assert!(!is_miaovps_daemon_command("/usr/local/bin/miaovps deploy --daemon"));
+        assert!(!is_miaovps_daemon_command(
+            "/tmp/not-miaovps connect --daemon"
+        ));
+        assert!(!is_miaovps_daemon_command(
+            "/usr/local/bin/miaovps connect --full"
+        ));
+        assert!(!is_miaovps_daemon_command(
+            "/usr/local/bin/miaovps deploy --daemon"
+        ));
     }
 
     /// 构造一个不触碰真实系统的 overlay：没有 DNS 备份 → 不会调 networksetup；
@@ -1546,7 +2046,10 @@ mod tests {
 
     #[test]
     fn overlay_starts_engaged() {
-        assert!(test_overlay().is_engaged(), "Full Tunnel 建立后应处于接管状态");
+        assert!(
+            test_overlay().is_engaged(),
+            "Full Tunnel 建立后应处于接管状态"
+        );
     }
 
     #[test]

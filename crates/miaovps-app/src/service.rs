@@ -11,6 +11,7 @@ use miaovps_provisioner::{
 };
 use miaovps_storage::{keychain::WgKeyStore, Database};
 use miaovps_wireguard_config::{generate_client_config, generate_keypair, ClientConfigParams};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -131,7 +132,15 @@ impl AppService {
 
         let opts = options.unwrap_or_default();
         let mut provisioner = open_provisioner(&server, &self.cred_dir, None).await?;
-        let progress = provisioner.deploy_reporting(&opts, events).await?;
+        let mut progress = provisioner.deploy_reporting(&opts, events).await?;
+        // 部署完成后显式关闭 russh 会话。仅丢弃 Handle 可能让后台连接任务
+        // 继续存活，CLI 会表现为部署成功但进程不自动退出。
+        if let Err(e) = provisioner.disconnect().await {
+            tracing::warn!(server_id=%server_id, error=%e, "关闭部署 SSH 会话失败");
+        }
+        // 事件接收方由 CLI/Tauri 调用方管理；返回最终结果前必须释放发送端，
+        // 否则 CLI 的进度打印任务会一直等待，导致部署成功后无法退出。
+        progress.clear_sink();
 
         // 部署成功后保存 WireGuardNode
         if progress.status == miaovps_core::DeploymentStatus::Success {
@@ -290,6 +299,82 @@ impl AppService {
     pub async fn list_devices(&self, server_id: String) -> Result<Vec<Device>, ServiceError> {
         Ok(self.db.list_devices(&server_id).await?)
     }
+
+    /// 通过 SSH 读取服务端的 WireGuard peer 指标并同步到本地设备记录。
+    ///
+    /// 设备表只保存展示用的快照，WireGuard 本身才是握手和流量的权威来源。
+    /// 只更新能按公钥匹配到的 peer；远端暂时缺失的 peer 保留最后一次已知
+    /// 状态，避免服务端短暂故障被误显示为“从未连接”。
+    pub async fn refresh_device_runtime(
+        &self,
+        server_id: String,
+    ) -> Result<Vec<Device>, ServiceError> {
+        let server = self
+            .db
+            .get_server(&server_id)
+            .await?
+            .ok_or_else(|| ServiceError::ServerNotFound(server_id.clone()))?;
+        let devices = self.db.list_devices(&server_id).await?;
+        if devices.is_empty() {
+            return Ok(devices);
+        }
+
+        let mut provisioner = open_provisioner_any(&server, &self.cred_dir).await?;
+        let peer_stats = parse_wg_dump(&provisioner.get_status_dump().await?);
+
+        let mut refreshed = 0usize;
+        for device in &devices {
+            if let Some(stats) = peer_stats.get(&device.public_key) {
+                self.db
+                    .update_device_runtime(
+                        &device.id,
+                        stats.latest_handshake_at,
+                        stats.rx_bytes,
+                        stats.tx_bytes,
+                    )
+                    .await?;
+                refreshed += 1;
+            }
+        }
+
+        info!(server_id=%server_id, refreshed, peer_count=peer_stats.len(), "设备 WireGuard 运行状态已刷新");
+        Ok(self.db.list_devices(&server_id).await?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerRuntime {
+    latest_handshake_at: Option<i64>,
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+/// 解析 `wg show wg0 dump`。
+///
+/// 第一行是接口信息；每个 peer 行的字段固定为：公钥、预共享密钥、endpoint、
+/// allowed-ips、最近握手、rx、tx、keepalive。格式损坏的行宁可忽略，不能让
+/// 单个异常 peer 阻断整个设备列表。
+fn parse_wg_dump(dump: &str) -> HashMap<String, PeerRuntime> {
+    dump.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 8 || fields[0].is_empty() {
+                return None;
+            }
+            let latest_handshake = fields[4].parse::<i64>().ok()?;
+            let rx_bytes = fields[5].parse::<u64>().ok()?;
+            let tx_bytes = fields[6].parse::<u64>().ok()?;
+            Some((
+                fields[0].to_string(),
+                PeerRuntime {
+                    latest_handshake_at: (latest_handshake > 0).then_some(latest_handshake),
+                    rx_bytes,
+                    tx_bytes,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn current_timestamp() -> i64 {
@@ -410,5 +495,34 @@ mod tests {
         assert_eq!(parse_os_version("Ubuntu 24.04").as_deref(), Some("24.04"));
         assert_eq!(parse_os_version("Ubuntu 22.04").as_deref(), Some("22.04"));
         assert_eq!(parse_os_version("Debian"), None);
+    }
+
+    #[test]
+    fn parses_wireguard_dump_with_handshake_and_counters() {
+        let dump = concat!(
+            "server-private\tserver-public\t51820\toff\n",
+            "peer-a\t(none)\t203.0.113.1:51820\t10.66.66.2/32\t1785495944\t1449785\t1068600\t25\n",
+            "peer-b\t(none)\t(none)\t10.66.66.3/32\t0\t0\t0\t0\n",
+            "malformed\tline\n",
+        );
+
+        let peers = parse_wg_dump(dump);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(
+            peers.get("peer-a"),
+            Some(&PeerRuntime {
+                latest_handshake_at: Some(1_785_495_944),
+                rx_bytes: 1_449_785,
+                tx_bytes: 1_068_600,
+            })
+        );
+        assert_eq!(
+            peers.get("peer-b"),
+            Some(&PeerRuntime {
+                latest_handshake_at: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
+            })
+        );
     }
 }

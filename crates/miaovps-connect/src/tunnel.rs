@@ -7,12 +7,12 @@
 //!   2. UDP 收到加密包 → decapsulate → TUN 写入
 
 use boringtun::noise::{Tunn, TunnResult};
-use x25519_dalek::{PublicKey, StaticSecret};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::warn;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::error::ConnectError;
 
@@ -84,7 +84,11 @@ impl WireGuardHandshaker {
         let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.recv(&mut recv_buf))
             .await
             .map_err(|_| {
-                format!("等待响应超时 {}s — 检查 UDP {} 是否开放", HANDSHAKE_TIMEOUT.as_secs(), self.server_addr.port())
+                format!(
+                    "等待响应超时 {}s — 检查 UDP {} 是否开放",
+                    HANDSHAKE_TIMEOUT.as_secs(),
+                    self.server_addr.port()
+                )
             })?
             .map_err(|e| format!("接收失败: {e}"))?;
 
@@ -135,9 +139,7 @@ impl TunnelHandle {
         let udp = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(ConnectError::Io)?;
-        udp.connect(server_addr)
-            .await
-            .map_err(ConnectError::Io)?;
+        udp.connect(server_addr).await.map_err(ConnectError::Io)?;
 
         Ok(Self {
             tunn: Arc::new(Mutex::new(tunn)),
@@ -163,10 +165,7 @@ impl TunnelHandle {
         let mut encrypted = [0u8; 1500];
         match tunn.encapsulate(ip_packet, &mut encrypted[..]) {
             TunnResult::WriteToNetwork(packet) => {
-                self.udp
-                    .send(packet)
-                    .await
-                    .map_err(ConnectError::Io)?;
+                self.udp.send(packet).await.map_err(ConnectError::Io)?;
                 Ok(())
             }
             TunnResult::Done => Ok(()),
@@ -183,18 +182,11 @@ impl TunnelHandle {
         let mut tunn = self.tunn.lock().await;
         let mut decrypted = [0u8; 1500];
         match tunn.decapsulate(None, raw, &mut decrypted[..]) {
-            TunnResult::WriteToTunnelV4(packet, _addr) => {
-                Ok(Some(packet.to_vec()))
-            }
-            TunnResult::WriteToTunnelV6(packet, _addr) => {
-                Ok(Some(packet.to_vec()))
-            }
+            TunnResult::WriteToTunnelV4(packet, _addr) => Ok(Some(packet.to_vec())),
+            TunnResult::WriteToTunnelV6(packet, _addr) => Ok(Some(packet.to_vec())),
             TunnResult::WriteToNetwork(packet) => {
                 // 需要回包（握手响应等）
-                self.udp
-                    .send(packet)
-                    .await
-                    .map_err(ConnectError::Io)?;
+                self.udp.send(packet).await.map_err(ConnectError::Io)?;
                 Ok(None)
             }
             TunnResult::Done => Ok(None),
@@ -208,10 +200,7 @@ impl TunnelHandle {
         let mut buf = [0u8; 148];
         match tunn.update_timers(&mut buf[..]) {
             TunnResult::WriteToNetwork(packet) => {
-                self.udp
-                    .send(packet)
-                    .await
-                    .map_err(ConnectError::Io)?;
+                self.udp.send(packet).await.map_err(ConnectError::Io)?;
                 Ok(())
             }
             _ => Ok(()),
@@ -222,8 +211,8 @@ impl TunnelHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x25519_dalek::{PublicKey, StaticSecret};
     use rand::rngs::OsRng;
+    use x25519_dalek::{PublicKey, StaticSecret};
 
     #[test]
     fn test_handshaker_creation() {
@@ -232,10 +221,6 @@ mod tests {
         let _server_pub = PublicKey::from(&server_secret);
 
         let addr: SocketAddr = "127.0.0.1:51820".parse().unwrap();
-        let _h = WireGuardHandshaker::new(
-            client_secret.to_bytes(),
-            server_secret.to_bytes(),
-            addr,
-        );
+        let _h = WireGuardHandshaker::new(client_secret.to_bytes(), server_secret.to_bytes(), addr);
     }
 }

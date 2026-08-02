@@ -60,11 +60,7 @@ pub struct AppError {
 }
 
 impl AppError {
-    pub fn new(
-        code: ErrorCode,
-        title: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn new(code: ErrorCode, title: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code,
             title: title.into(),

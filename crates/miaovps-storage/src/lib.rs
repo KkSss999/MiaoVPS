@@ -196,7 +196,11 @@ impl Database {
         rows.iter().map(row_to_server).collect()
     }
 
-    pub async fn update_server_status(&self, id: &str, status: &ServerStatus) -> Result<(), StorageError> {
+    pub async fn update_server_status(
+        &self,
+        id: &str,
+        status: &ServerStatus,
+    ) -> Result<(), StorageError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -287,7 +291,10 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_wg_node(&self, server_id: &str) -> Result<Option<WireGuardNode>, StorageError> {
+    pub async fn get_wg_node(
+        &self,
+        server_id: &str,
+    ) -> Result<Option<WireGuardNode>, StorageError> {
         let row = sqlx::query("SELECT * FROM wg_nodes WHERE server_id = ?1")
             .bind(server_id)
             .fetch_optional(&self.pool)
@@ -299,8 +306,6 @@ impl Database {
         }
     }
 }
-
-
 
 impl Database {
     pub async fn insert_device(&self, device: &Device) -> Result<(), StorageError> {
@@ -329,10 +334,11 @@ impl Database {
     }
 
     pub async fn list_devices(&self, server_id: &str) -> Result<Vec<Device>, StorageError> {
-        let rows = sqlx::query("SELECT * FROM devices WHERE server_id = ?1 ORDER BY created_at ASC")
-            .bind(server_id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT * FROM devices WHERE server_id = ?1 ORDER BY created_at ASC")
+                .bind(server_id)
+                .fetch_all(&self.pool)
+                .await?;
 
         rows.iter().map(row_to_device).collect()
     }
@@ -355,6 +361,29 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// 按服务端 `wg show dump` 的真实值刷新设备运行状态。
+    ///
+    /// 握手为 0 时存为 NULL，避免把 Unix epoch 当成一次有效连接；字节数是
+    /// WireGuard 自启动以来的累计值，直接覆盖而非累加。
+    pub async fn update_device_runtime(
+        &self,
+        id: &str,
+        latest_handshake_at: Option<i64>,
+        rx_bytes: u64,
+        tx_bytes: u64,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE devices SET latest_handshake_at = ?1, rx_bytes = ?2, tx_bytes = ?3 WHERE id = ?4",
+        )
+        .bind(latest_handshake_at)
+        .bind(rx_bytes as i64)
+        .bind(tx_bytes as i64)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -446,7 +475,8 @@ fn row_to_wg_node(r: &sqlx::sqlite::SqliteRow) -> Result<WireGuardNode, StorageE
 
 fn row_to_server(r: &sqlx::sqlite::SqliteRow) -> Result<Server, StorageError> {
     let auth_str: String = r.try_get("auth_type")?;
-    let auth_type: miaovps_core::SshAuthType = serde_json::from_str(&auth_str).unwrap_or(miaovps_core::SshAuthType::Password);
+    let auth_type: miaovps_core::SshAuthType =
+        serde_json::from_str(&auth_str).unwrap_or(miaovps_core::SshAuthType::Password);
 
     let status_str: String = r.try_get("status")?;
     let status: ServerStatus = serde_json::from_str(&status_str).unwrap_or(ServerStatus::Added);
@@ -660,5 +690,21 @@ mod tests {
 
         db.delete_device("dev-1").await.unwrap();
         assert!(db.get_device("dev-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn device_runtime_is_persisted_from_wireguard_counters() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.insert_server(&test_server()).await.unwrap();
+        db.insert_device(&test_device()).await.unwrap();
+
+        db.update_device_runtime("dev-1", Some(1_785_495_944), 1_449_785, 1_068_600)
+            .await
+            .unwrap();
+
+        let device = db.get_device("dev-1").await.unwrap().unwrap();
+        assert_eq!(device.latest_handshake_at, Some(1_785_495_944));
+        assert_eq!(device.rx_bytes, 1_449_785);
+        assert_eq!(device.tx_bytes, 1_068_600);
     }
 }

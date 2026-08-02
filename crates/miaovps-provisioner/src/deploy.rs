@@ -71,6 +71,14 @@ impl DeploymentProgress {
         self.sink = Some(sink);
     }
 
+    /// 部署调用方完成消费事件后释放发送端。
+    ///
+    /// 返回值会跨越服务层边界；如果把 sender 一起返回，CLI 的接收任务
+    /// 永远等不到通道关闭，表现为部署成功后进程不退出。
+    pub fn clear_sink(&mut self) {
+        self.sink = None;
+    }
+
     pub fn update_step(&mut self, step: DeploymentStep, result: StepResult) {
         self.steps.insert(step.clone(), result.clone());
         self.current_step = Some(step.clone());
@@ -157,6 +165,18 @@ mod tests {
         p.update_step(DeploymentStep::Backup, StepResult::Success);
         p.complete();
         assert_eq!(p.status, DeploymentStatus::Success);
+    }
+
+    #[test]
+    fn clear_sink_closes_event_channel() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut p = DeploymentProgress::new("d1".into());
+        p.set_sink(tx);
+        p.clear_sink();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     /// sink 不参与序列化 —— 它是进程内通道，跨 IPC 传不了

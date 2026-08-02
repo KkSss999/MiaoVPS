@@ -45,7 +45,10 @@ impl SecureStore {
 /// SSH 凭据类型
 pub enum SshCredential {
     Password(String),
-    PrivateKey { key_content: String, passphrase: Option<String> },
+    PrivateKey {
+        key_content: String,
+        passphrase: Option<String>,
+    },
 }
 
 impl SshCredential {
@@ -70,7 +73,10 @@ impl SshCredential {
                 "type": "password",
                 "password": pwd
             }),
-            SshCredential::PrivateKey { key_content, passphrase } => serde_json::json!({
+            SshCredential::PrivateKey {
+                key_content,
+                passphrase,
+            } => serde_json::json!({
                 "type": "private_key",
                 "key_content": key_content,
                 "passphrase": passphrase
@@ -82,7 +88,7 @@ impl SshCredential {
         let v: serde_json::Value = serde_json::from_str(json)?;
         match v["type"].as_str().unwrap_or("") {
             "password" => Ok(SshCredential::Password(
-                v["password"].as_str().unwrap_or("").into()
+                v["password"].as_str().unwrap_or("").into(),
             )),
             "private_key" => Ok(SshCredential::PrivateKey {
                 key_content: v["key_content"].as_str().unwrap_or("").into(),

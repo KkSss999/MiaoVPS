@@ -23,6 +23,7 @@ SERVER_VPN_IP="${SERVER_VPN_IP:-10.66.66.1}"
 CLIENT_VPN_IP="${CLIENT_VPN_IP:-10.66.66.2}"
 DNS="${DNS:-1.1.1.1}"
 MTU="${MTU:-1380}"
+MSS="${MSS:-$((MTU - 40))}"
 BACKUP_DIR="/var/lib/miaovps/backups/$(date +%s)"
 WG_DIR="/etc/wireguard"
 
@@ -99,6 +100,11 @@ if [ -n "$DEFAULT_IFACE" ]; then
     iptables -t nat -A POSTROUTING -o "$DEFAULT_IFACE" -j MASQUERADE
     iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -j ACCEPT
     iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -j ACCEPT
+    # WireGuard MTU 1380: set TCP SYN MSS explicitly to avoid PMTUD black holes.
+    iptables -t mangle -C FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS" 2>/dev/null || \
+        iptables -t mangle -A FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
+    iptables -t mangle -C FORWARD -i wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS" 2>/dev/null || \
+        iptables -t mangle -A FORWARD -i wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$MSS"
     log "NAT + Forward 规则已配置 (iface: $DEFAULT_IFACE)"
 else
     warn "无法检测默认网卡，请手动配置 NAT"

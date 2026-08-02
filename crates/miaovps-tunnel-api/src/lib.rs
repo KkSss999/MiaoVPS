@@ -29,7 +29,9 @@ impl RoutingPolicy {
     pub fn to_allowed_ips(&self) -> Vec<String> {
         match self {
             RoutingPolicy::FullTunnel => vec!["0.0.0.0/0".into(), "::/0".into()],
-            RoutingPolicy::SplitTunnel { included_routes, .. } => included_routes.clone(),
+            RoutingPolicy::SplitTunnel {
+                included_routes, ..
+            } => included_routes.clone(),
         }
     }
 }

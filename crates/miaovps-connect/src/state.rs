@@ -88,8 +88,16 @@ impl ConnectionState {
     pub fn progress_pct(&self) -> u32 {
         match self {
             Self::Disconnected => 0,
-            Self::Validating { step_num, total_steps, .. } => {
-                if *total_steps == 0 { 0 } else { (step_num * 100) / total_steps }
+            Self::Validating {
+                step_num,
+                total_steps,
+                ..
+            } => {
+                if *total_steps == 0 {
+                    0
+                } else {
+                    (step_num * 100) / total_steps
+                }
             }
             Self::SplitTunnel => 80,
             Self::FullTunnel => 100,

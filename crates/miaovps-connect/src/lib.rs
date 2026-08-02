@@ -22,7 +22,7 @@ pub mod validator;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info};
+use tracing::info;
 
 pub use crate::error::ConnectError;
 pub use crate::native::NativeTunnel;
@@ -82,10 +82,7 @@ impl VpnConnection {
     /// 开始连接（分步验证 → Split Tunnel）
     ///
     /// 回调 `on_progress` 在每个验证步骤完成时调用，传入当前状态
-    pub async fn connect<F>(
-        &self,
-        mut on_progress: F,
-    ) -> Result<ConnectionState, ConnectError>
+    pub async fn connect<F>(&self, mut on_progress: F) -> Result<ConnectionState, ConnectError>
     where
         F: FnMut(&ConnectionState),
     {
@@ -103,11 +100,13 @@ impl VpnConnection {
         }
 
         // ── 阶段 1：验证 ──
-        self.emit_validating(&mut on_progress, ValidationStep::CreateTun, 1, 5).await;
+        self.emit_validating(&mut on_progress, ValidationStep::CreateTun, 1, 5)
+            .await;
 
         // Step 1: 创建 TUN (验证模式，暂不真正创建)
         info!("[连接] 步骤 1/5 — 创建虚拟网卡...");
-        self.emit_validating(&mut on_progress, ValidationStep::UdpReachable, 2, 5).await;
+        self.emit_validating(&mut on_progress, ValidationStep::UdpReachable, 2, 5)
+            .await;
 
         // Step 2: UDP 可达测试
         info!("[连接] 步骤 2/5 — UDP 端口可达...");
@@ -135,11 +134,14 @@ impl VpnConnection {
         }
 
         // Step 3: WG 握手
-        self.emit_validating(&mut on_progress, ValidationStep::Handshake, 3, 5).await;
+        self.emit_validating(&mut on_progress, ValidationStep::Handshake, 3, 5)
+            .await;
         info!("[连接] 步骤 3/5 — WireGuard 握手...");
 
         // 握手已在 validate_all 中完成
-        let handshake_ok = results.iter().any(|r| r.step == "WireGuard 握手" && r.success);
+        let handshake_ok = results
+            .iter()
+            .any(|r| r.step == "WireGuard 握手" && r.success);
         if !handshake_ok {
             let err_msg = results
                 .iter()
@@ -157,11 +159,13 @@ impl VpnConnection {
         }
 
         // Step 4: NAT 检查
-        self.emit_validating(&mut on_progress, ValidationStep::NatCheck, 4, 5).await;
+        self.emit_validating(&mut on_progress, ValidationStep::NatCheck, 4, 5)
+            .await;
         info!("[连接] 步骤 4/5 — NAT 路由检查... 通过");
 
         // Step 5: 出口 IP 验证（Split Tunnel 后验证）
-        self.emit_validating(&mut on_progress, ValidationStep::EgressIp, 5, 5).await;
+        self.emit_validating(&mut on_progress, ValidationStep::EgressIp, 5, 5)
+            .await;
 
         // ── 阶段 2：Split Tunnel ──
         {
@@ -232,10 +236,7 @@ impl VpnConnection {
     }
 
     /// 断开 VPN 连接
-    pub async fn disconnect<F>(
-        &self,
-        mut on_progress: F,
-    ) -> Result<ConnectionState, ConnectError>
+    pub async fn disconnect<F>(&self, mut on_progress: F) -> Result<ConnectionState, ConnectError>
     where
         F: FnMut(&ConnectionState),
     {

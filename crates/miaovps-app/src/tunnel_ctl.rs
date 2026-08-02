@@ -123,8 +123,7 @@ impl TunnelCtl {
             }
         }
         Err(TunnelCtlError::LaunchFailed(
-            "隧道进程已启动，但 30 秒内未进入可用状态，请查看 ~/.miaovps/tunnel.log"
-                .into(),
+            "隧道进程已启动，但 30 秒内未进入可用状态，请查看 ~/.miaovps/tunnel.log".into(),
         ))
     }
 
@@ -363,10 +362,7 @@ mod tests {
     /// 正常断开必须只写停止请求，不能再调 osascript。
     #[test]
     fn managed_disconnect_needs_no_privileged_command() {
-        let dir = std::env::temp_dir().join(format!(
-            "miaovps-ctl-stop-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("miaovps-ctl-stop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         TunnelState::clear(&dir);
         TunnelState::clear_stop_request(&dir);
@@ -402,8 +398,11 @@ mod tests {
     fn connect_refuses_when_already_running() {
         let dir = std::env::temp_dir().join(format!("miaovps-ctl2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut state =
-            TunnelState::connecting(TunnelMode::Full, "1.2.3.4:51820".into(), "10.66.66.3".into());
+        let mut state = TunnelState::connecting(
+            TunnelMode::Full,
+            "1.2.3.4:51820".into(),
+            "10.66.66.3".into(),
+        );
         state.status = TunnelStatus::Connected;
         state.save(&dir).unwrap();
 
