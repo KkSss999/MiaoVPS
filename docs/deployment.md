@@ -46,6 +46,48 @@ sudo miaovps connect <server-id> --device <device-id> --full
 
 迁移后必须确认云防火墙和 VPS 内部防火墙都放行新的 UDP 端口。端口 443 上运行的是 WireGuard UDP，并不是 HTTPS；它仍可能受 UDP 策略影响。
 
+## 多台物理设备连接同一节点
+
+同一个 WireGuard 接口只有一个服务端监听端口。一个 MiaoVPS 节点上的所有设备
+应连接相同的 VPS 目标端口，由各自的客户端公钥和 VPN 地址区分身份：
+
+```text
+设备 A：随机本地 UDP 端口 -> VPS:443  (独立公钥，10.66.66.2/32)
+设备 B：随机本地 UDP 端口 -> VPS:443  (独立公钥，10.66.66.3/32)
+```
+
+为每台物理设备分别创建 peer，不要把同一份设备配置复制给多台设备：
+
+```bash
+miaovps add-device <server-id> "MacBook" mac
+miaovps add-device <server-id> "iPhone" iphone
+miaovps list-devices <server-id>
+miaovps export-config <device-id>
+```
+
+两台设备如果复用同一个客户端私钥、公钥或 VPN 地址，WireGuard 会把它们视为
+同一个 peer，并把远端 endpoint 在两台设备之间反复切换，表现为一台连通时另一台
+断流。设备使用不同的本地源端口是正常现象，无需手工配置。
+
+端口参数的作用范围：
+
+- `connect --port <port>` 只临时覆盖客户端要连接的 VPS 目标端口，不会让 VPS
+  新增监听端口，也不是每设备端口。
+- `deploy --port <port>` 会迁移整个节点的 `wg0` 监听端口，影响该节点的所有设备。
+  迁移后，其他物理设备上的旧配置也必须更新为新端口。
+- 当前版本不支持同一 `wg0` 同时为不同设备提供多个公网目标端口。如果某台设备
+  所在网络只能使用另一个 UDP 端口，应先统一迁移节点端口；不要让两台设备分别
+  指向不同端口。
+
+可在不停止隧道的情况下检查服务端端口和 peer：
+
+```bash
+sudo wg show wg0 listen-port
+sudo wg show wg0 peers
+sudo wg show wg0 endpoints
+sudo wg show wg0 allowed-ips
+```
+
 ## 验证与排障
 
 ```bash
