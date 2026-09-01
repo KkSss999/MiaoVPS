@@ -117,6 +117,7 @@ fn print_help() {
     println!("  profile show                                  查看当前配置");
     println!("  connect [server-id] [--device <device-id>] [--full] [--port <udp-port>] [--skip-validate] [--daemon] 建立隧道 (需 sudo)");
     println!("                                                --daemon 后台运行并写状态文件");
+    println!("                                                Full Tunnel 会阻止公网 IPv6，避免未受保护的 IPv6 直连");
     println!("  disconnect                                    停止隧道并清理路由");
     println!();
     println!("典型流程:");
@@ -517,9 +518,7 @@ fn connect_target_args(args: &[String]) -> Result<(Option<String>, Option<String
     while index < args.len() {
         match args[index].as_str() {
             "--device" => {
-                let value = args
-                    .get(index + 1)
-                    .context("--device 需要设备 ID 或前缀")?;
+                let value = args.get(index + 1).context("--device 需要设备 ID 或前缀")?;
                 if device.replace(value.clone()).is_some() {
                     anyhow::bail!("--device 只能指定一次");
                 }
@@ -641,7 +640,11 @@ fn gateway_from_cidr(cidr: &str) -> Result<String> {
     if prefix > 30 {
         anyhow::bail!("VPN 网段前缀必须不大于 /30");
     }
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     Ok(std::net::Ipv4Addr::from((u32::from(ip) & mask) + 1).to_string())
 }
 
@@ -698,20 +701,23 @@ async fn cmd_add_device(args: &[String]) -> Result<()> {
 }
 
 async fn cmd_list_devices(args: &[String]) -> Result<()> {
-    let server_id = args.get(2).cloned().unwrap_or_else(|| {
+    let prefix = args.get(2).cloned().unwrap_or_else(|| {
         eprintln!("用法: miaovps list-devices <server-id>");
         std::process::exit(1);
     });
 
-    let db = Database::open(data_dir().join("miaovps.db")).await?;
-    let devices = db.list_devices(&server_id).await?;
+    // 与 status / add-device / inspect 保持一致：用户通常输入短 ID 前缀，
+    // 不能把前缀直接当完整 server_id 交给存储层，否则查询只会得到空列表。
+    let svc = open_service().await?;
+    let server_id = resolve_server_id(&svc, &prefix).await?;
+    let devices = svc.list_devices(server_id.clone()).await?;
 
     if devices.is_empty() {
-        println!("暂无设备。");
+        println!("节点 {} 暂无设备。", &server_id[..8]);
         return Ok(());
     }
 
-    println!("设备列表:");
+    println!("设备列表 (节点 {}):", &server_id[..8]);
     for d in &devices {
         let status = d.status();
         println!(
@@ -1117,6 +1123,28 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         println!("  全局流量: 0.0.0.0/1 + 128.0.0.0/1 → {tun_name}");
     }
 
+    // 当前原生数据面只配置了 IPv4 地址与 IPv4 全局路由。Full Tunnel 不能
+    // 让 IPv6 保持直连，否则支持 IPv6 的站点会绕过 VPN。这里故意不做半套
+    // IPv6 隧道，而是只阻止公网 IPv6（2000::/3）；loopback、链路本地和局域网
+    // 地址不受影响。规则由 marker 标记所有权，退出/回落时只删除本进程创建的
+    // 规则，绝不触碰用户预先存在的路由。
+    let mut overlay = if full_tunnel {
+        let mut ov = FullTunnelOverlay::new(
+            tun_name.clone(),
+            profile.dns.clone(),
+            dns_backup.clone(),
+            data_dir(),
+        );
+        if let Err(e) = ov.enable_ipv6_leak_protection() {
+            remove_tunnel_routes(&vps_ip, &vpn_net);
+            return Err(e.context("无法阻止公网 IPv6，已回滚 IPv4 Full Tunnel 路由"));
+        }
+        println!("  IPv6:        已阻止公网 IPv6 直连（2000::/3）");
+        Some(ov)
+    } else {
+        None
+    };
+
     if full_tunnel && dns_backup.is_some() && !profile.dns.is_empty() {
         match dns::apply(&profile.dns) {
             Ok(()) => println!("  DNS 接管: {}", profile.dns.join(", ")),
@@ -1124,25 +1152,15 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         }
     }
 
-    // Full Tunnel 的全局路由+DNS 交给 overlay 管理，断线时可临时撤下
-    let mut overlay = if full_tunnel {
-        Some(FullTunnelOverlay::new(
-            tun_name.clone(),
-            profile.dns.clone(),
-            dns_backup.clone(),
-            data_dir(),
-        ))
-    } else {
-        None
-    };
-
     // ── 4. 启动隧道 ──
     println!("[4/4] 启动加密隧道...");
     let tunnel = match NativeTunnel::start(tun, client_priv, server_pub, server_addr, 25) {
         Ok(t) => t,
         Err(e) => {
             // 隧道起不来时必须撤掉路由和 DNS，否则流量进黑洞
-            if let Some(b) = &dns_backup {
+            if let Some(ov) = overlay.as_mut() {
+                ov.teardown();
+            } else if let Some(b) = &dns_backup {
                 let _ = b.restore(&data_dir());
             }
             remove_tunnel_routes(&vps_ip, &vpn_net);
@@ -1340,6 +1358,12 @@ async fn cmd_disconnect(_args: &[String]) -> Result<()> {
     // 上次异常退出（kill -9 / 崩溃）可能留下被改写的 DNS，优先还原
     if let Some(desc) = dns::restore_if_pending(&data_dir()) {
         println!("  DNS 已从备份还原: {desc}");
+    }
+
+    // 只清理由 MiaoVPS marker 证明归属的 IPv6 防泄漏规则；当前或其他 VPN
+    // 预先存在的同类规则不会被删除。
+    if let Err(e) = Ipv6LeakGuard::cleanup_if_owned(&data_dir()) {
+        eprintln!("  ⚠ IPv6 防泄漏规则清理失败: {e}");
     }
 
     // profile 存在时按其配置精确清理，否则退回通用清理
@@ -1710,6 +1734,8 @@ struct FullTunnelOverlay {
     data_dir: PathBuf,
     /// 当前是否处于「已接管」状态
     engaged: bool,
+    /// Full Tunnel 下显式阻止公网 IPv6，防止尚未实现 IPv6 隧道时旁路泄漏。
+    ipv6_guard: Option<Ipv6LeakGuard>,
 }
 
 impl FullTunnelOverlay {
@@ -1728,6 +1754,23 @@ impl FullTunnelOverlay {
             dns_backup,
             data_dir,
             engaged: true,
+            ipv6_guard: None,
+        }
+    }
+
+    /// 启用公网 IPv6 防泄漏。只应在 IPv4 Full Tunnel 已成功应用后调用。
+    fn enable_ipv6_leak_protection(&mut self) -> Result<()> {
+        if self.ipv6_guard.is_none() {
+            self.ipv6_guard = Some(Ipv6LeakGuard::install(self.data_dir.clone())?);
+        }
+        Ok(())
+    }
+
+    fn disable_ipv6_leak_protection(&mut self) {
+        if let Some(mut guard) = self.ipv6_guard.take() {
+            if let Err(e) = guard.remove() {
+                eprintln!("    ⚠ IPv6 防泄漏规则清理失败: {e}");
+            }
         }
     }
 
@@ -1753,6 +1796,8 @@ impl FullTunnelOverlay {
                 .args(["-q", "-n", "delete", "-inet", dest])
                 .output();
         }
+        // IPv4 全局路由已经撤下后，才允许公网 IPv6 恢复系统原状。
+        self.disable_ipv6_leak_protection();
         self.engaged = false;
     }
 
@@ -1772,11 +1817,16 @@ impl FullTunnelOverlay {
             }
         };
 
+        self.enable_ipv6_leak_protection()?;
+
         let plan: Vec<RouteSpec> = Self::GLOBAL_ROUTES
             .iter()
             .map(|d| RouteSpec::interface((*d).into(), &self.tun_name))
             .collect();
-        apply_routes(&plan)?;
+        if let Err(e) = apply_routes(&plan) {
+            self.disable_ipv6_leak_protection();
+            return Err(e);
+        }
 
         if self.dns_backup.is_some() && !self.dns_servers.is_empty() {
             if let Err(e) = dns::apply(&self.dns_servers) {
@@ -1799,7 +1849,162 @@ impl FullTunnelOverlay {
                     .args(["-q", "-n", "delete", "-inet", dest])
                     .output();
             }
+            self.disable_ipv6_leak_protection();
         }
+    }
+}
+
+/// Full Tunnel 尚未实现 IPv6 数据面时的防泄漏保护。
+///
+/// `2000::/3` 覆盖所有公网可路由 IPv6 地址；比拦截 `::/0` 更精确，因而不会
+/// 干扰 `::1`、`fe80::/10` 和局域网 ULA。使用 `-reject` 而非把流量送进 IPv4
+/// TUN：调用者会立即收到不可达错误，不会在一个不能转发 IPv6 的接口上静默挂起。
+///
+/// marker 让异常退出后的 `miaovps disconnect` 能清理本程序留下的规则，同时保证
+/// 不删除用户、系统或另一款 VPN 已存在的同类路由。
+struct Ipv6LeakGuard {
+    data_dir: PathBuf,
+    owns_route: bool,
+}
+
+impl Ipv6LeakGuard {
+    const PUBLIC_PREFIX: &'static str = "2000::/3";
+    /// 仅用于确认路由查找实际命中 reject；不是媒体或服务商特判。
+    const VERIFY_ADDRESS: &'static str = "2001:4860:4860::8888";
+    const MARKER_FILE: &'static str = "ipv6-public-block.active";
+
+    fn marker_path(data_dir: &std::path::Path) -> PathBuf {
+        data_dir.join(Self::MARKER_FILE)
+    }
+
+    fn install(data_dir: PathBuf) -> Result<Self> {
+        let marker = Self::marker_path(&data_dir);
+        let marker_exists = marker.is_file();
+        let output = Command::new("route")
+            // macOS 的 RTF_REJECT 路由必须提供 loopback gateway；只给
+            // destination 和 -reject 会出现命令成功但没有安装 reject 路由的假象。
+            .args(["-n", "add", "-inet6", Self::PUBLIC_PREFIX, "::1", "-reject"])
+            .output()
+            .context("无法添加 IPv6 防泄漏路由")?;
+
+        if output.status.success() {
+            if let Err(e) = Self::verify_route() {
+                let _ = Self::delete_route();
+                return Err(e);
+            }
+            if let Err(e) = std::fs::write(&marker, b"MiaoVPS IPv6 leak protection\n") {
+                // marker 写不出就无法保证未来只清自己的规则，立刻补偿回滚。
+                let _ = Self::delete_route();
+                return Err(e).with_context(|| {
+                    format!("无法记录 IPv6 防泄漏路由归属: {}", marker.display())
+                });
+            }
+            return Ok(Self {
+                data_dir,
+                owns_route: true,
+            });
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("File exists") {
+            // marker 已存在表示这是上一轮 MiaoVPS 异常退出留下的规则，当前
+            // 会话接管其清理责任；无 marker 则尊重用户/其他 VPN 的既有规则。
+            Self::verify_route().with_context(|| {
+                format!(
+                    "公网 IPv6 前缀 {} 已有路由，但不是有效的 REJECT 路由；为避免 IPv6 泄漏，拒绝建立 Full Tunnel",
+                    Self::PUBLIC_PREFIX
+                )
+            })?;
+            return Ok(Self {
+                data_dir,
+                owns_route: marker_exists,
+            });
+        }
+
+        anyhow::bail!(
+            "route add -inet6 {} ::1 -reject 失败: {}",
+            Self::PUBLIC_PREFIX,
+            stderr.trim()
+        );
+    }
+
+    fn verify_route() -> Result<()> {
+        let output = Command::new("route")
+            .args(["-n", "get", "-inet6", Self::VERIFY_ADDRESS])
+            .output()
+            .context("无法核验 IPv6 防泄漏路由")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "IPv6 路由查找失败: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("flags:") && line.contains("REJECT"))
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "IPv6 路由未命中 REJECT（仍可能经本地网络直连）: {}",
+            stdout
+                .lines()
+                .find(|line| line.trim_start().starts_with("flags:"))
+                .unwrap_or("未返回 flags")
+                .trim()
+        );
+    }
+
+    fn delete_route() -> Result<()> {
+        let output = Command::new("route")
+            .args(["-q", "-n", "delete", "-inet6", Self::PUBLIC_PREFIX, "::1"])
+            .output()
+            .context("无法删除 IPv6 防泄漏路由")?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 路由已被系统或用户删除，目标状态同样成立。
+        if stderr.contains("not in table") || stderr.contains("not found") {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "route delete -inet6 {} ::1 失败: {}",
+            Self::PUBLIC_PREFIX,
+            stderr.trim()
+        );
+    }
+
+    fn remove(&mut self) -> Result<()> {
+        if !self.owns_route {
+            return Ok(());
+        }
+        Self::delete_route()?;
+        std::fs::remove_file(Self::marker_path(&self.data_dir))
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .context("无法删除 IPv6 防泄漏归属标记")?;
+        self.owns_route = false;
+        Ok(())
+    }
+
+    fn cleanup_if_owned(data_dir: &std::path::Path) -> Result<()> {
+        let marker = Self::marker_path(data_dir);
+        if !marker.is_file() {
+            return Ok(());
+        }
+        let mut guard = Self {
+            data_dir: data_dir.to_path_buf(),
+            owns_route: true,
+        };
+        guard.remove()
     }
 }
 
@@ -1946,14 +2151,7 @@ mod tests {
 
     #[test]
     fn connect_port_can_override_profile_without_proxy_semantics() {
-        let args = argv(&[
-            "miaovps",
-            "connect",
-            "--full",
-            "--port",
-            "443",
-            "--daemon",
-        ]);
+        let args = argv(&["miaovps", "connect", "--full", "--port", "443", "--daemon"]);
         assert_eq!(connect_port_arg(&args).unwrap(), Some(443));
         assert!(connect_port_arg(&argv(&["miaovps", "connect", "--proxy", "http://x"])).is_err());
     }
@@ -1961,14 +2159,7 @@ mod tests {
     #[test]
     fn connect_accepts_explicit_server_and_device() {
         let args = argv(&[
-            "miaovps",
-            "connect",
-            "77ce8561",
-            "--device",
-            "aabbccdd",
-            "--full",
-            "--port",
-            "443",
+            "miaovps", "connect", "77ce8561", "--device", "aabbccdd", "--full", "--port", "443",
         ]);
         assert_eq!(
             connect_target_args(&args).unwrap(),
@@ -1987,7 +2178,10 @@ mod tests {
     fn connect_port_rejects_missing_or_invalid_values() {
         assert!(connect_port_arg(&argv(&["miaovps", "connect", "--port"])).is_err());
         assert!(connect_port_arg(&argv(&["miaovps", "connect", "--port", "0"])).is_err());
-        assert!(connect_port_arg(&argv(&["miaovps", "connect", "--port", "443", "--port", "51820"])).is_err());
+        assert!(connect_port_arg(&argv(&[
+            "miaovps", "connect", "--port", "443", "--port", "51820"
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -2087,6 +2281,13 @@ mod tests {
             FullTunnelOverlay::GLOBAL_ROUTES,
             ["0.0.0.0/1", "128.0.0.0/1"]
         );
+    }
+
+    #[test]
+    fn ipv6_policy_blocks_only_public_unicast_space() {
+        // 不用 ::/0：不能影响 loopback、链路本地或局域网 ULA；2000::/3
+        // 正好覆盖所有公网可路由 IPv6 前缀，防止 Full Tunnel 发生 IPv6 泄漏。
+        assert_eq!(Ipv6LeakGuard::PUBLIC_PREFIX, "2000::/3");
     }
 
     #[test]

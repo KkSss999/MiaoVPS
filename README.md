@@ -32,7 +32,7 @@ curl -s ifconfig.me       # Full Tunnel 下应返回 VPS 公网 IP
 sudo miaovps disconnect   # 停止隧道并还原路由、DNS
 ```
 
-若不需要全局流量，省略 `--full` 即可建立 Split Tunnel。完整参数和安全注意事项见 [CLI 指南](docs/CLI.md)。
+若不需要全局流量，省略 `--full` 即可建立 Split Tunnel。Full Tunnel 当前只承载 IPv4；为避免 IPv6 绕过隧道，MiaoVPS 会显式阻止公网 IPv6（`2000::/3`），并在断开或断线回落时精确恢复。完整参数和安全注意事项见 [CLI 指南](docs/CLI.md)。
 
 ## 文档
 

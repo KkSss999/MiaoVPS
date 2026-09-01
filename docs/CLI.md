@@ -33,7 +33,7 @@ sudo miaovps connect <server-id> --device <device-id> --full
 sudo miaovps disconnect
 ```
 
-`<server-id>` 和 `<device-id>` 支持完整 UUID 或唯一前缀。`--full` 会将默认流量和 DNS 交给 VPS；省略它则只建立 VPN 网段路由。
+`<server-id>` 和 `<device-id>` 支持完整 UUID 或唯一前缀。`--full` 会将 IPv4 默认流量和 DNS 交给 VPS；省略它则只建立 VPN 网段路由。当前版本不提供 IPv6 隧道，Full Tunnel 会明确阻止公网 IPv6（`2000::/3`），避免 IPv6 经本地网络绕过 VPN；断开或断线回落后只撤销 MiaoVPS 自己创建的拦截路由。
 
 ## 命令索引
 
