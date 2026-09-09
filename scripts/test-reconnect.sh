@@ -13,13 +13,18 @@
 
 set -uo pipefail
 
-VPS_IP="${VPS_IP:-203.0.113.10}"
+VPS_IP="${VPS_IP:-}"
 VPS_USER="${VPS_USER:-ubuntu}"
-VPS_KEY="${VPS_KEY:-$HOME/Downloads/VPS.pem}"
-VPS_SUDO_PW="${VPS_SUDO_PW:-[REDACTED_PASSWORD]}"
+VPS_KEY="${VPS_KEY:-}"
+VPS_SUDO_PW="${VPS_SUDO_PW:-}"
 WG_PORT=51820
 BLOCK_SECS="${1:-130}"
 PEER_IP="${PEER_IP:-10.66.66.1}"
+
+if [ -z "$VPS_IP" ] || [ -z "$VPS_KEY" ] || [ -z "$VPS_SUDO_PW" ]; then
+    echo "错误：请通过 VPS_IP、VPS_KEY 和 VPS_SUDO_PW 环境变量提供测试节点信息。" >&2
+    exit 2
+fi
 
 ssh_vps() {
     ssh -i "$VPS_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 \

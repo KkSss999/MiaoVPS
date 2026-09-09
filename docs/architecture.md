@@ -1,11 +1,11 @@
 # 核心架构
 
-MiaoVPS 仓库维护 Rust 核心和 CLI；桌面客户端已经拆分到同级仓库 `../MiaoVPS-Desktop`，不再位于本仓库的 Cargo workspace 内。
+MiaoVPS 仓库维护 Rust 核心、CLI、协议、部署器、存储与隧道数据平面。
 
 ## 数据流
 
 ```text
-miaovps CLI / MiaoVPS-Desktop
+miaovps CLI / compatible clients
         │
         ├─ 控制面：SSH（检测、部署、设备注册、状态读取）
         │
@@ -27,7 +27,7 @@ miaovps CLI / MiaoVPS-Desktop
 | `miaovps-provisioner` | 环境检测、安装、配置、启动和回滚 |
 | `miaovps-storage` | SQLite 本地数据与系统 Keychain |
 | `miaovps-connect` | TUN、路由、DNS、握手验证和重连 |
-| `miaovps-app` | CLI 与桌面端复用的应用服务边界 |
+| `miaovps-app` | CLI 与其他客户端可复用的应用服务边界 |
 | `miaovps-cli` | 用户可执行的命令行入口 |
 | `miaovps-tunnel-api` | 平台无关的隧道接口 |
 | `miaovps-telemetry` | 预留的状态观测客户端 |
@@ -43,10 +43,6 @@ miaovps CLI / MiaoVPS-Desktop
 cargo build
 cargo test --workspace
 
-# 同级桌面仓库：Tauri/React；其 sidecar 调用本仓库 CLI
-cd ../MiaoVPS-Desktop
-pnpm typecheck
-pnpm build
 ```
 
-所有 Cargo 产物统一位于本仓库 `target/`；桌面端的 Tauri bundle 也输出到桌面仓库对应的 `target/`。
+所有 Cargo 产物统一位于本仓库 `target/`。

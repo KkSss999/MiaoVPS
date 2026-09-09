@@ -1,74 +1,124 @@
 # MiaoVPS
 
-> 用自己的 VPS 建立私人网络。
+**Turn a VPS you already own into a private WireGuard network — from one local-first Rust CLI.**
 
-MiaoVPS 是一个本地优先的 Rust 核心和 CLI：通过 SSH 把 VPS 配置为 WireGuard 节点，创建和管理设备 peer，并在本机建立 Split Tunnel 或 Full Tunnel。它不提供公共节点、账户系统或云端控制面。
+[![License: MIT](https://img.shields.io/badge/license-MIT-0f766e.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2021-000000.svg?logo=rust)](https://www.rust-lang.org/)
+[![Status](https://img.shields.io/badge/status-pre--1.0-f59e0b.svg)](#project-status)
 
-桌面客户端是同级目录中的独立项目 `../MiaoVPS-Desktop`。本仓库只维护 CLI、协议核心、部署器、存储和隧道数据平面。
+[中文说明](README.zh-CN.md) · [CLI guide](docs/CLI.md) · [Deployment](docs/deployment.md) · [Architecture](docs/architecture.md) · [Security](SECURITY.md)
 
-## 快速开始
+MiaoVPS provisions WireGuard on a remote VPS over SSH, manages servers and
+device peers locally, and creates split or full tunnels on the client. It does
+not sell public nodes, require an account, or depend on a hosted control plane.
 
-### 安装 CLI
+## Why MiaoVPS?
 
-```bash
-cargo install --path crates/miaovps-cli
-miaovps --help
-```
+- **Own the infrastructure.** Bring any compatible VPS and keep control of the
+  server, peer configuration, and network path.
+- **Local-first by design.** Server metadata stays in local SQLite storage;
+  credentials and private keys use the operating system credential store.
+- **One operational workflow.** Inspect, deploy, add devices, validate, connect,
+  observe, and disconnect from one CLI.
+- **Fail closed.** MiaoVPS validates reachability and the WireGuard handshake
+  before taking over routes. Failed validation does not switch global traffic.
+- **Recoverable networking.** Full-tunnel setup preserves the direct route to
+  the VPS and restores routes and DNS on disconnect or connection fallback.
+- **Explicit IPv6 policy.** The current data plane is IPv4-only. Full-tunnel
+  mode blocks public IPv6 instead of silently allowing traffic to bypass the
+  tunnel.
 
-### 部署并连接一台 VPS
-
-```bash
-miaovps add-server "我的 VPS" 203.0.113.10 22 ubuntu --key ~/.ssh/id_ed25519
-miaovps inspect <server-id>
-miaovps deploy <server-id> --port 443
-miaovps add-device <server-id> "我的 Mac" mac
-sudo miaovps connect <server-id> --device <device-id> --full
-```
-
-连接成功后：
-
-```bash
-curl -s ifconfig.me       # Full Tunnel 下应返回 VPS 公网 IP
-sudo miaovps disconnect   # 停止隧道并还原路由、DNS
-```
-
-若不需要全局流量，省略 `--full` 即可建立 Split Tunnel。Full Tunnel 当前只承载 IPv4；为避免 IPv6 绕过隧道，MiaoVPS 会显式阻止公网 IPv6（`2000::/3`），并在断开或断线回落时精确恢复。完整参数和安全注意事项见 [CLI 指南](docs/CLI.md)。
-
-## 文档
-
-- [CLI 使用指南](docs/CLI.md) — 安装、命令、节点/设备和安全边界
-- [VPS 部署指南](docs/deployment.md) — SSH、云防火墙、端口迁移和排障
-- [核心架构](docs/architecture.md) — 控制面、数据面、crate 分层和构建边界
-
-## 项目结构
+## How it works
 
 ```text
-MiaoVPS/
-├── crates/                 # Rust 核心与 CLI
-├── scripts/                # 部署参考脚本和链路健康检查
-├── docs/                   # 当前使用文档
-├── .pmem/                  # 项目记忆 Markdown（SQLite 索引可重建）
-└── target/                 # 本地构建产物，不提交
+                         SSH control plane
+┌──────────────┐  inspect / deploy / peers / status  ┌──────────────┐
+│ MiaoVPS CLI  │ ───────────────────────────────────▶ │ Your VPS     │
+│ local state  │                                      │ WireGuard wg0│
+│ + key store  │ ◀════════ WireGuard UDP ═══════════▶ │ NAT + routing│
+└──────────────┘             data plane               └──────────────┘
 ```
 
-## 开发
+SSH is used for server administration only; VPN traffic is carried by
+WireGuard. Client private keys are generated and retained on the client. The
+VPS receives peer public keys.
+
+## Quick start
+
+```bash
+# Build and install.
+cargo install --path crates/miaovps-cli
+
+# Register and inspect a VPS.
+miaovps add-server "my-vps" 203.0.113.10 22 ubuntu --key ~/.ssh/id_ed25519
+miaovps inspect <server-id>
+
+# Deploy WireGuard and add a device.
+miaovps deploy <server-id> --port 443
+miaovps add-device <server-id> "my-mac" mac
+
+# Split tunnel: route only the private VPN network.
+sudo miaovps connect <server-id> --device <device-id>
+
+# Full tunnel: route IPv4 through the VPS and block public IPv6 bypass.
+sudo miaovps connect <server-id> --device <device-id> --full
+
+# Restore MiaoVPS-owned routes and DNS state.
+sudo miaovps disconnect
+```
+
+Run `miaovps <command> --help` and read the [CLI guide](docs/CLI.md) before
+using MiaoVPS on important infrastructure.
+
+## Core capabilities
+
+| Area | Capabilities |
+| --- | --- |
+| VPS lifecycle | Local server records, environment inspection, SSH deployment, WireGuard port migration |
+| Device lifecycle | Per-device keypairs, peer registration, allocation, listing, configuration export |
+| Connection | Preflight validation, split tunnel, IPv4 full tunnel, daemon mode, disconnect cleanup |
+| Resilience | Endpoint rebinding, handshake monitoring, reconnect backoff, route and DNS restoration |
+| Security | OS credential storage, log masking, client-side private keys, no hosted control plane |
+
+## Workspace
+
+```text
+crates/
+├── miaovps-core              # Domain models
+├── miaovps-wireguard-config # Keys and WireGuard configuration
+├── miaovps-ssh              # SSH transport and authentication
+├── miaovps-provisioner      # Detection, deployment and rollback
+├── miaovps-storage          # SQLite and OS credential storage
+├── miaovps-connect          # TUN, routes, DNS, handshake and reconnect
+├── miaovps-app              # Reusable application-service boundary
+├── miaovps-cli              # Command-line entry point
+├── miaovps-tunnel-api       # Platform-neutral tunnel contracts
+└── miaovps-telemetry        # Local status-observation client
+```
+
+## Development
 
 ```bash
 cargo build
 cargo test --workspace
-cargo clippy --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features
 ```
 
-桌面端开发请进入同级目录 `../MiaoVPS-Desktop`。核心仓库和桌面仓库分别提交、构建和发布。
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and
+do not include real infrastructure addresses, credentials, private keys,
+exported WireGuard configurations, or local MiaoVPS data in issues or commits.
 
-## 设计原则
+## Project status
 
-- **本地优先**：节点、设备和密钥由本地 SQLite/Keychain 管理。
-- **私钥私有**：客户端私钥不上传 VPS；VPS 只保存 peer 公钥。
-- **SSH 控制、WireGuard 传输**：部署管理与 VPN 数据流分离。
-- **失败不切路由**：握手或关键验证失败时不接管系统流量。
-- **可恢复**：断开时清理路由并还原 DNS，部署过程保留远端网络备份。
+MiaoVPS is **pre-1.0**. The Rust workspace and macOS client tunnel path are the
+currently exercised development path. SSH management may be portable, but a
+platform must not be considered supported until its TUN, routing, DNS,
+privilege, and recovery behavior have been validated end to end.
+
+Use a non-critical VPS first and retain provider-console access. Review the
+[security policy](SECURITY.md) and [deployment guide](docs/deployment.md) before
+deployment.
 
 ## License
 
-MIT
+MiaoVPS is available under the [MIT License](LICENSE). Copyright © 2026 Wentao Ge.

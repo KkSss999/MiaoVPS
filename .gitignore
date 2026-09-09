@@ -1,7 +1,13 @@
 /target
 **/.DS_Store
-.pmem/pmem.db
-.pmem/pmem.db-shm
-.pmem/pmem.db-wal
+.pmem/
 .miaovps-data/
 node_modules/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.conf
