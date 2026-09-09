@@ -1,61 +1,72 @@
 # MiaoVPS CLI
 
-`miaovps` 是 MiaoVPS 的命令行入口，负责本地节点记录、SSH 部署、设备密钥管理和 WireGuard 隧道连接。
+`miaovps` is the command-line entry point for local server records, SSH-based
+deployment, device-key management, and WireGuard tunnel connections.
 
-## 安装
+## Install
 
 ```bash
 cargo install --path crates/miaovps-cli
 miaovps --help
 ```
 
-升级已安装版本时重复执行 `cargo install` 即可。构建产物位于仓库根目录的 `target/`，不会写入仓库源文件。
+Re-run `cargo install` to upgrade a locally installed build. Workspace build
+artifacts stay under the repository-level `target/` directory.
 
-## 常用流程
+## Typical workflow
 
 ```bash
-# 1. 添加 VPS。认证二选一：--key 或 --password
-miaovps add-server "我的 VPS" 203.0.113.10 22 ubuntu --key ~/.ssh/id_ed25519
+# 1. Register a VPS. Use either --key or --password authentication.
+miaovps add-server "my-vps" 203.0.113.10 22 ubuntu --key ~/.ssh/id_ed25519
 
-# 2. 检查系统、权限、网络和 WireGuard 条件
+# 2. Inspect operating-system, privilege, network, and WireGuard prerequisites.
 miaovps inspect <server-id>
 
-# 3. 部署 WireGuard；如果 UDP 51820 受限，可迁移到其他端口
+# 3. Deploy WireGuard. Choose another UDP port if 51820 is unsuitable.
 miaovps deploy <server-id> --port 443
 
-# 4. 为本机或其他设备创建 peer
-miaovps add-device <server-id> "我的 Mac" mac
+# 4. Create a distinct peer for each physical device.
+miaovps add-device <server-id> "my-mac" mac
 
-# 5. 按节点和设备连接；不写节点时使用当前 profile
+# 5. Connect. Omit --full to route only the private VPN network.
 sudo miaovps connect <server-id> --device <device-id> --full
 
-# 6. 断开并还原路由、DNS
+# 6. Stop the tunnel and restore MiaoVPS-owned route and DNS changes.
 sudo miaovps disconnect
 ```
 
-`<server-id>` 和 `<device-id>` 支持完整 UUID 或唯一前缀。`--full` 会将 IPv4 默认流量和 DNS 交给 VPS；省略它则只建立 VPN 网段路由。当前版本不提供 IPv6 隧道，Full Tunnel 会明确阻止公网 IPv6（`2000::/3`），避免 IPv6 经本地网络绕过 VPN；断开或断线回落后只撤销 MiaoVPS 自己创建的拦截路由。
+`<server-id>` and `<device-id>` accept a full UUID or a unique prefix. Full
+tunnel mode routes IPv4 and DNS through the VPS. The current data plane does
+not provide an IPv6 tunnel, so MiaoVPS installs an explicit public-IPv6 reject
+route to prevent silent bypass. Disconnect and fallback remove only rules owned
+by MiaoVPS.
 
-## 命令索引
+## Command reference
 
-| 命令 | 用途 |
+| Command | Purpose |
 | --- | --- |
-| `add-server` / `remove-server` | 添加或删除本地 VPS 记录 |
-| `list-servers` | 列出节点 |
-| `inspect` | 部署前环境检测 |
-| `deploy` | 通过 SSH 安装并配置 WireGuard |
-| `add-device` / `list-devices` | 管理 peer 和设备 |
-| `status` | 查询远端 WireGuard 状态 |
-| `export-config` | 导出设备 `.conf` |
-| `generate-keypair` | 生成 WireGuard 密钥对 |
-| `validate` | 只验证 UDP/WireGuard，不切换路由 |
-| `profile init` / `profile show` | 创建或检查默认连接 profile |
-| `connect` / `disconnect` | 建立或停止本机隧道 |
+| `add-server` / `remove-server` | Add or remove a local VPS record |
+| `list-servers` | List known servers |
+| `inspect` | Run read-only deployment prerequisite checks |
+| `deploy` | Install and configure WireGuard over SSH |
+| `add-device` / `list-devices` | Manage devices and WireGuard peers |
+| `status` | Read remote WireGuard status |
+| `export-config` | Export a device configuration |
+| `generate-keypair` | Generate a WireGuard keypair |
+| `validate` | Validate UDP and WireGuard without changing routes |
+| `profile init` / `profile show` | Create or inspect the default connection profile |
+| `connect` / `disconnect` | Start or stop the local tunnel |
 
-完整参数以 `miaovps --help` 和各子命令帮助为准。
+Use `miaovps --help` and command-specific help as the source of truth for the
+current argument surface.
 
-## 安全提醒
+## Security notes
 
-- 私钥保存在本机 Keychain；不要把终端输出、`.conf` 或密码提交到 Git。
-- `connect` 和 `disconnect` 需要 root 权限，因为它们要创建 TUN、修改路由和 DNS。
-- `inspect` 是只读检查；部署前应确认目标机器不是承载关键业务的生产机。
-- `deploy --port` 修改的是 VPS WireGuard 监听端口，也必须同步放行云防火墙的 UDP 端口。
+- Private keys belong in the local credential store. Never commit terminal
+  output, exported `.conf` files, passwords, or real infrastructure details.
+- `connect` and `disconnect` require elevated privileges because they manage a
+  TUN device, routes, and DNS.
+- `inspect` is read-only. Before `deploy`, verify that the target is not a
+  critical production host and retain provider-console access.
+- `deploy --port` changes the VPS WireGuard listen port. Update both cloud and
+  host firewalls and ensure every device uses the same target port.

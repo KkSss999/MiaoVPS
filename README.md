@@ -6,7 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2021-000000.svg?logo=rust)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-pre--1.0-f59e0b.svg)](#project-status)
 
-[中文说明](README.zh-CN.md) · [CLI guide](docs/CLI.md) · [Deployment](docs/deployment.md) · [Architecture](docs/architecture.md) · [Security](SECURITY.md)
+[English](README.md) · [Chinese](README.zh-CN.md) · [CLI guide](docs/CLI.md) · [Deployment](docs/deployment.md) · [Architecture](docs/architecture.md) · [Security](SECURITY.md)
 
 MiaoVPS provisions WireGuard on a remote VPS over SSH, manages servers and
 device peers locally, and creates split or full tunnels on the client. It does

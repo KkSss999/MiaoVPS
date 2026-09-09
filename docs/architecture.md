@@ -1,48 +1,60 @@
-# 核心架构
+# Core Architecture
 
-MiaoVPS 仓库维护 Rust 核心、CLI、协议、部署器、存储与隧道数据平面。
+MiaoVPS contains the Rust core, CLI, protocols, provisioner, storage, and
+tunnel data plane.
 
-## 数据流
+## Data flow
 
 ```text
 miaovps CLI / compatible clients
         │
-        ├─ 控制面：SSH（检测、部署、设备注册、状态读取）
+        ├─ Control plane: SSH
+        │  inspection, deployment, peer registration, status
         │
-        └─ 数据面：WireGuard UDP
-                 │
-                 ▼
-        VPS: wg0 + IP forwarding + NAT
+        └─ Data plane: WireGuard UDP
+                         │
+                         ▼
+                VPS: wg0 + forwarding + NAT
 ```
 
-控制面和数据面相互独立：SSH 只用于管理，VPN 流量不会通过 SSH 转发；WireGuard 私钥只在客户端侧生成和保存。
+The control and data planes are independent. SSH is used for administration;
+VPN traffic is never tunneled through SSH. WireGuard client private keys are
+generated and stored on the client, while the VPS receives peer public keys.
 
-## Crate 分层
+## Crate boundaries
 
-| Crate | 职责 |
+| Crate | Responsibility |
 | --- | --- |
-| `miaovps-core` | VPS、设备、隧道等领域模型 |
-| `miaovps-wireguard-config` | 密钥和 WireGuard 配置生成 |
-| `miaovps-ssh` | SSH 认证与远程命令执行 |
-| `miaovps-provisioner` | 环境检测、安装、配置、启动和回滚 |
-| `miaovps-storage` | SQLite 本地数据与系统 Keychain |
-| `miaovps-connect` | TUN、路由、DNS、握手验证和重连 |
-| `miaovps-app` | CLI 与其他客户端可复用的应用服务边界 |
-| `miaovps-cli` | 用户可执行的命令行入口 |
-| `miaovps-tunnel-api` | 平台无关的隧道接口 |
-| `miaovps-telemetry` | 预留的状态观测客户端 |
+| `miaovps-core` | Domain models for servers, devices, and tunnels |
+| `miaovps-wireguard-config` | Key and WireGuard configuration generation |
+| `miaovps-ssh` | SSH authentication and remote command execution |
+| `miaovps-provisioner` | Environment detection, installation, configuration, startup, and rollback |
+| `miaovps-storage` | Local SQLite state and operating-system credential storage |
+| `miaovps-connect` | TUN, routes, DNS, handshake validation, and reconnect logic |
+| `miaovps-app` | Application-service boundary reusable by the CLI and other clients |
+| `miaovps-cli` | User-facing command-line entry point |
+| `miaovps-tunnel-api` | Platform-neutral tunnel contracts |
+| `miaovps-telemetry` | Local status-observation client |
 
-## 连接安全边界
+## Connection safety boundary
 
-连接前按 UDP 可达、WireGuard 握手、隧道创建、路由应用的顺序验证；验证失败时不切换全局路由。Full Tunnel 使用 `0.0.0.0/1` 和 `128.0.0.0/1`，并保留 VPS 直连路由，避免把握手回程错误地送进自身隧道。当前数据面只配置 IPv4，因此 Full Tunnel 同时安装 `2000::/3` 的 IPv6 reject 路由，明确禁止公网 IPv6 绕过隧道；该规则由 MiaoVPS 归属标记管理，在回落或退出时精确撤销。
+Connection setup validates UDP reachability, the WireGuard handshake, tunnel
+creation, and route application in sequence. A critical validation failure does
+not switch global routes.
 
-## 构建边界
+Full tunnel mode uses `0.0.0.0/1` and `128.0.0.0/1` while preserving a direct
+route to the VPS, preventing the WireGuard transport from routing into its own
+tunnel. Because the current data plane carries IPv4 only, MiaoVPS also installs
+a reject route for public IPv6 (`2000::/3`) to prevent bypass. Ownership markers
+allow fallback and disconnect to remove only MiaoVPS-managed state.
+
+## Build boundary
 
 ```bash
-# 本仓库：核心和 CLI
 cargo build
 cargo test --workspace
-
+cargo clippy --workspace --all-targets --all-features
 ```
 
-所有 Cargo 产物统一位于本仓库 `target/`。
+Workspace artifacts are written under the repository-level `target/`
+directory.
