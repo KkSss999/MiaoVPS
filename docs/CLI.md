@@ -41,6 +41,36 @@ not provide an IPv6 tunnel, so MiaoVPS installs an explicit public-IPv6 reject
 route to prevent silent bypass. Disconnect and fallback remove only rules owned
 by MiaoVPS.
 
+## Continuous diagnostics
+
+```bash
+sudo miaovps connect --full --dev
+# Compatible with explicit device selection and background mode:
+sudo miaovps connect <server-id> --device <device-id> --full --daemon --dev
+```
+
+`--dev` appends application and boringtun debug events to
+`~/.miaovps/tunnel-dev.log`, or the directory selected by `MIAOVPS_DATA_DIR`.
+Restarting the tunnel preserves previous entries. Logs rotate at approximately
+16 MiB per file, keeping the active file and three backups (`.1` is newest).
+Files use mode `0600`. Logs do not include command arguments, private keys,
+passwords, or packet payloads. `RUST_LOG` still controls console verbosity;
+detailed file logging has its own filter. Background mode also retains the
+existing `tunnel.log` console-output file.
+
+Diagnostics include session start time and process ID, handshake retries,
+protocol rejection types, socket rebindings, fallback/recovery events, and
+five-second snapshots of traffic, authenticated receive times, and errors.
+Keep the entire rotated file set when investigating an incident.
+
+Link health now requires recent authenticated input. After 30 seconds of
+silence, a rate-limited socket rebind and non-forced handshake probe check the
+path without replacing an in-flight handshake. At 45 seconds of silence the
+link is marked unavailable. Full tunnel mode falls back to direct routing
+only after roughly another 30 seconds of continuous unavailability; fresh
+authenticated input and a usable session permit recovery. Session/replay
+rejections are no longer assumed to be harmless rekey loss.
+
 ## Command reference
 
 | Command | Purpose |

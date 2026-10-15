@@ -86,13 +86,13 @@ pub struct TunnelState {
     pub updated_at: i64,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
-    /// 可疑解密错误 —— 非零才代表异常
+    /// 启动宽限期之后的协议/解密拒收计数；单独计数不直接确定原因
     pub decrypt_errors: u64,
-    /// 会话轮换丢包 —— 正常现象（每 120s rekey 一次的必然产物）
+    /// 会话/重放拒收计数；字段名为兼容旧状态文件保留，不代表已确认换钥原因
     #[serde(default)]
     pub session_churn: u64,
     pub reconnects: u64,
-    /// boringtun 会话是否存活 —— 与流量无关，回落期间只有 keepalive
+    /// 会话存在且最近收到过认证包；空闲/回落期间通过握手探测确认
     pub session_alive: bool,
     pub last_error: Option<String>,
 }

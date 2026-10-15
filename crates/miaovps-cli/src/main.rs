@@ -4,6 +4,7 @@
 //!   添加服务器 → 环境检测 → 部署 WireGuard → 添加设备 → 导出配置
 
 mod dns;
+mod logging;
 mod profile;
 
 use anyhow::{Context, Result};
@@ -61,17 +62,15 @@ fn real_home() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 默认 miaovps=info，可用 RUST_LOG 覆盖以查看数据平面细节
-    // （解密错误分级、重连退避等都在 debug 级别）
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("miaovps=info")),
-        )
-        .init();
-
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
+    // Only the actual tunnel process owns the diagnostic file, not elevation/daemon launchers.
+    let dev = cmd == "connect"
+        && args.iter().any(|a| a == "--dev")
+        && is_root()
+        && (!args.iter().any(|a| a == "--daemon") || std::env::var_os(DAEMON_MARKER).is_some());
+    let log_dir = dev.then(data_dir);
+    logging::init(log_dir.as_deref())?;
 
     match cmd {
         "add-server" => cmd_add_server(&args).await?,
@@ -87,7 +86,13 @@ async fn main() -> Result<()> {
         "validate" => cmd_validate(&args).await?,
         "profile" => cmd_profile(&args).await?,
         "__prepare-profile" => cmd_prepare_profile(&args).await?,
-        "connect" => cmd_connect(&args).await?,
+        "connect" => {
+            let result = cmd_connect(&args).await;
+            if let Err(error) = &result {
+                tracing::error!(%error, "[连接] 连接失败");
+            }
+            result?;
+        }
         "disconnect" => cmd_disconnect(&args).await?,
         _ => print_help(),
     }
@@ -115,8 +120,9 @@ fn print_help() {
     println!("  profile init <ip:port> <client-priv> <server-pub> [client-ip]");
     println!("                                                保存连接配置");
     println!("  profile show                                  查看当前配置");
-    println!("  connect [server-id] [--device <device-id>] [--full] [--port <udp-port>] [--skip-validate] [--daemon] 建立隧道 (需 sudo)");
+    println!("  connect [server-id] [--device <device-id>] [--full] [--port <udp-port>] [--skip-validate] [--daemon] [--dev] 建立隧道 (需 sudo)");
     println!("                                                --daemon 后台运行并写状态文件");
+    println!("                                                --dev 追加详细日志到 ~/.miaovps/tunnel-dev.log（自动轮转）");
     println!("                                                Full Tunnel 会阻止公网 IPv6，避免未受保护的 IPv6 直连");
     println!("  disconnect                                    停止隧道并清理路由");
     println!();
@@ -478,7 +484,7 @@ fn connect_port_arg(args: &[String]) -> Result<Option<u16>> {
     while index < args.len() {
         match args[index].as_str() {
             value if index == 2 && !value.starts_with("--") => index += 1,
-            "--full" | "--skip-validate" | "--daemon" => index += 1,
+            "--full" | "--skip-validate" | "--daemon" | "--dev" => index += 1,
             "--device" => {
                 if args.get(index + 1).is_none() {
                     anyhow::bail!("--device 需要设备 ID 或前缀");
@@ -524,7 +530,7 @@ fn connect_target_args(args: &[String]) -> Result<(Option<String>, Option<String
                 }
                 index += 2;
             }
-            "--full" | "--skip-validate" | "--daemon" => index += 1,
+            "--full" | "--skip-validate" | "--daemon" | "--dev" => index += 1,
             "--port" => index += 2,
             "--proxy" => anyhow::bail!(
                 "WireGuard 使用 UDP，不支持 HTTP/SOCKS --proxy；请使用 --port <udp-port>"
@@ -992,6 +998,7 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         profile.server_endpoint = endpoint.to_string();
     }
     let server_addr = profile.server_addr()?;
+    tracing::info!(endpoint = %server_addr, full_tunnel, daemon, skip_validate, "[连接] 开始建立隧道");
     let client_priv = profile.client_private_bytes()?;
     let server_pub = profile.server_public_bytes()?;
     let vps_ip = profile.server_ip()?;
@@ -1236,17 +1243,18 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
                     println!("  [网络] 默认网关 {old} → {new}，已重建 VPS 直连路由");
                     // 路由修好后立刻重绑定 —— 在此之前重绑定是无用功，
                     // 因为包没有可用的出口
+                    tracing::info!(old_gateway = %old, new_gateway = %new, "[网络] 已修复 VPS 直连路由");
                     tunnel.notify_network_changed();
                 }
                 ticks += 1;
                 if ticks.is_multiple_of(STATUS_EVERY) {
                     println!("  [状态] {}", tunnel.health_line());
+                    tracing::debug!("[状态] {}", tunnel.health_line());
                 }
 
                 // ── 断线回落 / 恢复接管 ──
                 //
-                // 会话状态用 is_session_alive()（boringtun 的握手状态），
-                // 不能用流量 —— 回落期间隧道内没有数据，只有 keepalive。
+                // 使用经过认证的收包新鲜度；空闲时由握手探测确认，不能只看本地密钥。
                 if let Some(ov) = overlay.as_mut() {
                     let alive = tunnel.stats().is_session_alive();
 
@@ -1256,6 +1264,7 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
                             println!();
                             println!("  ⚠ 隧道断开约 {}s 未恢复 —— 回落直连以保持网络可用",
                                 outage_ticks * TICK.as_secs() as u32);
+                            tracing::warn!("[连接] 认证链路持续不可用，回落直连");
                             ov.disengage();
                             println!("    全局路由已撤下。隧道继续重连，恢复后自动接管。");
                             println!("    此时流量不经 VPN（无隐私保护）。");
@@ -1269,6 +1278,7 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
                             Ok(()) => {
                                 println!("    全局路由 + DNS 已恢复接管");
                                 outage_ticks = 0;
+                                tracing::info!("[连接] 认证链路恢复，重新接管全局流量");
                             }
                             Err(e) => {
                                 eprintln!("    ⚠ 重新接管失败: {e}");
@@ -1297,9 +1307,17 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         }
     }
     println!("\n正在关闭...");
+    tracing::info!("[连接] 正在关闭隧道");
 
     let (tx, rx, errs) = tunnel.stats().snapshot();
     let reconnects = tunnel.stats().reconnects();
+    tracing::info!(
+        tx_bytes = tx,
+        rx_bytes = rx,
+        rejected = errs,
+        reconnects,
+        "[连接] 隧道结束"
+    );
     tunnel.shutdown();
 
     // Full Tunnel 的全局路由/DNS 由 overlay 负责 —— 它知道当前是接管还是
@@ -2324,6 +2342,32 @@ mod tests {
         let iface = RouteSpec::interface("0.0.0.0/1".into(), "utun5");
         assert!(matches!(iface.via, RouteVia::Interface(ref i) if i == "utun5"));
         assert_eq!(iface.destination, "0.0.0.0/1");
+    }
+
+    #[test]
+    fn dev_flag_combines_with_all_connect_options() {
+        let args = argv(&[
+            "miaovps",
+            "connect",
+            "server",
+            "--device",
+            "device",
+            "--full",
+            "--dev",
+            "--port",
+            "443",
+            "--daemon",
+            "--skip-validate",
+        ]);
+        assert_eq!(connect_port_arg(&args).unwrap(), Some(443));
+        assert_eq!(
+            connect_target_args(&args).unwrap(),
+            (Some("server".into()), Some("device".into()))
+        );
+        assert_eq!(
+            connect_target_args(&argv(&["miaovps", "connect", "--dev"])).unwrap(),
+            (None, None)
+        );
     }
 
     #[test]

@@ -38,8 +38,10 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// TUN poll 超时 — 同上，让空闲时也能响应停止
 const TUN_POLL_TIMEOUT: Duration = Duration::from_millis(500);
-/// 单次 decapsulate 后排空待发队列的上限
-const MAX_FLUSH_PACKETS: usize = 16;
+/// 空闲链路用握手确认对端可达；不重置正在进行的握手。
+const LINK_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// 探测留出 15s 响应窗口，再将链路标为不可用。
+const LINK_STALE_AFTER: Duration = Duration::from_secs(45);
 /// 隧道启动后的宽限期 — 期间的解密错误是预期的会话交接残留
 ///
 /// 验证阶段用同一对密钥握手会在服务端留下一个 session。隧道随后从
@@ -47,8 +49,8 @@ const MAX_FLUSH_PACKETS: usize = 16;
 /// 新 session — 旧 session 的在途包（keepalive）会被发到新端口，
 /// 而本地 `Tunn` 只持有新 session 的密钥，必然解不开。
 ///
-/// 这类瞬态无害。宽限期只对**可疑**错误有意义 ——
-/// 会话轮换类错误（见 `is_session_churn`）在整个生命周期都是正常的。
+/// 启动交接期只保留诊断日志；宽限期之后的持续拒收必须计数并限频告警，
+/// 不能仅凭错误类型归因为正常换钥。
 const DECRYPT_GRACE: Duration = Duration::from_secs(3);
 /// 解密错误的日志抑制间隔 — 防止异常状态下刷屏
 const DECRYPT_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -122,25 +124,20 @@ impl Endpoint {
     /// 限流是必需的：网络切换瞬间地址可能反复变化，
     /// 不限流会在震荡期打转（实测一秒 700 次）。
     pub fn rebind(&self) -> Result<(), ConnectError> {
-        {
-            let mut last = match self.last_rebind.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            if let Some(t) = *last {
-                if t.elapsed() < REBIND_MIN_INTERVAL {
-                    return Ok(()); // 视为成功 —— 当前 socket 还很新
-                }
-            }
-            *last = Some(Instant::now());
+        let mut last = match self.last_rebind.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if last.is_some_and(|t| t.elapsed() < REBIND_MIN_INTERVAL) {
+            return Ok(());
         }
-
         let fresh = Self::make_socket(self.server_addr)?;
         let local = fresh.local_addr().ok();
         match self.socket.write() {
             Ok(mut g) => *g = Arc::new(fresh),
             Err(e) => *e.into_inner() = Arc::new(fresh),
         }
+        *last = Some(Instant::now());
         let n = self.rebinds.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::debug!(
             "[隧道] UDP socket 已重绑定 (第 {n} 次) → {}",
@@ -193,11 +190,12 @@ fn is_network_change_error(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         ErrorKind::AddrNotAvailable | ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable
-    ) || matches!(
-        e.raw_os_error(),
-        // macOS: EADDRNOTAVAIL(49) ENETDOWN(50) ENETUNREACH(51) EHOSTUNREACH(65) EHOSTDOWN(64)
-        Some(49) | Some(50) | Some(51) | Some(64) | Some(65)
-    )
+    ) || cfg!(target_os = "macos")
+        && matches!(
+            e.raw_os_error(),
+            // macOS: EADDRNOTAVAIL(49) ENETDOWN(50) ENETUNREACH(51) EHOSTUNREACH(65) EHOSTDOWN(64)
+            Some(49) | Some(50) | Some(51) | Some(64) | Some(65)
+        )
 }
 
 /// 隧道流量统计
@@ -207,12 +205,9 @@ pub struct TunnelStats {
     pub tx_bytes: AtomicU64,
     /// 入站明文字节数（VPS → TUN）
     pub rx_bytes: AtomicU64,
-    /// 可疑解密错误计数 —— index 对上但解不开（密钥不匹配 / 包注入）
-    ///
-    /// 不含会话轮换丢包，那些计入 `session_churn`。混在一起会让
-    /// 正常长连接看起来像遭到攻击。
+    /// 启动宽限期之后的所有协议/解密拒收计数。不能仅凭错误类型认定原因。
     pub decrypt_errors: AtomicU64,
-    /// 会话轮换丢包 —— 旧 session 的在途包，正常现象
+    /// 会话/重放拒收计数（兼容原 session_churn 字段，不表示已确认换钥原因）
     pub session_churn: AtomicU64,
     /// 因网络不可用而丢弃的出站包数
     pub tx_dropped: AtomicU64,
@@ -220,9 +215,11 @@ pub struct TunnelStats {
     pub reconnects: AtomicU64,
     /// 最后一次收到任何入站包的时刻（隧道启动后的毫秒数）
     pub last_inbound_ms: AtomicU64,
-    /// 是否曾成功解出对端包（含 keepalive）
+    /// 最后一次收到经过认证的对端握手或数据包（含 keepalive）的时刻
+    pub last_authenticated_ms: AtomicU64,
+    /// 当前链路是否通过认证且未超出探测响应窗口
     pub healthy: AtomicBool,
-    /// boringtun 报告的会话是否存活 —— 恢复判定用这个，与流量无关
+    /// 本地会话存在且认证收包未过期；空闲时依靠握手探测确认
     pub session_alive: AtomicBool,
 }
 
@@ -240,7 +237,7 @@ impl TunnelStats {
         self.reconnects.load(Ordering::Relaxed)
     }
 
-    /// 会话轮换丢包数 —— 正常现象，仅用于诊断
+    /// 会话/重放拒收数，保留兼容接口
     pub fn session_churn(&self) -> u64 {
         self.session_churn.load(Ordering::Relaxed)
     }
@@ -249,8 +246,7 @@ impl TunnelStats {
         self.healthy.load(Ordering::Relaxed)
     }
 
-    /// 会话是否存活 —— 由 boringtun 的握手状态判定，不依赖流量。
-    /// fallback 模式下（路由已撤、隧道内无数据）恢复检测只能用这个。
+    /// 链路是否仍可用；包含握手探测新鲜度，不能只看本地密钥是否存在。
     pub fn is_session_alive(&self) -> bool {
         self.session_alive.load(Ordering::Relaxed)
     }
@@ -305,7 +301,13 @@ impl NativeTunnel {
         send_handshake(&tunn, &udp);
 
         let threads = vec![
-            spawn_outbound(tun_rx, tunn.clone(), udp.clone(), running.clone(), stats.clone())?,
+            spawn_outbound(
+                tun_rx,
+                tunn.clone(),
+                udp.clone(),
+                running.clone(),
+                stats.clone(),
+            )?,
             spawn_inbound(
                 tun_tx,
                 tunn.clone(),
@@ -314,11 +316,23 @@ impl NativeTunnel {
                 stats.clone(),
                 started_at,
             )?,
-            spawn_timer(tunn, udp.clone(), running.clone(), stats.clone(), started_at)?,
+            spawn_timer(
+                tunn,
+                udp.clone(),
+                running.clone(),
+                stats.clone(),
+                started_at,
+            )?,
         ];
 
         tracing::info!("[隧道] 已启动 → {}", server_addr);
-        Ok(Self { running, stats, threads, started_at, udp })
+        Ok(Self {
+            running,
+            stats,
+            threads,
+            started_at,
+            udp,
+        })
     }
 
     /// 请求停止隧道（非阻塞）
@@ -366,7 +380,11 @@ impl NativeTunnel {
     pub fn health_line(&self) -> String {
         let (tx, rx, errs) = self.stats.snapshot();
         let reconnects = self.stats.reconnects();
-        let state = if self.stats.is_healthy() { "正常" } else { "重连中" };
+        let state = if self.stats.is_healthy() {
+            "正常"
+        } else {
+            "重连中"
+        };
 
         let silence = match self.stats.since_last_inbound(self.started_at) {
             Some(d) => format!("{}s 前", d.as_secs()),
@@ -392,11 +410,11 @@ impl NativeTunnel {
         }
         let churn = self.stats.session_churn();
         if churn > 0 {
-            line.push_str(&format!(" · 换钥丢包 {churn}"));
+            line.push_str(&format!(" · 会话/重放拒收 {churn}"));
         }
-        // 只有这一项代表异常 —— 措辞上要和上面几个正常计数区分开
+        // 不从计数直接推断密钥错误或攻击。
         if errs > 0 {
-            line.push_str(&format!(" · ⚠ 解密错误 {errs}"));
+            line.push_str(&format!(" · ⚠ 协议拒收 {errs}"));
         }
         line
     }
@@ -496,7 +514,6 @@ fn spawn_outbound(
                     }
                 };
 
-                let plaintext_len = ip_packet.len() as u64;
                 let outbound = {
                     let mut t = match tunn.lock() {
                         Ok(t) => t,
@@ -516,7 +533,9 @@ fn spawn_outbound(
                 if let Some(p) = outbound {
                     match udp.send(&p) {
                         Ok(_) => {
-                            stats.tx_bytes.fetch_add(plaintext_len, Ordering::Relaxed);
+                            stats
+                                .tx_bytes
+                                .fetch_add(network_plaintext_len(&p), Ordering::Relaxed);
                             dropped_since_log = 0;
                         }
                         Err(e) => {
@@ -600,54 +619,51 @@ fn spawn_inbound(
                     };
                     match t.decapsulate(None, &udp_buf[..n], &mut decrypted[..]) {
                         TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
-                            mark_healthy(&stats);
+                            mark_authenticated(&stats, started_at);
                             to_tun = Some(p.to_vec());
                         }
                         // 空载荷 keepalive 走这里（validate_decapsulated_packet 对
                         // len==0 返回 Done）。它同样证明会话存活 —— 且在
-                        // fallback 模式下路由已撤、隧道内没有数据流量时，
-                        // keepalive 是**唯一**的存活信号，必须计入。
-                        TunnResult::Done => mark_healthy(&stats),
-                        TunnResult::WriteToNetwork(p) => {
-                            to_net.push(p.to_vec());
-                            // boringtun 约定：用空输入反复调用以排空待发队列。
-                            // 加上限防止异常状态下无限循环。
-                            let mut flush = [0u8; PKT_BUF];
-                            while to_net.len() < MAX_FLUSH_PACKETS {
-                                match t.decapsulate(None, &[], &mut flush[..]) {
-                                    TunnResult::WriteToNetwork(extra) => to_net.push(extra.to_vec()),
-                                    _ => break,
-                                }
+                        // 空闲和回落期间也计入；握手探测是另一种认证信号。
+                        TunnResult::Done => {
+                            // Done also covers cookie replies; those do not prove a live peer session.
+                            if udp_buf[..n].starts_with(&4u32.to_le_bytes()) {
+                                mark_authenticated(&stats, started_at);
                             }
                         }
+                        TunnResult::WriteToNetwork(p) => {
+                            to_net.push(p.to_vec());
+                            // A cookie challenge is not an authenticated peer response.
+                            if matches!(p.first(), Some(2 | 4)) {
+                                mark_authenticated(&stats, started_at);
+                            }
+                            drain_queued_packets(&mut t, &mut to_net);
+                        }
                         TunnResult::Err(e) => {
-                            // 会话轮换和真正的解密失败分开计数 —— 前者是
-                            // 长连接的正常产物，混在一起会掩盖真问题
-                            let counter = if is_session_churn(&e) {
-                                &stats.session_churn
-                            } else if !should_count_decrypt_error(started_at.elapsed()) {
-                                // 隧道刚建立时，旧 session 的在途包可能晚到。
-                                // 这段交接噪声只记录 debug，不能污染用户可见的
-                                // decrypt_errors 统计（此前会固定显示「解密错误 4」）。
-                                log_decrypt_error(
-                                    &e,
-                                    stats.decrypt_errors.load(Ordering::Relaxed),
-                                    started_at,
-                                    &mut last_decrypt_log,
-                                );
-                                continue;
+                            if is_session_rejection(&e) {
+                                stats.session_churn.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let total = if should_count_decrypt_error(started_at.elapsed()) {
+                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed) + 1
                             } else {
-                                &stats.decrypt_errors
+                                stats.decrypt_errors.load(Ordering::Relaxed)
                             };
-                            let total = counter.fetch_add(1, Ordering::Relaxed) + 1;
                             log_decrypt_error(&e, total, started_at, &mut last_decrypt_log);
                         }
                     }
                 }
 
                 for p in &to_net {
-                    if let Err(e) = udp.send(p) {
-                        tracing::error!("[隧道] UDP 回包失败: {e}");
+                    match udp.send(p) {
+                        Ok(_) => {
+                            stats
+                                .tx_bytes
+                                .fetch_add(network_plaintext_len(p), Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!("[隧道] UDP 回包失败: {e}");
+                        }
                     }
                 }
                 if let Some(p) = to_tun {
@@ -664,65 +680,77 @@ fn spawn_inbound(
         .map_err(|e| ConnectError::TunError(format!("无法启动入站线程: {e}")))
 }
 
-/// 标记会话存活，仅在状态翻转时记日志
-fn mark_healthy(stats: &Arc<TunnelStats>) {
-    if !stats.healthy.swap(true, Ordering::Relaxed) {
-        tracing::info!("[隧道] 会话已建立，链路正常");
+/// WireGuard transport data has a 16-byte header and a 16-byte authentication tag.
+/// Handshake packets carry no tunnel plaintext.
+fn network_plaintext_len(packet: &[u8]) -> u64 {
+    if packet.starts_with(&4u32.to_le_bytes()) {
+        packet.len().saturating_sub(32) as u64
+    } else {
+        0
     }
 }
 
-/// 会话轮换导致的解密失败 —— 正常现象，不是安全问题
-///
-/// boringtun 只保留最近 8 个 session，槽位是 `session_index % 8`
-/// （见其 `noise/mod.rs` 的 `N_SESSIONS`）。每次握手都会取一个新的本地
-/// index，重连和每 120s 的 rekey 都会产生新 session。新 session 落到
-/// 某个槽位后，服务端**仍在用旧 session 加密的在途包**到达时，
-/// 槽里已经是新 session 了 —— `receive_packet_data` 比对
-/// `receiver_idx != self.receiving_index` 直接返回 `WrongIndex`。
-///
-/// 换句话说：每次会话轮换都会丢掉「旧密钥的在途包」，
-/// 数量取决于轮换瞬间链路上有多少包在飞。高带宽 + 高 RTT 链路上
-/// 一次轮换掉几十个包是正常的，TCP 自己会重传。
-///
-/// 这几类都属于此类：
-/// - `WrongIndex` — 槽位已被新 session 覆盖
-/// - `NoCurrentSession` — 槽位还没建立 session
-/// - `DuplicateCounter` / `InvalidCounter` 之外的重放窗口抖动
-///
-/// **真正可疑**的是 `InvalidAeadTag` / `WrongKey` / `InvalidMac`：
-/// index 对上了但解不开，才意味着密钥不匹配或有人注入包。
-fn is_session_churn(err: &boringtun::noise::errors::WireGuardError) -> bool {
-    use boringtun::noise::errors::WireGuardError as E;
+/// boringtun's queue is bounded to 256 packets. Drain it to Done so no backlog
+/// is stranded until an unrelated later handshake. I/O remains outside the lock.
+fn drain_queued_packets(tunn: &mut Tunn, packets: &mut Vec<Vec<u8>>) {
+    let mut buf = [0u8; PKT_BUF];
+    loop {
+        match tunn.decapsulate(None, &[], &mut buf) {
+            TunnResult::WriteToNetwork(p) => packets.push(p.to_vec()),
+            TunnResult::Err(e) => {
+                tracing::warn!("[隧道] 积压队列处理失败: {e:?}");
+                break;
+            }
+            _ => break,
+        }
+    }
+    if packets.len() > 1 {
+        tracing::debug!(packets = packets.len() - 1, "[隧道] 积压队列已排空");
+    }
+}
+
+fn mark_authenticated(stats: &TunnelStats, started_at: Instant) {
+    stats.last_authenticated_ms.store(
+        (started_at.elapsed().as_millis() as u64).max(1),
+        Ordering::Relaxed,
+    );
+}
+
+fn link_is_fresh(session_exists: bool, elapsed: Duration, last_authenticated_ms: u64) -> bool {
+    session_exists
+        && last_authenticated_ms != 0
+        && elapsed
+            .as_millis()
+            .saturating_sub(last_authenticated_ms as u128)
+            < LINK_STALE_AFTER.as_millis()
+}
+
+/// These errors identify rejection classes, not their cause. In particular,
+/// normal rekey retains the previous session and should not itself cause loss.
+fn is_session_rejection(err: &WireGuardError) -> bool {
     matches!(
         err,
-        E::WrongIndex | E::NoCurrentSession | E::DuplicateCounter | E::UnexpectedPacket
+        WireGuardError::WrongIndex
+            | WireGuardError::NoCurrentSession
+            | WireGuardError::DuplicateCounter
+            | WireGuardError::UnexpectedPacket
     )
 }
 
-/// 只有离开启动宽限期后，可疑的加密错误才进入用户可见计数。
-/// 会话轮换类错误由调用方单独计入 `session_churn`。
+/// 离开启动宽限期后，所有协议拒收都进入用户可见错误计数。
+/// 会话/重放错误同时保留兼容性分类计数。
 fn should_count_decrypt_error(elapsed: Duration) -> bool {
     elapsed >= DECRYPT_GRACE
 }
 
-/// 按「会话轮换 vs 可疑」分级记录解密错误
-///
-/// 之前这里对所有错误都报 `持续出现说明密钥不匹配或存在包注入`，
-/// 但绝大多数是 `WrongIndex` —— 会话轮换的正常产物。在长连接上
-/// 每 120s rekey 一次，累计几百次 WrongIndex 完全正常，
-/// 却让日志看起来像遭到攻击。
+/// Rate-limit warnings without treating persistent session rejection as normal rekey.
 fn log_decrypt_error(
     err: &boringtun::noise::errors::WireGuardError,
     total: u64,
     started_at: Instant,
     last_log: &mut Option<Instant>,
 ) {
-    // 会话轮换类错误全生命周期都是 debug —— 它们不代表任何异常
-    if is_session_churn(err) {
-        tracing::debug!("[隧道] 会话轮换丢包 (正常): {err:?} — 累计 {total} 次");
-        return;
-    }
-
+    tracing::debug!(error = ?err, total, uptime_ms = started_at.elapsed().as_millis(), "[隧道] 收包被拒绝");
     if started_at.elapsed() < DECRYPT_GRACE {
         tracing::debug!("[隧道] 会话交接期解密失败 (预期): {err:?}");
         return;
@@ -734,21 +762,16 @@ fn log_decrypt_error(
 
     if should_log {
         *last_log = Some(Instant::now());
-        tracing::warn!(
-            "[隧道] 解密失败: {err:?} — 累计 {total} 次。\
-             index 对上但解不开，说明密钥不匹配或存在包注入",
-        );
+        tracing::warn!("[隧道] 协议/解密拒收: {err:?} — 累计 {total} 次（原因尚未确认）",);
     }
 }
 
 /// 计时线程：驱动 boringtun 的握手重传/keepalive，并在其放弃后无限重连
 ///
-/// ## 为什么不自己做静默检测
-///
-/// boringtun 已实现 RFC 标准逻辑：对端静默 15s (KEEPALIVE_TIMEOUT +
-/// REKEY_TIMEOUT) 触发新握手，之后每 5s (REKEY_TIMEOUT) 重传，
-/// 累计 90s (REKEY_ATTEMPT_TIME) 后放弃并返回 `ConnectionExpired`。
-/// 再叠一层自己的检测只会和它打架。
+/// boringtun owns handshake retransmission and expiry. The host additionally
+/// probes after 30s without authenticated input, because keepalive does not
+/// require a reply and a cached local key cannot prove that the path is live.
+/// The probe never forces/restarts an in-flight handshake.
 ///
 /// 原来的 bug 就一处：`update_timers` 的 `Err` 被忽略了。
 /// boringtun 放弃后 `Tunn` 进入 `HandshakeState::Expired` 终态，
@@ -776,6 +799,8 @@ fn spawn_timer(
             let mut buf = [0u8; HANDSHAKE_BUF];
             let mut backoff = RECONNECT_BACKOFF_MIN;
             let mut next_revive: Option<Instant> = None;
+            let mut last_probe = Duration::ZERO;
+            let mut last_diagnostic = Duration::ZERO;
 
             while running.load(Ordering::Relaxed) {
                 thread::sleep(TIMER_TICK);
@@ -786,35 +811,70 @@ fn spawn_timer(
                         Err(_) => break,
                     };
 
-                    // boringtun 的权威会话状态：time_since_last_handshake()
-                    // 返回 Some 即会话已建立。这与「有无流量」无关 ——
-                    // fallback 模式下路由已撤、隧道内无数据，只能靠这个判断恢复。
-                    let alive = t.stats().0.is_some();
-                    stats.session_alive.store(alive, Ordering::Relaxed);
-
                     match t.update_timers(&mut buf[..]) {
                         TunnResult::WriteToNetwork(p) => TimerOutcome::Send(p.to_vec()),
-                        TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                            TimerOutcome::Expired
-                        }
+                        TunnResult::Err(WireGuardError::ConnectionExpired) => TimerOutcome::Expired,
                         TunnResult::Err(e) => TimerOutcome::OtherError(format!("{e:?}")),
                         _ => TimerOutcome::Idle,
                     }
                 };
 
+                let elapsed = started_at.elapsed();
+                let last_auth = stats.last_authenticated_ms.load(Ordering::Relaxed);
+                let (session_exists, handshake_age) = match tunn.lock() {
+                    Ok(t) => (t.stats().0.is_some(), t.stats().0),
+                    Err(_) => break,
+                };
+                let alive = link_is_fresh(session_exists, elapsed, last_auth);
+                stats.session_alive.store(alive, Ordering::Relaxed);
+                if stats.healthy.swap(alive, Ordering::Relaxed) != alive {
+                    tracing::info!(
+                        alive,
+                        last_authenticated_ms = last_auth,
+                        "[隧道] 认证链路状态变化"
+                    );
+                }
+                if elapsed.saturating_sub(last_diagnostic) >= Duration::from_secs(5) {
+                    last_diagnostic = elapsed;
+                    tracing::debug!(uptime_ms = elapsed.as_millis(), alive, session_exists,
+                        handshake_age_ms = ?handshake_age.map(|d| d.as_millis()),
+                        last_authenticated_ms = last_auth,
+                        last_inbound_ms = stats.last_inbound_ms.load(Ordering::Relaxed),
+                        tx_bytes = stats.tx_bytes.load(Ordering::Relaxed),
+                        rx_bytes = stats.rx_bytes.load(Ordering::Relaxed),
+                        tx_dropped = stats.tx_dropped.load(Ordering::Relaxed),
+                        rejected = stats.decrypt_errors.load(Ordering::Relaxed),
+                        session_rejected = stats.session_churn(), rebinds = udp.rebinds(),
+                        reconnects = stats.reconnects(), "[隧道] 诊断快照");
+                }
+                // Keepalives do not solicit a reply. Probe idle/blackholed links with
+                // a non-forced handshake, preserving boringtun's active retry state.
+                if elapsed.as_millis().saturating_sub(last_auth as u128)
+                    >= LINK_PROBE_INTERVAL.as_millis()
+                    && elapsed.saturating_sub(last_probe) >= LINK_PROBE_INTERVAL
+                    && !matches!(outcome, TimerOutcome::Expired)
+                {
+                    last_probe = elapsed;
+                    probe_link(&tunn, &udp);
+                }
+
                 match outcome {
                     TimerOutcome::Send(p) => {
-                        // 有包可发说明会话在正常推进，重置退避
-                        backoff = RECONNECT_BACKOFF_MIN;
-                        next_revive = None;
+                        // Only authenticated recovery resets backoff, not an unanswered send.
+                        if alive {
+                            backoff = RECONNECT_BACKOFF_MIN;
+                            next_revive = None;
+                        }
                         if let Err(e) = udp.send_with_rebind(&p) {
                             // 断网期间这条每 250ms 会触发一次，降为 debug
                             tracing::debug!("[隧道] 保活/握手发送失败: {e}");
                         }
                     }
                     TimerOutcome::Idle => {
-                        backoff = RECONNECT_BACKOFF_MIN;
-                        next_revive = None;
+                        if alive {
+                            backoff = RECONNECT_BACKOFF_MIN;
+                            next_revive = None;
+                        }
                     }
                     TimerOutcome::OtherError(msg) => {
                         tracing::warn!("[隧道] 计时器异常: {msg}");
@@ -852,6 +912,33 @@ fn spawn_timer(
             tracing::debug!("[隧道] 计时线程退出");
         })
         .map_err(|e| ConnectError::TunError(format!("无法启动计时线程: {e}")))
+}
+
+/// Rebind at most once per probe interval to recover stale local/NAT paths.
+/// Never force a new handshake while boringtun is already retrying one.
+fn probe_link(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) {
+    if let Err(e) = udp.rebind() {
+        tracing::debug!("[隧道] 链路探测重绑定失败: {e}");
+        return;
+    }
+    let mut buf = [0u8; HANDSHAKE_BUF];
+    let packet = {
+        let Ok(mut t) = tunn.lock() else { return };
+        match t.format_handshake_initiation(&mut buf, false) {
+            TunnResult::WriteToNetwork(p) => Some(p.to_vec()),
+            TunnResult::Err(e) => {
+                tracing::debug!("[隧道] 链路探测失败: {e:?}");
+                None
+            }
+            _ => None,
+        }
+    };
+    if let Some(p) = packet {
+        tracing::debug!("[隧道] 认证收包静默，发起链路探测");
+        if let Err(e) = udp.send(&p) {
+            tracing::debug!("[隧道] 链路探测发送失败: {e}");
+        }
+    }
 }
 
 /// 退避序列：给定已用退避，返回下一个值
@@ -982,17 +1069,27 @@ mod tests {
         use std::io::{Error, ErrorKind};
 
         // macOS 网络环境变化的 errno — 必须重绑定
-        for code in [49, 50, 51, 64, 65] {
+        for code in if cfg!(target_os = "macos") {
+            vec![49, 50, 51, 64, 65]
+        } else {
+            vec![]
+        } {
             assert!(
                 is_network_change_error(&Error::from_raw_os_error(code)),
                 "errno {code} 应触发重绑定"
             );
         }
-        assert!(is_network_change_error(&Error::from(ErrorKind::AddrNotAvailable)));
+        assert!(is_network_change_error(&Error::from(
+            ErrorKind::AddrNotAvailable
+        )));
 
         // 与本机地址无关的错误 — 重绑定无济于事，不该重绑
-        assert!(!is_network_change_error(&Error::from(ErrorKind::PermissionDenied)));
-        assert!(!is_network_change_error(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!is_network_change_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_network_change_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
         assert!(!is_network_change_error(&Error::from(ErrorKind::TimedOut)));
         // EMSGSIZE(40): 载荷过大，换 socket 也一样失败
         assert!(!is_network_change_error(&Error::from_raw_os_error(40)));
@@ -1045,60 +1142,111 @@ mod tests {
         assert_eq!(fmt_bytes(3 * 1024 * 1024), "3.0MiB");
     }
 
-    // ── 解密错误分类 ──
-    //
-    // 之前所有解密错误都报「密钥不匹配或存在包注入」。实际上长连接上
-    // 绝大多数是 WrongIndex —— 每 120s rekey 一次，旧 session 的在途包
-    // 必然解不开。误报会让用户以为遭到攻击。
-
     #[test]
-    fn wrong_index_is_session_churn_not_attack() {
-        use boringtun::noise::errors::WireGuardError as E;
-        // 槽位被新 session 覆盖 —— rekey 和重连的必然产物
-        assert!(is_session_churn(&E::WrongIndex));
-        assert!(is_session_churn(&E::NoCurrentSession));
-        assert!(is_session_churn(&E::DuplicateCounter));
-    }
-
-    /// index 对上却解不开才是真问题 —— 这几类必须报警
-    #[test]
-    fn crypto_failures_are_suspicious() {
-        use boringtun::noise::errors::WireGuardError as E;
-        assert!(!is_session_churn(&E::InvalidAeadTag));
-        assert!(!is_session_churn(&E::WrongKey));
-        assert!(!is_session_churn(&E::InvalidMac));
-        assert!(!is_session_churn(&E::InvalidCounter));
-    }
-
-    #[test]
-    fn startup_grace_does_not_count_suspicious_decrypt_errors() {
-        // 启动初期的交接包即使被 boringtun 判定为 AEAD 错误，也不应让
-        // 健康行显示固定的「解密错误 4」；宽限期结束后才进入计数。
-        assert!(!should_count_decrypt_error(Duration::from_millis(0)));
-        assert!(!should_count_decrypt_error(Duration::from_secs(2)));
+    fn session_rejections_do_not_prove_rekey_or_attack() {
+        assert!(is_session_rejection(&WireGuardError::WrongIndex));
+        assert!(is_session_rejection(&WireGuardError::DuplicateCounter));
+        assert!(!is_session_rejection(&WireGuardError::InvalidAeadTag));
         assert!(should_count_decrypt_error(DECRYPT_GRACE));
-        assert!(should_count_decrypt_error(Duration::from_secs(4)));
+        assert!(!should_count_decrypt_error(Duration::ZERO));
     }
 
     #[test]
-    fn churn_and_errors_use_separate_counters() {
-        let stats = TunnelStats::default();
-        stats.session_churn.store(400, Ordering::Relaxed);
-        stats.decrypt_errors.store(2, Ordering::Relaxed);
-
-        assert_eq!(stats.session_churn(), 400);
-        // snapshot 的第三项只统计可疑错误，不含换钥丢包
-        assert_eq!(stats.snapshot().2, 2);
+    fn cached_key_and_unauthenticated_traffic_do_not_prove_liveness() {
+        assert!(!link_is_fresh(true, Duration::from_secs(1), 0));
+        assert!(link_is_fresh(true, Duration::from_secs(40), 1));
+        assert!(!link_is_fresh(true, Duration::from_secs(46), 1));
+        assert!(!link_is_fresh(false, Duration::from_secs(1), 1));
+        assert!(link_is_fresh(true, Duration::from_secs(46), 45_000));
+    }
+    fn paired_tunnels() -> (Tunn, Tunn) {
+        let a = StaticSecret::from([1u8; 32]);
+        let b = StaticSecret::from([2u8; 32]);
+        let ap = PublicKey::from(&a);
+        let bp = PublicKey::from(&b);
+        (
+            Tunn::new(a, bp, None, None, 0, None),
+            Tunn::new(b, ap, None, None, 0, None),
+        )
     }
 
-    /// 健康行必须让「正常丢包」和「异常」在措辞上可区分
+    fn network_packet(result: TunnResult<'_>) -> Vec<u8> {
+        match result {
+            TunnResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected network packet, got {other:?}"),
+        }
+    }
+
+    fn handshake(a: &mut Tunn, b: &mut Tunn) {
+        let mut buf = [0u8; PKT_BUF];
+        let init = network_packet(a.format_handshake_initiation(&mut buf, true));
+        let response = network_packet(b.decapsulate(None, &init, &mut buf));
+        let confirmation = network_packet(a.decapsulate(None, &response, &mut buf));
+        assert!(matches!(
+            b.decapsulate(None, &confirmation, &mut buf),
+            TunnResult::Done
+        ));
+    }
+
+    fn ipv4_packet() -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[3] = 20;
+        p[12] = 10;
+        p[16] = 10;
+        p
+    }
+
     #[test]
-    fn health_line_marks_only_real_errors() {
-        let stats = TunnelStats::default();
-        stats.session_churn.store(400, Ordering::Relaxed);
-        // 换钥丢包不带警示符号
-        assert!(!format!(" · 换钥丢包 {}", stats.session_churn()).contains('⚠'));
-        // 解密错误带警示符号
-        assert!(format!(" · ⚠ 解密错误 {}", 2).contains('⚠'));
+    fn old_inflight_data_survives_rekey() {
+        let (mut a, mut b) = paired_tunnels();
+        handshake(&mut a, &mut b);
+        let mut buf = [0u8; PKT_BUF];
+        let old = network_packet(b.encapsulate(&ipv4_packet(), &mut buf));
+        handshake(&mut a, &mut b);
+        assert!(matches!(
+            a.decapsulate(None, &old, &mut buf),
+            TunnResult::WriteToTunnelV4(..)
+        ));
+    }
+
+    #[test]
+    fn handshake_backlog_is_fully_drained_and_delivered() {
+        let (mut a, mut b) = paired_tunnels();
+        let mut buf = [0u8; PKT_BUF];
+        for _ in 0..256 {
+            a.encapsulate(&ipv4_packet(), &mut buf);
+        }
+        handshake(&mut a, &mut b);
+        let mut pending = Vec::new();
+        drain_queued_packets(&mut a, &mut pending);
+        assert_eq!(pending.len(), 256);
+        for p in pending {
+            assert!(matches!(
+                b.decapsulate(None, &p, &mut buf),
+                TunnResult::WriteToTunnelV4(..)
+            ));
+        }
+        assert!(matches!(
+            a.decapsulate(None, &[], &mut buf),
+            TunnResult::Done
+        ));
+    }
+
+    #[test]
+    fn idle_probe_preserves_an_inflight_handshake() {
+        let (mut a, mut b) = paired_tunnels();
+        let mut buf = [0u8; PKT_BUF];
+        let init = network_packet(a.format_handshake_initiation(&mut buf, true));
+        let response = network_packet(b.decapsulate(None, &init, &mut buf));
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp = Arc::new(Endpoint::new(listener.local_addr().unwrap()).unwrap());
+        let tunn = Arc::new(Mutex::new(a));
+        probe_link(&tunn, &udp);
+        assert_eq!(udp.rebinds(), 1);
+        assert!(matches!(
+            tunn.lock().unwrap().decapsulate(None, &response, &mut buf),
+            TunnResult::WriteToNetwork(_)
+        ));
     }
 }
