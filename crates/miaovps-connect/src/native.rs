@@ -38,7 +38,7 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(500);
 /// TUN poll 超时 — 同上，让空闲时也能响应停止
 const TUN_POLL_TIMEOUT: Duration = Duration::from_millis(500);
-/// 空闲链路用握手确认对端可达；不重置正在进行的握手。
+/// 从上次双向确认起计时，单向握手请求不能推迟探测。
 const LINK_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// 探测留出 15s 响应窗口，再将链路标为不可用。
 const LINK_STALE_AFTER: Duration = Duration::from_secs(45);
@@ -215,11 +215,13 @@ pub struct TunnelStats {
     pub reconnects: AtomicU64,
     /// 最后一次收到任何入站包的时刻（隧道启动后的毫秒数）
     pub last_inbound_ms: AtomicU64,
-    /// 最后一次收到经过认证的对端握手或数据包（含 keepalive）的时刻
+    /// 最后一次双向确认：解出 transport 数据/keepalive，或验证本机握手的响应
     pub last_authenticated_ms: AtomicU64,
+    /// 接受的对端握手请求总数；请求本身不能证明对方接受了本机回应
+    pub peer_handshake_requests: AtomicU64,
     /// 当前链路是否通过认证且未超出探测响应窗口
     pub healthy: AtomicBool,
-    /// 本地会话存在且认证收包未过期；空闲时依靠握手探测确认
+    /// 本地会话存在且双向确认未过期；未确认的对端请求不延长存活
     pub session_alive: AtomicBool,
 }
 
@@ -617,26 +619,15 @@ fn spawn_inbound(
                         Ok(t) => t,
                         Err(_) => break,
                     };
-                    match t.decapsulate(None, &udp_buf[..n], &mut decrypted[..]) {
+                    let result = t.decapsulate(None, &udp_buf[..n], &mut decrypted[..]);
+                    record_link_progress(&stats, started_at.elapsed(), &udp_buf[..n], &result);
+                    match result {
                         TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
-                            mark_authenticated(&stats, started_at);
                             to_tun = Some(p.to_vec());
                         }
-                        // 空载荷 keepalive 走这里（validate_decapsulated_packet 对
-                        // len==0 返回 Done）。它同样证明会话存活 —— 且在
-                        // 空闲和回落期间也计入；握手探测是另一种认证信号。
-                        TunnResult::Done => {
-                            // Done also covers cookie replies; those do not prove a live peer session.
-                            if udp_buf[..n].starts_with(&4u32.to_le_bytes()) {
-                                mark_authenticated(&stats, started_at);
-                            }
-                        }
+                        TunnResult::Done => {}
                         TunnResult::WriteToNetwork(p) => {
                             to_net.push(p.to_vec());
-                            // A cookie challenge is not an authenticated peer response.
-                            if matches!(p.first(), Some(2 | 4)) {
-                                mark_authenticated(&stats, started_at);
-                            }
                             drain_queued_packets(&mut t, &mut to_net);
                         }
                         TunnResult::Err(e) => {
@@ -709,11 +700,66 @@ fn drain_queued_packets(tunn: &mut Tunn, packets: &mut Vec<Vec<u8>>) {
     }
 }
 
-fn mark_authenticated(stats: &TunnelStats, started_at: Instant) {
-    stats.last_authenticated_ms.store(
-        (started_at.elapsed().as_millis() as u64).max(1),
-        Ordering::Relaxed,
-    );
+/// Only completed protocol progress proves both directions. A verified request
+/// proves the peer can reach us, but not that it received/accepted our response.
+fn record_link_progress(
+    stats: &TunnelStats,
+    elapsed: Duration,
+    packet: &[u8],
+    result: &TunnResult<'_>,
+) {
+    let confirmed = match (packet.get(..4), result) {
+        (
+            Some([4, 0, 0, 0]),
+            TunnResult::Done | TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..),
+        ) => true,
+        (Some([2, 0, 0, 0]), TunnResult::WriteToNetwork(reply)) => {
+            reply.starts_with(&4u32.to_le_bytes())
+        }
+        _ => false,
+    };
+    if confirmed {
+        stats
+            .last_authenticated_ms
+            .store((elapsed.as_millis() as u64).max(1), Ordering::Relaxed);
+    } else if let (Some([1, 0, 0, 0]), TunnResult::WriteToNetwork(reply)) =
+        (packet.get(..4), result)
+    {
+        if reply.starts_with(&2u32.to_le_bytes()) {
+            let n = stats
+                .peer_handshake_requests
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            tracing::debug!(
+                requests = n,
+                "[隧道] 已回应对端握手，等待双向确认（不刷新链路健康）"
+            );
+        }
+    }
+}
+
+/// Separate recovery scheduling from raw input/handshake activity. In particular,
+/// repeated peer initiations must not starve probes when they abort local retries.
+#[derive(Default)]
+struct LinkProbeSchedule {
+    last_probe: Duration,
+}
+
+impl LinkProbeSchedule {
+    fn due(&mut self, elapsed: Duration, last_confirmed_ms: u64, expired: bool) -> bool {
+        if !expired
+            && elapsed
+                .as_millis()
+                .saturating_sub(last_confirmed_ms as u128)
+                >= LINK_PROBE_INTERVAL.as_millis()
+            && elapsed.saturating_sub(self.last_probe) >= LINK_PROBE_INTERVAL
+        {
+            self.last_probe = elapsed;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn link_is_fresh(session_exists: bool, elapsed: Duration, last_authenticated_ms: u64) -> bool {
@@ -799,7 +845,7 @@ fn spawn_timer(
             let mut buf = [0u8; HANDSHAKE_BUF];
             let mut backoff = RECONNECT_BACKOFF_MIN;
             let mut next_revive: Option<Instant> = None;
-            let mut last_probe = Duration::ZERO;
+            let mut probe_schedule = LinkProbeSchedule::default();
             let mut last_diagnostic = Duration::ZERO;
 
             while running.load(Ordering::Relaxed) {
@@ -839,6 +885,8 @@ fn spawn_timer(
                     tracing::debug!(uptime_ms = elapsed.as_millis(), alive, session_exists,
                         handshake_age_ms = ?handshake_age.map(|d| d.as_millis()),
                         last_authenticated_ms = last_auth,
+                        peer_handshake_requests = stats.peer_handshake_requests.load(Ordering::Relaxed),
+                        confirmed_silence_ms = elapsed.as_millis().saturating_sub(last_auth as u128),
                         last_inbound_ms = stats.last_inbound_ms.load(Ordering::Relaxed),
                         tx_bytes = stats.tx_bytes.load(Ordering::Relaxed),
                         rx_bytes = stats.rx_bytes.load(Ordering::Relaxed),
@@ -847,14 +895,11 @@ fn spawn_timer(
                         session_rejected = stats.session_churn(), rebinds = udp.rebinds(),
                         reconnects = stats.reconnects(), "[隧道] 诊断快照");
                 }
-                // Keepalives do not solicit a reply. Probe idle/blackholed links with
-                // a non-forced handshake, preserving boringtun's active retry state.
-                if elapsed.as_millis().saturating_sub(last_auth as u128)
-                    >= LINK_PROBE_INTERVAL.as_millis()
-                    && elapsed.saturating_sub(last_probe) >= LINK_PROBE_INTERVAL
-                    && !matches!(outcome, TimerOutcome::Expired)
-                {
-                    last_probe = elapsed;
+                // Peer requests are intentionally excluded from the confirmation clock:
+                // they can arrive forever while our response path is broken.
+                if probe_schedule.due(elapsed, last_auth, matches!(outcome, TimerOutcome::Expired)) {
+                    tracing::warn!(confirmed_silence_ms = elapsed.as_millis().saturating_sub(last_auth as u128),
+                        "[隧道] 双向确认停滞，重绑定并探测链路");
                     probe_link(&tunn, &udp);
                 }
 
@@ -934,7 +979,7 @@ fn probe_link(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) {
         }
     };
     if let Some(p) = packet {
-        tracing::debug!("[隧道] 认证收包静默，发起链路探测");
+        tracing::debug!("[隧道] 双向确认静默，发起链路探测");
         if let Err(e) = udp.send(&p) {
             tracing::debug!("[隧道] 链路探测发送失败: {e}");
         }
@@ -1248,5 +1293,130 @@ mod tests {
             tunn.lock().unwrap().decapsulate(None, &response, &mut buf),
             TunnResult::WriteToNetwork(_)
         ));
+    }
+    #[test]
+    fn unconfirmed_peer_rekeys_cannot_starve_recovery() {
+        let (mut client, mut server) = paired_tunnels();
+        handshake(&mut client, &mut server);
+        let stats = TunnelStats::default();
+        let mut buf = [0u8; PKT_BUF];
+        let data = network_packet(server.encapsulate(&ipv4_packet(), &mut buf));
+        let result = client.decapsulate(None, &data, &mut buf);
+        record_link_progress(&stats, Duration::from_secs(1), &data, &result);
+        assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 1000);
+
+        let mut schedule = LinkProbeSchedule::default();
+        let mut due_at = Vec::new();
+        for retry in 1..=8 {
+            let elapsed = Duration::from_secs(1 + retry * 5);
+            let request = network_packet(server.format_handshake_initiation(&mut buf, true));
+            let result = client.decapsulate(None, &request, &mut buf);
+            assert!(matches!(result, TunnResult::WriteToNetwork(_)));
+            // Intentionally discard the response, matching the stalled confirmation path.
+            record_link_progress(&stats, elapsed, &request, &result);
+            let confirmed = stats.last_authenticated_ms.load(Ordering::Relaxed);
+            assert_eq!(confirmed, 1000, "peer requests must not refresh health");
+            if schedule.due(elapsed, confirmed, false) {
+                due_at.push(elapsed.as_secs());
+            }
+        }
+        assert_eq!(stats.peer_handshake_requests.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            due_at,
+            vec![31],
+            "probe must fire despite five-second peer requests"
+        );
+        let old = network_packet(server.encapsulate(&ipv4_packet(), &mut buf));
+        let rejected = client.decapsulate(None, &old, &mut buf);
+        assert!(matches!(
+            rejected,
+            TunnResult::Err(WireGuardError::WrongIndex)
+        ));
+        record_link_progress(&stats, Duration::from_secs(44), &old, &rejected);
+        assert!(!link_is_fresh(
+            client.stats().0.is_some(),
+            Duration::from_secs(46),
+            stats.last_authenticated_ms.load(Ordering::Relaxed)
+        ));
+        assert!(!schedule.due(Duration::from_secs(46), 1000, false));
+        assert!(schedule.due(Duration::from_secs(61), 1000, false));
+
+        // Execute the actual recovery sender and complete its handshake over a new socket.
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let udp = Arc::new(Endpoint::new(listener.local_addr().unwrap()).unwrap());
+        let tunn = Arc::new(Mutex::new(client));
+        probe_link(&tunn, &udp);
+        assert_eq!(udp.rebinds(), 1);
+        let n = listener.recv(&mut buf).unwrap();
+        let request = buf[..n].to_vec();
+        assert!(request.starts_with(&1u32.to_le_bytes()));
+        let response = network_packet(server.decapsulate(None, &request, &mut buf));
+        let mut client = tunn.lock().unwrap();
+        let result = client.decapsulate(None, &response, &mut buf);
+        record_link_progress(&stats, Duration::from_secs(62), &response, &result);
+        let confirmation = network_packet(result);
+        assert!(matches!(
+            server.decapsulate(None, &confirmation, &mut buf),
+            TunnResult::Done
+        ));
+        assert!(link_is_fresh(
+            client.stats().0.is_some(),
+            Duration::from_secs(62),
+            stats.last_authenticated_ms.load(Ordering::Relaxed)
+        ));
+        let data = network_packet(server.encapsulate(&ipv4_packet(), &mut buf));
+        let result = client.decapsulate(None, &data, &mut buf);
+        assert!(matches!(result, TunnResult::WriteToTunnelV4(..)));
+        record_link_progress(&stats, Duration::from_secs(63), &data, &result);
+        assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 63_000);
+    }
+
+    #[test]
+    fn cookies_invalid_data_and_queued_output_do_not_confirm_link() {
+        let stats = TunnelStats::default();
+        record_link_progress(
+            &stats,
+            Duration::from_secs(30),
+            &[3, 0, 0, 0],
+            &TunnResult::Done,
+        );
+        record_link_progress(
+            &stats,
+            Duration::from_secs(30),
+            &[4, 0, 0, 0],
+            &TunnResult::Err(WireGuardError::WrongIndex),
+        );
+        let mut transport_header = [4, 0, 0, 0];
+        record_link_progress(
+            &stats,
+            Duration::from_secs(30),
+            &[],
+            &TunnResult::WriteToNetwork(&mut transport_header),
+        );
+        assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 0);
+        // An authenticated empty transport packet (keepalive) is sufficient even when idle.
+        record_link_progress(
+            &stats,
+            Duration::from_secs(31),
+            &[4, 0, 0, 0],
+            &TunnResult::Done,
+        );
+        assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 31_000);
+    }
+
+    #[test]
+    fn recovery_schedule_is_rate_limited_and_expiry_keeps_its_own_backoff() {
+        let mut schedule = LinkProbeSchedule::default();
+        assert!(!schedule.due(Duration::from_secs(29), 0, false));
+        assert!(schedule.due(Duration::from_secs(30), 0, false));
+        assert!(!schedule.due(Duration::from_secs(30), 0, false));
+        assert!(!schedule.due(Duration::from_secs(60), 0, true));
+        assert!(schedule.due(Duration::from_secs(60), 0, false));
+        // Fresh confirmed traffic defers probing, but unconfirmed requests never enter this clock.
+        assert!(!schedule.due(Duration::from_secs(90), 89_000, false));
+        assert!(schedule.due(Duration::from_secs(119), 89_000, false));
     }
 }

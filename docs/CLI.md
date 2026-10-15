@@ -60,15 +60,19 @@ existing `tunnel.log` console-output file.
 
 Diagnostics include session start time and process ID, handshake retries,
 protocol rejection types, socket rebindings, fallback/recovery events, and
-five-second snapshots of traffic, authenticated receive times, and errors.
+five-second snapshots of traffic, confirmed receive times, peer handshake request
+counts, and errors.
 Keep the entire rotated file set when investigating an incident.
 
-Link health now requires recent authenticated input. After 30 seconds of
-silence, a rate-limited socket rebind and non-forced handshake probe check the
+Link health requires recent bidirectional confirmation: decrypted transport
+packets (including empty keepalives), or a verified response to our own handshake.
+Incoming handshake requests and locally generated responses do not refresh health;
+repeated peer requests cannot indefinitely defer recovery. After 30 seconds without
+confirmation, a rate-limited socket rebind and non-forced handshake probe check the
 path without replacing an in-flight handshake. At 45 seconds of silence the
 link is marked unavailable. Full tunnel mode falls back to direct routing
 only after roughly another 30 seconds of continuous unavailability; fresh
-authenticated input and a usable session permit recovery. Session/replay
+bidirectional confirmation and a usable session permit recovery. Session/replay
 rejections are no longer assumed to be harmless rekey loss.
 
 ## Command reference
