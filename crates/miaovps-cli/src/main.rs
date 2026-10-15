@@ -6,6 +6,7 @@
 mod dns;
 mod logging;
 mod profile;
+mod recovery;
 
 use anyhow::{Context, Result};
 use miaovps_app::credentials::ServerCredential;
@@ -940,7 +941,137 @@ fn publish_state(
     }
 }
 
+/// Own the entire lifecycle: a restart is requested only after the old session
+/// has joined its threads and restored its routes/DNS.
 async fn cmd_connect(args: &[String]) -> Result<()> {
+    use recovery::SessionExit;
+    let mut current_args = args.to_vec();
+    let mut policy = recovery::RecoveryPolicy::default();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+        let _ = stop_tx.send(true);
+    });
+    loop {
+        if *stop_rx.borrow() {
+            return Ok(());
+        }
+        let outcome = match cmd_connect_once(&current_args, policy.retrying).await {
+            Ok(SessionExit::Stopped) => return Ok(()),
+            Ok(outcome) => outcome,
+            Err(error) => return Err(error),
+        };
+        if *stop_rx.borrow() || TunnelState::stop_requested(&data_dir()) {
+            return Ok(());
+        }
+        if policy.ended(outcome) {
+            // No active tunnel or overlay remains when mutating the remote port.
+            let deployment = tokio::select! {
+                result = redeploy_next_port(&current_args) => result,
+                _ = wait_for_stop_request() => {
+                    tracing::warn!("[恢复] 收到停止请求，终止自动端口部署，远端状态需核对");
+                    return Ok(());
+                },
+                _ = stop_rx.changed() => {
+                    tracing::warn!("[恢复] 用户停止端口部署，远端状态需核对");
+                    return Ok(());
+                }
+            };
+            match deployment {
+                Ok(port) => {
+                    current_args = recovery::with_port(&current_args, port);
+                    policy.migrated();
+                }
+                Err(error) => {
+                    tracing::error!(%error, "[恢复] 端口迁移未完成，停止自动部署");
+                    return Err(error);
+                }
+            }
+        }
+        tracing::warn!("[恢复] 即将完整重连（重建 TUN、socket 与会话）");
+        // Stop/disconnect must also work in the gap between sessions.
+        tokio::select! {
+            _ = stop_rx.changed() => return Ok(()),
+            _ = tokio::time::sleep(if outcome == SessionExit::RetryFailed {
+                Duration::from_secs(5)
+            } else { Duration::ZERO }) => {}
+        }
+        if TunnelState::stop_requested(&data_dir()) {
+            TunnelState::clear_stop_request(&data_dir());
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_stop_request() {
+    while !TunnelState::stop_requested(&data_dir()) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn redeploy_next_port(args: &[String]) -> Result<u16> {
+    let mut profile = ConnectionProfile::load(&data_dir())?;
+    let port =
+        recovery::next_port(connect_port_arg(args)?.unwrap_or(profile.server_addr()?.port()))?;
+    let svc = open_service().await?;
+    let (selected, _) = connect_target_args(args)?;
+    let server_id = if let Some(prefix) = selected {
+        resolve_server_id(&svc, &prefix).await?
+    } else {
+        let mut matches = Vec::new();
+        for server in svc.list_servers().await? {
+            if let Some(node) = svc.db.get_wg_node(&server.id).await? {
+                if node.server_public_key == profile.server_public_key {
+                    matches.push(server.id);
+                }
+            }
+        }
+        match matches.as_slice() {
+            [id] => id.clone(),
+            _ => anyhow::bail!(
+                "无法唯一确定重部署节点，请使用 connect <server-id> --device <device-id>"
+            ),
+        }
+    };
+    let mut node = svc
+        .db
+        .get_wg_node(&server_id)
+        .await?
+        .context("未找到已部署节点，停止自动迁移")?;
+    if node.server_public_key != profile.server_public_key {
+        anyhow::bail!("所选节点与当前连接公钥不符，拒绝自动部署");
+    }
+    let options = recovery::deployment_options(&node, profile.mtu, port);
+    tracing::warn!(%server_id, port, "[恢复] 连续两次完整重连失败，重新部署下一端口");
+    let progress = svc.deploy_server(server_id, Some(options), None).await?;
+    if progress.status != DeploymentStatus::Success {
+        anyhow::bail!(
+            "自动端口部署失败（{:?}），未切换本地连接端口",
+            progress.status
+        );
+    }
+    let public_key = progress
+        .server_public_key
+        .context("部署结果缺少公钥，停止自动迁移")?;
+    if public_key != profile.server_public_key {
+        anyhow::bail!("重部署意外改变了服务端公钥，请人工核对后连接");
+    }
+    // Preserve the existing node's non-port settings in local storage as well.
+    node.listen_port = port;
+    svc.db.upsert_wg_node(&node).await?;
+    let mut endpoint = profile.server_addr()?;
+    endpoint.set_port(port);
+    profile.server_endpoint = endpoint.to_string();
+    profile.save(&data_dir())?;
+    tracing::info!(port, "[恢复] 端口部署成功，已同步节点与 profile");
+    Ok(port)
+}
+
+async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::SessionExit> {
     let flags: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
     let (server_prefix, device_prefix) = connect_target_args(args)?;
     let port_override = connect_port_arg(args)?;
@@ -956,7 +1087,7 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     if !is_root() {
         if let Some(server_prefix) = server_prefix.as_deref() {
             prepare_selected_profile(server_prefix, device_prefix.as_deref()).await?;
-            return spawn_elevated(args);
+            return spawn_elevated(args).map(|_| recovery::SessionExit::Stopped);
         }
         anyhow::bail!(
             "创建 TUN 接口和修改路由需要 root 权限。\n\
@@ -986,7 +1117,7 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     // 不用 fork()：tokio 运行时已经起了线程，fork 只复制调用线程，
     // 子进程里的 runtime 会带着半套线程状态死锁。re-exec 拿到干净进程。
     if daemon && std::env::var_os(DAEMON_MARKER).is_none() {
-        return spawn_daemon(args);
+        return spawn_daemon(args).map(|_| recovery::SessionExit::Stopped);
     }
 
     let is_daemon_child = daemon && std::env::var_os(DAEMON_MARKER).is_some();
@@ -1027,6 +1158,9 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     // 必须在创建 utun 之前先写出归属状态。否则前端在
     // 「网卡已出现、状态文件尚未写」的窗口会误判为终端启动。
     if is_daemon_child {
+        if retrying && TunnelState::stop_requested(&data_dir()) {
+            return Ok(recovery::SessionExit::Stopped);
+        }
         TunnelState::clear_stop_request(&data_dir());
         let state = TunnelState::connecting(
             tunnel_mode,
@@ -1064,6 +1198,10 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
             );
             if !r.success {
                 println!("     {}", r.detail);
+                if retrying {
+                    tracing::warn!(step = %r.step, "[恢复] 重连链路验证失败");
+                    return Ok(recovery::SessionExit::RetryFailed);
+                }
                 anyhow::bail!(
                     "验证失败，未切换任何路由。\n\
                      确认公钥 {} 已注册到 VPS peer 列表 (sudo wg show)",
@@ -1227,14 +1365,47 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("无法注册 SIGTERM 处理")?;
 
+    let mut exit = recovery::SessionExit::Stopped;
+    let mut retry_confirmed = false;
+    // Generate real transport traffic when retrying an otherwise idle tunnel.
+    let mut recovery_ping = if retrying {
+        match tokio::process::Command::new("ping")
+            .args(["-n", "-i", "1", "-t", "45", &profile.peer_ip])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => Some(child),
+            Err(error) => {
+                tracing::warn!(%error, "[恢复] 无法启动网关探测");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut watchdog = tokio::time::interval(Duration::from_millis(250));
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = watchdog.tick() => {
+                let wrong_index = tunnel.stats().wrong_index.load(std::sync::atomic::Ordering::Relaxed);
+                if let Some(reason) = recovery::session_exit(wrong_index, retrying,
+                    tunnel.stats().snapshot().1 > 0, retry_confirmed, tunnel.uptime()) {
+                    tracing::warn!(wrong_index, retrying, retry_confirmed, "[恢复] 达到重连条件，完整断开本轮连接");
+                    exit = reason;
+                    break;
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => {
                 println!("\n收到 SIGTERM，开始收尾");
                 break;
             }
-            _ = tokio::time::sleep(TICK) => {
+            _ = tick.tick() => {
                 if is_daemon_child && TunnelState::stop_requested(&data_dir()) {
                     println!("\n收到前端停止请求，开始收尾");
                     break;
@@ -1245,6 +1416,15 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
                     // 因为包没有可用的出口
                     tracing::info!(old_gateway = %old, new_gateway = %new, "[网络] 已修复 VPS 直连路由");
                     tunnel.notify_network_changed();
+                }
+                if retrying && !retry_confirmed && tunnel.stats().snapshot().1 > 0
+                    && tunnel.uptime() >= recovery::RETRY_STABLE_FOR && tunnel.stats().is_session_alive() {
+                    retry_confirmed = true;
+                    tracing::info!("[恢复] 已收到实际隧道数据，完整重连成功");
+                    if let Some(mut child) = recovery_ping.take() {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                    }
                 }
                 ticks += 1;
                 if ticks.is_multiple_of(STATUS_EVERY) {
@@ -1306,6 +1486,10 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
             }
         }
     }
+    if let Some(mut child) = recovery_ping.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
     println!("\n正在关闭...");
     tracing::info!("[连接] 正在关闭隧道");
 
@@ -1339,7 +1523,9 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     // 状态文件必须在路由清理后删 —— 中间崩溃时留着文件才能被识别为 Stale
     if is_daemon_child {
         TunnelState::clear(&data_dir());
-        TunnelState::clear_stop_request(&data_dir());
+        if exit == recovery::SessionExit::Stopped {
+            TunnelState::clear_stop_request(&data_dir());
+        }
     }
 
     println!(
@@ -1359,7 +1545,7 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
     );
     println!("✅ 已断开");
 
-    Ok(())
+    Ok(exit)
 }
 
 async fn cmd_disconnect(_args: &[String]) -> Result<()> {

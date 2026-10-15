@@ -219,6 +219,8 @@ pub struct TunnelStats {
     pub last_authenticated_ms: AtomicU64,
     /// 接受的对端握手请求总数；请求本身不能证明对方接受了本机回应
     pub peer_handshake_requests: AtomicU64,
+    /// WrongIndex 原始拒收数（独立于日志抑制与启动宽限期）
+    pub wrong_index: AtomicU64,
     /// 当前链路是否通过认证且未超出探测响应窗口
     pub healthy: AtomicBool,
     /// 本地会话存在且双向确认未过期；未确认的对端请求不延长存活
@@ -631,6 +633,9 @@ fn spawn_inbound(
                             drain_queued_packets(&mut t, &mut to_net);
                         }
                         TunnResult::Err(e) => {
+                            if matches!(e, WireGuardError::WrongIndex) {
+                                stats.wrong_index.fetch_add(1, Ordering::Relaxed);
+                            }
                             if is_session_rejection(&e) {
                                 stats.session_churn.fetch_add(1, Ordering::Relaxed);
                             }
@@ -886,6 +891,7 @@ fn spawn_timer(
                         handshake_age_ms = ?handshake_age.map(|d| d.as_millis()),
                         last_authenticated_ms = last_auth,
                         peer_handshake_requests = stats.peer_handshake_requests.load(Ordering::Relaxed),
+                        wrong_index = stats.wrong_index.load(Ordering::Relaxed),
                         confirmed_silence_ms = elapsed.as_millis().saturating_sub(last_auth as u128),
                         last_inbound_ms = stats.last_inbound_ms.load(Ordering::Relaxed),
                         tx_bytes = stats.tx_bytes.load(Ordering::Relaxed),

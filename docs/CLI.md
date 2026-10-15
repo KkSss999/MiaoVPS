@@ -75,6 +75,33 @@ only after roughly another 30 seconds of continuous unavailability; fresh
 bidirectional confirmation and a usable session permit recovery. Session/replay
 rejections are no longer assumed to be harmless rekey loss.
 
+## Automatic reconnection and port escalation
+
+A connection is fully torn down and rebuilt when its raw `WrongIndex` count
+reaches **2**. A 250 ms watchdog observes the count independently of the
+rate-limited warning log. TUN threads, routes and DNS are cleaned up before
+creating the next TUN, UDP socket and WireGuard session.
+
+A retry must receive actual tunnel traffic within 45 seconds; handshake responses
+alone are insufficient. An ICMP probe to the VPN gateway generates traffic even
+when idle. After at least 30 seconds with traffic and a healthy session the retry
+is considered established. A `WrongIndex` relapse before that point counts as a
+failed retry. A later incident starts a new retry sequence.
+
+After **two consecutive failed retries**, the current endpoint port is incremented
+by one and the existing SSH deployment flow redeploys the selected node. Existing
+server keys and peers are retained. Subnet, DNS and MTU settings are reused.
+The node record, profile and subsequent `--port` argument are updated only after
+deployment reports success. Failed deployment stops escalation for manual review;
+port 65535 never wraps. Cloud-provider firewall rules still need to allow the new
+UDP port; deployment can only configure the VPS firewall.
+
+Explicit server/device selection is preserved across retries. Profile-only
+connections can redeploy only when the stored server public key identifies one
+local node unambiguously. Ctrl+C, SIGTERM and daemon stop requests stop recovery
+as well. Automatic redeployment changes the shared server listen port, so other
+devices on that node must use the new port too.
+
 ## Command reference
 
 | Command | Purpose |
