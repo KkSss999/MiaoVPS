@@ -341,7 +341,7 @@ async fn cmd_inspect(args: &[String]) -> Result<()> {
     if report.blocked {
         println!("❌ 存在阻塞项，部署前需要先解决上面标 ❌ 的问题。");
     } else if report.all_passed {
-        println!("🎉 全部通过，可以部署: miaovps deploy {}", &prefix);
+        println!("🎉 全部通过，可以部署: miaovps deploy {}", prefix);
     } else {
         println!("⚠️  有警告项但不阻塞部署。");
     }
