@@ -32,6 +32,11 @@ jobs:
         run: cargo test --workspace --locked
 
       # clippy 只跑一遍：OS 差异已经由 test 在两个平台上覆盖
+      #
+      # 不加 -- -D warnings：CI 用浮动 stable，clippy 每版都会加新 lint
+      # （已经连续撞上 useless_borrows_in_formatting、double_must_use），
+      # 那会让 main 在没有代码改动的情况下变红。要恢复严格门禁就先
+      # 在 rust-toolchain.toml 里钉死版本，再开 -D warnings。
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked
