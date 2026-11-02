@@ -98,13 +98,18 @@ bash scripts/bootstrap-server.sh  # manual server-side deploy (run on the VPS)
 ## CI and releases
 
 - `.github/workflows/ci.yml`: `cargo test --workspace` on Ubuntu and macOS, plus
-  `cargo clippy --all-targets -- -D warnings` on Ubuntu. The macOS job is the
-  only automated compile of the macOS code paths.
+  `cargo clippy --all-targets` on Ubuntu. The macOS job is the only automated
+  compile of the macOS code paths. Clippy findings are printed but do not fail
+  the build: CI uses a floating `stable`, and new lints landing would otherwise
+  turn `main` red without any code change. Pin the toolchain first if you want
+  a strict gate.
 - `.github/workflows/release.yml`: releasing is automatic. Bump
   `[workspace.package] version` in `Cargo.toml` and push to `main`; the workflow
   creates tag `v<version>` when missing and publishes Linux x86_64 plus macOS
   arm64/x86_64 binaries. Same version again is a no-op; a missing release (failed
-  run) is re-published on the next run.
+  run) is re-published on the next run. The Linux artifact is built on
+  `ubuntu-22.04` on purpose — the runner's glibc becomes the artifact's minimum
+  (2.34), so 24.04-built binaries would not start on Debian 12.
 - The version has exactly one source: `Cargo.toml`. Anything that displays a
   version uses `env!("CARGO_PKG_VERSION")`, never a literal.
 
