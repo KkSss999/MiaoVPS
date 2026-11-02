@@ -5,6 +5,7 @@
 
 mod dns;
 mod logging;
+mod net;
 mod profile;
 mod recovery;
 
@@ -20,6 +21,10 @@ use miaovps_core::{DeploymentStatus, DeploymentStep, Device, DeviceType, Server,
 use miaovps_provisioner::{DeploymentOptions, DetectStatus, StepEvent, StepResult};
 use miaovps_storage::Database;
 use miaovps_wireguard_config as wg;
+use net::{
+    add_ipv6_block, apply_routes, delete_ipv6_block, delete_route, verify_ipv6_block,
+    Ipv6Block, RouteSpec,
+};
 use profile::{decode_key, derive_public_key, ConnectionProfile};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -45,12 +50,17 @@ fn data_dir() -> PathBuf {
     dir
 }
 
+/// 用户目录的父目录 —— macOS 固定在 /Users，Linux 惯例是 /home
+#[cfg(target_os = "macos")]
+const USER_HOME_ROOT: &str = "/Users";
+#[cfg(target_os = "linux")]
+const USER_HOME_ROOT: &str = "/home";
+
 /// 真实用户的 home — sudo 下解析为调用者而非 root
 fn real_home() -> PathBuf {
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
         if !sudo_user.is_empty() && sudo_user != "root" {
-            // macOS 用户目录固定在 /Users/<name>
-            let candidate = PathBuf::from("/Users").join(&sudo_user);
+            let candidate = PathBuf::from(USER_HOME_ROOT).join(&sudo_user);
             if candidate.is_dir() {
                 return candidate;
             }
@@ -1231,7 +1241,7 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
 
     // DNS 原始状态必须在任何修改前抓取
     let dns_backup = if full_tunnel {
-        match dns::DnsBackup::capture(&data_dir()) {
+        match dns::DnsBackup::capture(&data_dir(), &tun_name) {
             Ok(b) => {
                 println!("  DNS 原始配置已备份: {}", b.describe());
                 Some(b)
@@ -1246,7 +1256,7 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
         None
     };
 
-    let default_gw = get_default_gateway()?;
+    let default_gw = net::default_gateway()?;
     let vpn_net = vpn_network_cidr(&profile.peer_ip)?;
 
     let mut plan = vec![
@@ -1291,7 +1301,7 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
     };
 
     if full_tunnel && dns_backup.is_some() && !profile.dns.is_empty() {
-        match dns::apply(&profile.dns) {
+        match dns::apply(&profile.dns, &tun_name) {
             Ok(()) => println!("  DNS 接管: {}", profile.dns.join(", ")),
             Err(e) => println!("  ⚠ DNS 接管失败（查询可能泄露给 ISP）: {e}"),
         }
@@ -1368,9 +1378,16 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
     let mut exit = recovery::SessionExit::Stopped;
     let mut retry_confirmed = false;
     // Generate real transport traffic when retrying an otherwise idle tunnel.
+    // macOS 的 -t 是整体超时；Linux 的 -t 是 TTL，超时用 -w。
+    #[cfg(target_os = "macos")]
+    const PING_TIMEOUT: [&str; 2] = ["-t", "45"];
+    #[cfg(target_os = "linux")]
+    const PING_TIMEOUT: [&str; 2] = ["-w", "45"];
     let mut recovery_ping = if retrying {
         match tokio::process::Command::new("ping")
-            .args(["-n", "-i", "1", "-t", "45", &profile.peer_ip])
+            .args(["-n", "-i", "1"])
+            .args(PING_TIMEOUT)
+            .arg(&profile.peer_ip)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -1800,91 +1817,6 @@ fn is_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
-/// 一条待应用的路由
-#[derive(Debug, Clone)]
-struct RouteSpec {
-    /// 目标网段 CIDR
-    destination: String,
-    /// 下一跳 — 网关 IP 或接口名
-    via: RouteVia,
-}
-
-#[derive(Debug, Clone)]
-enum RouteVia {
-    Gateway(String),
-    Interface(String),
-}
-
-impl RouteSpec {
-    fn gateway(destination: String, gw: &str) -> Self {
-        Self {
-            destination,
-            via: RouteVia::Gateway(gw.to_string()),
-        }
-    }
-
-    fn interface(destination: String, iface: &str) -> Self {
-        Self {
-            destination,
-            via: RouteVia::Interface(iface.to_string()),
-        }
-    }
-
-    fn add(&self) -> Result<()> {
-        let (flag, target) = match &self.via {
-            RouteVia::Gateway(gw) => ("-gateway", gw.as_str()),
-            RouteVia::Interface(i) => ("-interface", i.as_str()),
-        };
-        run_route(&["add", "-inet", &self.destination, flag, target])
-    }
-
-    fn delete(&self) {
-        let _ = Command::new("route")
-            .args(["-q", "-n", "delete", "-inet", &self.destination])
-            .output();
-    }
-}
-
-/// 按顺序应用路由，任一条失败则回滚已应用的部分
-///
-/// 半套路由比没有路由更危险 — 用户可能只剩部分流量可达，
-/// 且不知道该删哪几条才能恢复。
-fn apply_routes(plan: &[RouteSpec]) -> Result<()> {
-    let mut applied: Vec<&RouteSpec> = Vec::with_capacity(plan.len());
-
-    for spec in plan {
-        if let Err(e) = spec.add() {
-            for done in applied.iter().rev() {
-                done.delete();
-            }
-            return Err(e.context(format!(
-                "应用路由 {} 失败，已回滚 {} 条先前路由",
-                spec.destination,
-                applied.len()
-            )));
-        }
-        applied.push(spec);
-    }
-    Ok(())
-}
-
-/// 执行 route 命令。已经 root 了，不再套 sudo。
-///
-/// 「路由已存在」不算失败 — 上次异常退出可能留下同名路由，
-/// 目标状态（该网段走隧道）已经满足。
-fn run_route(args: &[&str]) -> Result<()> {
-    let output = Command::new("route").arg("-n").args(args).output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("File exists") {
-            return Ok(());
-        }
-        anyhow::bail!("route {} 失败: {}", args.join(" "), stderr.trim());
-    }
-    Ok(())
-}
-
 /// 删除隧道相关路由，逐条静默 — 清理路径上任何一条失败都不该中断其余清理
 fn remove_tunnel_routes(vps_ip: &str, vpn_net: &str) {
     let mut targets: Vec<String> = vec![
@@ -1897,34 +1829,15 @@ fn remove_tunnel_routes(vps_ip: &str, vpn_net: &str) {
     }
 
     for t in &targets {
-        let _ = Command::new("route")
-            .args(["-q", "-n", "delete", "-inet", t])
-            .output();
+        delete_route(t);
     }
-}
-
-/// 获取当前默认网关 IP
-fn get_default_gateway() -> Result<String> {
-    let output = Command::new("route")
-        .args(["-n", "get", "default"])
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let gw = stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gateway:"))
-        .map(|g| g.trim().to_string())
-        .filter(|g| !g.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("无法获取默认网关 — 当前可能没有可用网络连接"))?;
-
-    Ok(gw)
 }
 
 /// Full Tunnel 的全局路由 + DNS 接管，可临时撤下再装回
 ///
 /// ## 为什么需要
 ///
-/// Full Tunnel 下 `0/1`+`128/1` 指向 utun、DNS 指向只能经隧道到达的地址。
+/// Full Tunnel 下 `0/1`+`128/1` 指向 TUN、DNS 指向只能经隧道到达的地址。
 /// 隧道断了但路由还在时，全局流量和 DNS 全进黑洞 —— macOS 的连通性探测
 /// 失败，系统判定「已连接但无互联网」，用户看到的是 WiFi 坏了。
 ///
@@ -1996,9 +1909,7 @@ impl FullTunnelOverlay {
             }
         }
         for dest in Self::GLOBAL_ROUTES {
-            let _ = Command::new("route")
-                .args(["-q", "-n", "delete", "-inet", dest])
-                .output();
+            delete_route(dest);
         }
         // IPv4 全局路由已经撤下后，才允许公网 IPv6 恢复系统原状。
         self.disable_ipv6_leak_protection();
@@ -2013,7 +1924,7 @@ impl FullTunnelOverlay {
 
         // DNS 备份要重新抓取 —— 回落期间用户可能换了网络，
         // 沿用旧备份会在下次还原时写回错误的 DNS
-        self.dns_backup = match dns::DnsBackup::capture(&self.data_dir) {
+        self.dns_backup = match dns::DnsBackup::capture(&self.data_dir, &self.tun_name) {
             Ok(b) => Some(b),
             Err(e) => {
                 println!("    ⚠ 无法备份 DNS，跳过 DNS 接管: {e}");
@@ -2033,7 +1944,7 @@ impl FullTunnelOverlay {
         }
 
         if self.dns_backup.is_some() && !self.dns_servers.is_empty() {
-            if let Err(e) = dns::apply(&self.dns_servers) {
+            if let Err(e) = dns::apply(&self.dns_servers, &self.tun_name) {
                 println!("    ⚠ DNS 接管失败（查询可能泄露给 ISP）: {e}");
             }
         }
@@ -2049,9 +1960,7 @@ impl FullTunnelOverlay {
         } else {
             // 已回落 —— DNS 早已还原，只清理可能残留的路由
             for dest in Self::GLOBAL_ROUTES {
-                let _ = Command::new("route")
-                    .args(["-q", "-n", "delete", "-inet", dest])
-                    .output();
+                delete_route(dest);
             }
             self.disable_ipv6_leak_protection();
         }
@@ -2073,8 +1982,6 @@ struct Ipv6LeakGuard {
 
 impl Ipv6LeakGuard {
     const PUBLIC_PREFIX: &'static str = "2000::/3";
-    /// 仅用于确认路由查找实际命中 reject；不是媒体或服务商特判。
-    const VERIFY_ADDRESS: &'static str = "2001:4860:4860::8888";
     const MARKER_FILE: &'static str = "ipv6-public-block.active";
 
     fn marker_path(data_dir: &std::path::Path) -> PathBuf {
@@ -2084,108 +1991,56 @@ impl Ipv6LeakGuard {
     fn install(data_dir: PathBuf) -> Result<Self> {
         let marker = Self::marker_path(&data_dir);
         let marker_exists = marker.is_file();
-        let output = Command::new("route")
-            // macOS 的 RTF_REJECT 路由必须提供 loopback gateway；只给
-            // destination 和 -reject 会出现命令成功但没有安装 reject 路由的假象。
-            .args(["-n", "add", "-inet6", Self::PUBLIC_PREFIX, "::1", "-reject"])
-            .output()
-            .context("无法添加 IPv6 防泄漏路由")?;
 
-        if output.status.success() {
-            if let Err(e) = Self::verify_route() {
-                let _ = Self::delete_route();
-                return Err(e);
+        match add_ipv6_block(Self::PUBLIC_PREFIX)? {
+            Ipv6Block::Added => {
+                if let Err(e) = Self::verify_route() {
+                    let _ = delete_ipv6_block(Self::PUBLIC_PREFIX);
+                    return Err(e);
+                }
+                if let Err(e) = std::fs::write(&marker, b"MiaoVPS IPv6 leak protection\n") {
+                    // marker 写不出就无法保证未来只清自己的规则，立刻补偿回滚。
+                    let _ = delete_ipv6_block(Self::PUBLIC_PREFIX);
+                    return Err(e).with_context(|| {
+                        format!("无法记录 IPv6 防泄漏路由归属: {}", marker.display())
+                    });
+                }
+                Ok(Self {
+                    data_dir,
+                    owns_route: true,
+                })
             }
-            if let Err(e) = std::fs::write(&marker, b"MiaoVPS IPv6 leak protection\n") {
-                // marker 写不出就无法保证未来只清自己的规则，立刻补偿回滚。
-                let _ = Self::delete_route();
-                return Err(e).with_context(|| {
-                    format!("无法记录 IPv6 防泄漏路由归属: {}", marker.display())
-                });
+            // 本机没有 IPv6 栈：没有泄漏面，也就没有需要归属的规则
+            Ipv6Block::Unsupported => Ok(Self {
+                data_dir,
+                owns_route: false,
+            }),
+            Ipv6Block::AlreadyPresent => {
+                // marker 已存在表示这是上一轮 MiaoVPS 异常退出留下的规则，当前
+                // 会话接管其清理责任；无 marker 则尊重用户/其他 VPN 的既有规则。
+                Self::verify_route().with_context(|| {
+                    format!(
+                        "公网 IPv6 前缀 {} 已有路由，但不是有效的拦截路由；为避免 IPv6 泄漏，拒绝建立 Full Tunnel",
+                        Self::PUBLIC_PREFIX
+                    )
+                })?;
+                Ok(Self {
+                    data_dir,
+                    owns_route: marker_exists,
+                })
             }
-            return Ok(Self {
-                data_dir,
-                owns_route: true,
-            });
         }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("File exists") {
-            // marker 已存在表示这是上一轮 MiaoVPS 异常退出留下的规则，当前
-            // 会话接管其清理责任；无 marker 则尊重用户/其他 VPN 的既有规则。
-            Self::verify_route().with_context(|| {
-                format!(
-                    "公网 IPv6 前缀 {} 已有路由，但不是有效的 REJECT 路由；为避免 IPv6 泄漏，拒绝建立 Full Tunnel",
-                    Self::PUBLIC_PREFIX
-                )
-            })?;
-            return Ok(Self {
-                data_dir,
-                owns_route: marker_exists,
-            });
-        }
-
-        anyhow::bail!(
-            "route add -inet6 {} ::1 -reject 失败: {}",
-            Self::PUBLIC_PREFIX,
-            stderr.trim()
-        );
     }
 
     fn verify_route() -> Result<()> {
-        let output = Command::new("route")
-            .args(["-n", "get", "-inet6", Self::VERIFY_ADDRESS])
-            .output()
-            .context("无法核验 IPv6 防泄漏路由")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "IPv6 路由查找失败: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout
-            .lines()
-            .any(|line| line.trim_start().starts_with("flags:") && line.contains("REJECT"))
-        {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "IPv6 路由未命中 REJECT（仍可能经本地网络直连）: {}",
-            stdout
-                .lines()
-                .find(|line| line.trim_start().starts_with("flags:"))
-                .unwrap_or("未返回 flags")
-                .trim()
-        );
-    }
-
-    fn delete_route() -> Result<()> {
-        let output = Command::new("route")
-            .args(["-q", "-n", "delete", "-inet6", Self::PUBLIC_PREFIX, "::1"])
-            .output()
-            .context("无法删除 IPv6 防泄漏路由")?;
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // 路由已被系统或用户删除，目标状态同样成立。
-        if stderr.contains("not in table") || stderr.contains("not found") {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "route delete -inet6 {} ::1 失败: {}",
-            Self::PUBLIC_PREFIX,
-            stderr.trim()
-        );
+        verify_ipv6_block(Self::PUBLIC_PREFIX)
     }
 
     fn remove(&mut self) -> Result<()> {
         if !self.owns_route {
             return Ok(());
         }
-        Self::delete_route()?;
+        delete_ipv6_block(Self::PUBLIC_PREFIX)?;
         std::fs::remove_file(Self::marker_path(&self.data_dir))
             .or_else(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -2220,12 +2075,12 @@ impl Ipv6LeakGuard {
 /// （或 WiFi↔有线切换）后网关变了，这条路由指向一个不可达的下一跳 ——
 /// 握手包连出口都没有，隧道永远无法恢复。
 ///
-/// Full Tunnel 下后果更严重：`0/1`+`128/1` 仍指向已死的 utun，
+/// Full Tunnel 下后果更严重：`0/1`+`128/1` 仍指向已死的 TUN，
 /// DNS 又指向只能经隧道到达的地址，于是系统的连通性探测（HTTP + DNS）
 /// 全部进黑洞，macOS 判定「已连接但无互联网」—— 表现为 WiFi 连不上。
 ///
 /// 物理默认路由与 `0/1`/`128/1` 并存（后者更具体但不覆盖 default 条目），
-/// 所以 `get_default_gateway()` 在 Full Tunnel 下仍能读到真实网关。
+/// 所以 `net::default_gateway()` 在 Full Tunnel 下仍能读到真实网关。
 struct VpsRouteGuard {
     vps_ip: String,
     /// 当前这条主机路由指向的网关
@@ -2244,7 +2099,7 @@ impl VpsRouteGuard {
     ///
     /// 返回 `Some((旧网关, 新网关))` 表示做了重建。
     fn reconcile(&mut self) -> Option<(String, String)> {
-        let current = get_default_gateway().ok()?;
+        let current = net::default_gateway().ok()?;
         if current == self.pinned_gw {
             return None;
         }
@@ -2253,11 +2108,9 @@ impl VpsRouteGuard {
         let dest = format!("{}/32", self.vps_ip);
 
         // 先删旧的，否则 add 会因 "File exists" 静默保留错误的下一跳
-        let _ = Command::new("route")
-            .args(["-q", "-n", "delete", "-inet", &dest])
-            .output();
+        delete_route(&dest);
 
-        match run_route(&["add", "-inet", &dest, "-gateway", &current]) {
+        match RouteSpec::gateway(dest.clone(), &current).add() {
             Ok(()) => Some((old, current)),
             Err(e) => {
                 eprintln!("  ⚠ VPS 直连路由重建失败: {e}");
@@ -2497,7 +2350,7 @@ mod tests {
     #[test]
     fn route_guard_noops_when_gateway_unchanged() {
         // 用当前真实网关构造，reconcile 应判定无变化且不碰路由表
-        let gw = match get_default_gateway() {
+        let gw = match net::default_gateway() {
             Ok(g) => g,
             Err(_) => return, // 无网络时跳过
         };
@@ -2511,23 +2364,13 @@ mod tests {
         // 构造一个不可能是当前网关的值，reconcile 应检测到差异。
         // 使用 TEST-NET-3 (RFC 5737) 保证不会误撞真实网关。
         let mut guard = VpsRouteGuard::new("203.0.113.1".into(), "203.0.113.254".into());
-        if get_default_gateway().is_err() {
+        if net::default_gateway().is_err() {
             return; // 无网络时跳过
         }
         // 会尝试重建路由；非 root 下 route add 失败返回 None，
         // 但 pinned_gw 必须已更新 —— 否则每 5s 都会重试同一个失效网关
         let _ = guard.reconcile();
         assert_ne!(guard.pinned_gw, "203.0.113.254", "检测到变化后必须更新记录");
-    }
-
-    #[test]
-    fn route_spec_carries_correct_next_hop() {
-        let gw = RouteSpec::gateway("203.0.113.10/32".into(), "192.168.1.1");
-        assert!(matches!(gw.via, RouteVia::Gateway(ref g) if g == "192.168.1.1"));
-
-        let iface = RouteSpec::interface("0.0.0.0/1".into(), "utun5");
-        assert!(matches!(iface.via, RouteVia::Interface(ref i) if i == "utun5"));
-        assert_eq!(iface.destination, "0.0.0.0/1");
     }
 
     #[test]

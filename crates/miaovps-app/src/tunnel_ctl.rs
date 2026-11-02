@@ -2,10 +2,13 @@
 //!
 //! ## 提权方式
 //!
-//! `osascript -e 'do shell script "..." with administrator privileges'`
-//! 弹出 macOS 原生授权框。相比自建 launchd helper 的好处是零安装、
-//! 无需签名；代价是每次连接授权一次。正常断开通过受限的停止请求
-//! 让 root daemon 自行收尾，不需要再授权。
+//! - **macOS**：`osascript -e 'do shell script "..." with administrator
+//!   privileges'` 弹出原生授权框。相比自建 launchd helper 的好处是零安装、
+//!   无需签名；代价是每次连接授权一次。
+//! - **Linux**：`pkexec`（polkit）弹桌面授权框，需要会话里有 polkit agent。
+//!
+//! 两个平台都由 root daemon 自己收尾，正常断开只写一个受限的停止请求，
+//! 不需要再授权一次。
 //!
 //! ## 命令注入防护
 //!
@@ -144,7 +147,7 @@ impl TunnelCtl {
         }
 
         // 正常运行的 root daemon 自己有权限还原 DNS/路由。App 只发一个
-        // 无参数停止事件，不再起第二次 osascript 授权。
+        // 无参数停止事件，不再起第二次授权框。
         TunnelState::request_stop(&self.data_dir)
             .map_err(|e| TunnelCtlError::Other(format!("无法发出停止请求: {e}")))?;
 
@@ -183,7 +186,8 @@ impl TunnelCtl {
         cmd
     }
 
-    /// 经 osascript 以管理员身份执行
+    /// 以管理员身份执行 shell 命令
+    #[cfg(target_os = "macos")]
     fn run_privileged(&self, shell_cmd: &str) -> Result<String, TunnelCtlError> {
         let script = format!(
             "do shell script {} with administrator privileges",
@@ -205,6 +209,40 @@ impl TunnelCtl {
             Err(TunnelCtlError::AuthCancelled)
         } else {
             Err(TunnelCtlError::LaunchFailed(stderr.trim().to_string()))
+        }
+    }
+
+    /// 以管理员身份执行 shell 命令
+    ///
+    /// `pkexec` 会清空环境，所以 `MIAOVPS_DATA_DIR` 必须留在命令串里
+    /// （`build_shell_command` 已经这么做了）。
+    #[cfg(target_os = "linux")]
+    fn run_privileged(&self, shell_cmd: &str) -> Result<String, TunnelCtlError> {
+        let output = Command::new("pkexec")
+            .args(["/bin/sh", "-c", shell_cmd])
+            .output()
+            .map_err(|e| {
+                TunnelCtlError::LaunchFailed(format!(
+                    "无法执行 pkexec（需要 polkit）: {e}\n\
+                     也可以手动运行: sudo {shell_cmd}"
+                ))
+            })?;
+
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+
+        // polkit 的约定：126 = 用户关闭授权框，127 = 未授权或执行失败
+        match output.status.code() {
+            Some(126) => Err(TunnelCtlError::AuthCancelled),
+            Some(127) => Err(TunnelCtlError::LaunchFailed(format!(
+                "未获得授权或 pkexec 无法执行: {}\n\
+                 也可以手动运行: sudo {shell_cmd}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+            _ => Err(TunnelCtlError::LaunchFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            )),
         }
     }
 }
@@ -261,6 +299,7 @@ pub fn shell_quote(s: &str) -> String {
 ///
 /// AppleScript 只认 `\` 和 `"` 两个转义字符，顺序不能反 ——
 /// 先转 `"` 会把随后插入的反斜杠再转一遍。
+#[cfg(target_os = "macos")]
 pub fn applescript_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', r"\\").replace('"', "\\\""))
 }
@@ -329,6 +368,7 @@ mod tests {
         assert_eq!(shell_quote("a;b"), "'a;b'");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn applescript_quote_escapes_backslash_before_quote() {
         assert_eq!(applescript_quote(r#"a"b"#), r#""a\"b""#);
@@ -338,6 +378,7 @@ mod tests {
     }
 
     /// 两层嵌套后仍不能逃出字符串上下文
+    #[cfg(target_os = "macos")]
     #[test]
     fn nested_quoting_survives_injection_attempt() {
         let evil = "/tmp/x'; rm -rf /; echo '";

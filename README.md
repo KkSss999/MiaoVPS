@@ -110,10 +110,10 @@ exported WireGuard configurations, or local MiaoVPS data in issues or commits.
 
 ## Project status
 
-MiaoVPS is **pre-1.0**. The Rust workspace and macOS client tunnel path are the
-currently exercised development path. SSH management may be portable, but a
-platform must not be considered supported until its TUN, routing, DNS,
-privilege, and recovery behavior have been validated end to end.
+MiaoVPS is **pre-1.0**. The Rust workspace and the macOS and Linux client tunnel
+paths are the currently exercised development path. SSH management may be
+portable, but a platform must not be considered supported until its TUN,
+routing, DNS, privilege, and recovery behavior have been validated end to end.
 
 Use a non-critical VPS first and retain provider-console access. Review the
 [security policy](SECURITY.md) and [deployment guide](docs/deployment.md) before

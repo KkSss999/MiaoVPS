@@ -1,17 +1,16 @@
-//! macOS TUN 接口管理 — 创建 utun、分配 IP、设置 MTU
+//! TUN 接口管理 — 创建虚拟网卡、分配 IP、设置 MTU
 //!
-//! 使用 tun crate 在 macOS 上创建 UTUN 虚拟网卡。
+//! macOS 用 utun 字符设备，Linux 用 `/dev/net/tun`；两者差异只在"框架"上：
 //!
-//! ## macOS utun 的两个关键约束
+//! - **macOS**：每个包前有 4 字节地址族头 (AF_INET = 2, AF_INET6 = 30)。
+//!   读取时跳过，写入时必须附加。而且 utun 是字符设备，每次 `write()`
+//!   就是一个独立数据包 —— AF 头和 IP 包必须拼接到同一个缓冲区一次写出，
+//!   分两次 `write_all` 会被内核当成两个畸形包丢弃。
+//! - **Linux**：包是裸 IP，没有任何头（tun crate 默认 `IFF_NO_PI`）。
 //!
-//! 1. **4 字节地址族头**：每个 IP 包前有 4 字节 AF 头 (AF_INET = 2, AF_INET6 = 30)。
-//!    读取时跳过，写入时必须附加。
+//! 地址、对端、MTU 两个平台都通过 `Configuration` 传入（见 `create`）。
 //!
-//! 2. **写入必须是单次 write**：utun 是字符设备，每次 `write()` 系统调用就是一个
-//!    独立数据包。AF 头和 IP 包必须拼接到同一个缓冲区一次写出，
-//!    分两次 `write_all` 会被内核当成两个畸形包丢弃。
-//!
-//! ## POINTOPOINT 语义
+//! ## macOS POINTOPOINT 语义
 //!
 //! utun 是点对点接口。`set_alias(addr, dst, mask)` 的第二个参数在 BSD
 //! `SIOCAIFADDR` 语义下是**对端地址**（不是广播地址）。必须传 VPN 网关
@@ -22,14 +21,21 @@ use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
-use tun::platform::macos::Device;
 use tun::platform::posix::{Reader, Writer};
+use tun::platform::Device;
 use tun::Device as _;
 
 use crate::error::ConnectError;
 
-/// macOS utun 的地址族头长度
+/// macOS utun 的地址族头长度（Linux 没有这个头）
 const AF_HEADER_LEN: usize = 4;
+
+/// 创建 TUN 失败时最常见的前提缺失
+#[cfg(target_os = "macos")]
+const TUN_HINT: &str = "需要 root";
+#[cfg(target_os = "linux")]
+const TUN_HINT: &str = "需要 root，且 /dev/net/tun 可用（modprobe tun）";
+
 /// 单个包缓冲区大小（MTU 1380 + AF 头 + 余量）
 const PKT_BUF: usize = 2048;
 
@@ -64,7 +70,7 @@ impl TunConfig {
     }
 }
 
-/// macOS TUN 接口
+/// 虚拟网卡
 pub struct TunInterface {
     reader: Reader,
     writer: Writer,
@@ -93,7 +99,7 @@ impl TunInterface {
             .up();
 
         let device = Device::new(&cfg)
-            .map_err(|e| ConnectError::TunError(format!("无法创建 TUN 接口 (需要 root): {e}")))?;
+            .map_err(|e| ConnectError::TunError(format!("无法创建 TUN 接口 ({TUN_HINT}): {e}")))?;
 
         let name = device
             .name()
@@ -196,7 +202,7 @@ impl TunReader {
         }
     }
 
-    /// 读取一个 IP 包，跳过 macOS 4 字节 AF 头
+    /// 读取一个 IP 包，跳过 macOS 的 4 字节 AF 头（Linux 上是裸包，原样返回）
     ///
     /// 调用前应先用 `wait_readable` 确认有数据，否则会阻塞。
     pub fn read_packet(&mut self) -> io::Result<Vec<u8>> {
@@ -215,21 +221,34 @@ pub struct TunWriter {
 }
 
 impl TunWriter {
-    /// 写入一个 IP 包，附加 4 字节 AF 头
-    ///
-    /// AF 头和包体拼接后**一次** write — utun 每次 write 就是一个数据包。
+    /// 写入一个 IP 包 —— 平台框架见 `frame_packet`
     pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         if packet.is_empty() {
             return Ok(());
         }
-        let mut framed = Vec::with_capacity(AF_HEADER_LEN + packet.len());
-        framed.extend_from_slice(&af_for(packet).to_be_bytes());
-        framed.extend_from_slice(packet);
-        self.writer.write_all(&framed)
+        self.writer.write_all(&frame_packet(packet))
     }
 }
 
+/// 写入前的组帧
+///
+/// macOS 必须附加 AF 头，且头和包体要在同一次 write 里写出（见模块文档）；
+/// Linux 的 TUN 是裸 IP，多写 4 字节会在对端被当成畸形包丢弃。
+#[cfg(target_os = "macos")]
+fn frame_packet(packet: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(AF_HEADER_LEN + packet.len());
+    framed.extend_from_slice(&af_for(packet).to_be_bytes());
+    framed.extend_from_slice(packet);
+    framed
+}
+
+#[cfg(target_os = "linux")]
+fn frame_packet(packet: &[u8]) -> Vec<u8> {
+    packet.to_vec()
+}
+
 /// 根据 IP 版本返回地址族常量
+#[cfg(target_os = "macos")]
 fn af_for(packet: &[u8]) -> u32 {
     match packet.first().map(|b| b >> 4) {
         Some(6) => libc::AF_INET6 as u32,
@@ -271,10 +290,23 @@ mod tests {
         assert_eq!(strip_af_header(&raw), &raw);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn detects_address_family_from_version() {
         assert_eq!(af_for(&[0x45]), libc::AF_INET as u32);
         assert_eq!(af_for(&[0x60]), libc::AF_INET6 as u32);
+    }
+
+    /// Linux 多写 4 字节头就会被对端丢弃，macOS 不写头则同样不通
+    #[test]
+    fn frames_packet_per_platform() {
+        let packet = [0x45u8, 0x00, 0x00, 0x14];
+        let framed = frame_packet(&packet);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(framed, [0, 0, 0, 2, 0x45, 0x00, 0x00, 0x14]);
+        #[cfg(target_os = "linux")]
+        assert_eq!(framed, packet);
     }
 
     #[test]

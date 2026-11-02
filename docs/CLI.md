@@ -13,6 +13,19 @@ miaovps --help
 Re-run `cargo install` to upgrade a locally installed build. Workspace build
 artifacts stay under the repository-level `target/` directory.
 
+## Client requirements
+
+`miaovps connect` and `miaovps disconnect` run as root, because they create a
+TUN interface and change the routing table.
+
+| Platform | Requirements |
+| --- | --- |
+| macOS | built-in utun device. Full Tunnel takeover changes the active network service's DNS through `networksetup` and restores it on exit. |
+| Linux | `/dev/net/tun` available (`modprobe tun`) and iproute2 (`ip`). Full Tunnel takes DNS over through systemd-resolved (`resolvectl`) when it runs; otherwise it rewrites `/etc/resolv.conf` only when that file is a regular file, and skips DNS takeover when neither applies. |
+
+The desktop app launches the tunnel through `pkexec` on Linux, which needs a
+polkit authentication agent in the session.
+
 ## Typical workflow
 
 ```bash

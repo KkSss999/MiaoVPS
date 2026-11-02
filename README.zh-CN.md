@@ -62,8 +62,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features
 ```
 
-MiaoVPS 当前处于 **pre-1.0** 阶段。Rust workspace 与 macOS 客户端隧道链路
-是当前实际验证路径；其他平台必须完成 TUN、路由、DNS、权限和恢复行为的
+MiaoVPS 当前处于 **pre-1.0** 阶段。Rust workspace 与 macOS、Linux 客户端隧道
+链路是当前实际验证路径；其他平台必须完成 TUN、路由、DNS、权限和恢复行为的
 端到端验证后，才能宣称正式支持。
 
 首次使用请选择非关键 VPS，并保留云厂商控制台访问能力。不要在 Issue、日志

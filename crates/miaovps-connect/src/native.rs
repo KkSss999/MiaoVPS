@@ -181,21 +181,31 @@ impl Endpoint {
     }
 }
 
+/// 网络环境变化时内核给出的 errno（ErrorKind 之外再兜一层）
+///
+/// macOS: EADDRNOTAVAIL(49) ENETDOWN(50) ENETUNREACH(51) EHOSTDOWN(64)
+/// EHOSTUNREACH(65)
+/// Linux: EADDRNOTAVAIL(99) ENETDOWN(100) ENETUNREACH(101) EHOSTDOWN(112)
+/// EHOSTUNREACH(113)
+#[cfg(target_os = "macos")]
+const NETWORK_CHANGE_ERRNOS: &[i32] = &[49, 50, 51, 64, 65];
+#[cfg(target_os = "linux")]
+const NETWORK_CHANGE_ERRNOS: &[i32] = &[99, 100, 101, 112, 113];
+
 /// 判断错误是否源于本机网络环境变化（需要重绑定 socket）
 ///
 /// 这些错误意味着 socket 钉死的源地址或路由已失效，重试同一个 socket
 /// 不可能成功；而其他错误（如 UDP 载荷过大）重绑定也无济于事。
 fn is_network_change_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
-    matches!(
+    if matches!(
         e.kind(),
         ErrorKind::AddrNotAvailable | ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable
-    ) || cfg!(target_os = "macos")
-        && matches!(
-            e.raw_os_error(),
-            // macOS: EADDRNOTAVAIL(49) ENETDOWN(50) ENETUNREACH(51) EHOSTUNREACH(65) EHOSTDOWN(64)
-            Some(49) | Some(50) | Some(51) | Some(64) | Some(65)
-        )
+    ) {
+        return true;
+    }
+
+    matches!(e.raw_os_error(), Some(code) if NETWORK_CHANGE_ERRNOS.contains(&code))
 }
 
 /// 隧道流量统计
@@ -1119,14 +1129,10 @@ mod tests {
     fn detects_errors_that_require_rebind() {
         use std::io::{Error, ErrorKind};
 
-        // macOS 网络环境变化的 errno — 必须重绑定
-        for code in if cfg!(target_os = "macos") {
-            vec![49, 50, 51, 64, 65]
-        } else {
-            vec![]
-        } {
+        // 本平台网络环境变化的 errno — 必须重绑定
+        for code in NETWORK_CHANGE_ERRNOS {
             assert!(
-                is_network_change_error(&Error::from_raw_os_error(code)),
+                is_network_change_error(&Error::from_raw_os_error(*code)),
                 "errno {code} 应触发重绑定"
             );
         }

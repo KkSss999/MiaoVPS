@@ -2,7 +2,7 @@
 //!
 //! ## 为什么要走状态文件
 //!
-//! `connect` 必须以 root 运行（创建 utun、改路由表），而 Tauri App 以普通
+//! `connect` 必须以 root 运行（创建 TUN、改路由表），而 Tauri App 以普通
 //! 用户身份运行。让整个 App 跑在 root 下会把 Keychain 和数据目录都变成
 //! root 的（见 CLAUDE.md「权限与密钥存储」），所以隧道进程必须独立。
 //!
@@ -47,7 +47,7 @@ pub enum TunnelStatus {
     /// 隧道在跑，但不是本 App 启动的
     ///
     /// 典型场景：用户在终端跑了 `sudo miaovps connect --full`（前台模式，
-    /// 不写状态文件）。此时 utun 上已经有 VPN 地址，绝不能再起第二个隧道 ——
+    /// 不写状态文件）。此时 TUN 上已经有 VPN 地址，绝不能再起第二个隧道 ——
     /// 两个进程会互相踩路由表。
     External,
 }
@@ -176,7 +176,7 @@ impl TunnelState {
 
     /// 无状态文件时探测是否已有外部隧道
     ///
-    /// 判据是 profile 里的客户端地址是否已绑在某个 utun 上 —— 比扫进程名
+    /// 判据是 profile 里的客户端地址是否已绑在某个 TUN 上 —— 比扫进程名
     /// 可靠：进程可能叫任何名字，但地址在网卡上就是在。
     fn probe_external(data_dir: &Path) -> Self {
         let Some(client_ip) = profile_client_ip(data_dir) else {
@@ -266,17 +266,55 @@ fn profile_client_ip(data_dir: &Path) -> Option<String> {
     json.get("client_ip")?.as_str().map(|s| s.to_string())
 }
 
-/// 某个 utun 接口上是否绑着这个地址
+/// 某个 TUN 接口上是否绑着这个地址
 fn utun_has_address(addr: &str) -> bool {
-    let Ok(out) = std::process::Command::new("ifconfig").output() else {
+    if addr.is_empty() {
+        return false;
+    }
+
+    #[cfg(target_os = "macos")]
+    let output = std::process::Command::new("ifconfig").output();
+    #[cfg(target_os = "linux")]
+    let output = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show"])
+        .output();
+
+    let Ok(out) = output else {
         return false;
     };
-    // `inet 10.66.66.3 --> 10.66.66.1` —— 匹配带边界的 inet 行，
-    // 避免 10.66.66.3 误匹配 10.66.66.30
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("inet "))
-        .any(|rest| rest.split_whitespace().next() == Some(addr))
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    // macOS: `inet 10.66.66.3 --> 10.66.66.1`
+    #[cfg(target_os = "macos")]
+    {
+        text.lines()
+            .filter_map(|l| l.trim().strip_prefix("inet "))
+            .any(|rest| rest.split_whitespace().next() == Some(addr))
+    }
+
+    // Linux: `2: tun0    inet 10.66.66.3/24 scope global tun0`
+    #[cfg(target_os = "linux")]
+    {
+        ip_addr_output_has(&text, addr)
+    }
+}
+
+/// 从 `ip -4 -o addr show` 的输出里找地址（含前缀长度的形式）
+///
+/// 按 `inet` 后的完整 CIDR 精确比较，避免 10.66.66.3 误匹配 10.66.66.30。
+#[cfg(target_os = "linux")]
+fn ip_addr_output_has(text: &str, addr: &str) -> bool {
+    let mut tokens = text.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "inet" {
+            if let Some(cidr) = tokens.next() {
+                if cidr.split('/').next() == Some(addr) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 进程是否存活 —— `kill(pid, 0)` 不发信号，只做权限和存在性检查
@@ -499,10 +537,23 @@ mod tests {
     /// 地址匹配必须带边界：10.66.66.3 不能匹配 10.66.66.30
     #[test]
     fn address_match_is_exact() {
-        // 用真实 ifconfig 输出验证不了具体地址，这里验证解析逻辑的边界行为：
+        // 用真实命令输出验证不了具体地址，这里验证解析逻辑的边界行为：
         // 一个当前机器上不可能存在的地址必须返回 false
         assert!(!utun_has_address("203.0.113.254"));
         assert!(!utun_has_address(""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_ip_addr_output_with_prefix_length() {
+        let out = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n\
+                   2: tun0    inet 10.66.66.3/24 scope global tun0\\       valid_lft forever\n";
+        assert!(ip_addr_output_has(out, "10.66.66.3"));
+        assert!(ip_addr_output_has(out, "127.0.0.1"));
+        // 前缀边界：不能把 10.66.66.30 算成命中
+        assert!(!ip_addr_output_has(out, "10.66.66.30"));
+        assert!(!ip_addr_output_has(out, "10.66.66"));
+        assert!(!ip_addr_output_has("", "10.66.66.3"));
     }
 
     #[test]
