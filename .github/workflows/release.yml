@@ -74,8 +74,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 用 22.04 而不是 latest 构建 Linux 产物：发行版 runner 的 glibc 会
+          # 变成产物的最低要求（24.04 上的产物要求 GLIBC_2.39，Ubuntu 22.04/
+          # Debian 12 直接跑不起来）。22.04 的 glibc 是 2.35。
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
