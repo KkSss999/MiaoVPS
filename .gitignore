@@ -1,6 +1,5 @@
 /target
 **/.DS_Store
-.pmem/
 .miaovps-data/
 node_modules/
 .env
