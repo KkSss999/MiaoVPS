@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
 }
 
 fn print_help() {
-    println!("MiaoVPS CLI v0.1.0 — 私人 VPN 节点管理工具\n");
+    println!(concat!("MiaoVPS CLI v", env!("CARGO_PKG_VERSION"), " — 私人 VPN 节点管理工具\n"));
     println!("用法: miaovps <command> [args]\n");
     println!("命令:");
     println!("  add-server <name> <host> [port] [user]  添加 VPS 服务器");

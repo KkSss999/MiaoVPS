@@ -95,6 +95,19 @@ bash scripts/test-tunnel-health.sh
 bash scripts/bootstrap-server.sh  # manual server-side deploy (run on the VPS)
 ```
 
+## CI and releases
+
+- `.github/workflows/ci.yml`: `cargo test --workspace` on Ubuntu and macOS, plus
+  `cargo clippy --all-targets -- -D warnings` on Ubuntu. The macOS job is the
+  only automated compile of the macOS code paths.
+- `.github/workflows/release.yml`: releasing is automatic. Bump
+  `[workspace.package] version` in `Cargo.toml` and push to `main`; the workflow
+  creates tag `v<version>` when missing and publishes Linux x86_64 plus macOS
+  arm64/x86_64 binaries. Same version again is a no-op; a missing release (failed
+  run) is re-published on the next run.
+- The version has exactly one source: `Cargo.toml`. Anything that displays a
+  version uses `env!("CARGO_PKG_VERSION")`, never a literal.
+
 ## Crate layering
 
 Strictly one-directional; `core` is pure domain models with no internal

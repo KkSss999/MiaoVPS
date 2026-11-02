@@ -1413,7 +1413,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "miaovps-app"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -1432,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-connect"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "boringtun",
  "libc",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-control"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1503,7 +1503,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-provisioner"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "miaovps-core",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-ssh"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "miaovps-core",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-storage"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "keyring",
  "miaovps-core",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-telemetry"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "miaovps-core",
  "serde",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-tunnel-api"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "miaovps-core",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "miaovps-wireguard-config"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "miaovps-core",
