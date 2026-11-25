@@ -82,9 +82,11 @@ if [[ $(sysctl -n net.ipv4.ip_forward) != 1 ]]; then
     sysctl -p /etc/sysctl.d/99-miaovps-awg.conf >&2
 fi
 systemctl start "$unit" >&2
-[[ $(awg show "$iface" listen-port) == "$port" && $(awg show "$iface" peers) == "$peer" ]] || fail 'AWG runtime differs from requested trial'
+# An active managed deployment may already have extra peers; return just the requested one.
+allowed=$(awg show "$iface" allowed-ips | awk -v peer="$peer" '$1 == peer && NF == 2 {print $2}')
+[[ $(awg show "$iface" listen-port) == "$port" && $allowed =~ ^[0-9.]+/32$ ]] || fail 'AWG runtime differs from requested configuration'
 systemctl enable "$unit" >&2
 # Output is deliberately limited to a public key and numeric framing parameters.
 awg show "$iface" public-key
-awg show "$iface" allowed-ips | awk '{print $2}'
+printf '%s\n' "$allowed"
 grep -E '^(H[1-4]|S[12]) = [0-9]+$' "$conf"

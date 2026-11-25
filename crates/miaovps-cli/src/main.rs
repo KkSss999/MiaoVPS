@@ -93,10 +93,8 @@ async fn main() -> Result<()> {
         "deploy" => awg::deploy_default(&args).await?,
         "deploy-awg" => awg::deploy_trial(&args[2..]).await?,
         "list-devices" if !uses_wireguard(&args) => awg::list_device(&args[2..]).await?,
-        "add-device" if !uses_wireguard(&args) => {
-            anyhow::bail!("AWG 单设备由 deploy 创建；添加原生 WireGuard 设备请显式加 --wg")
-        }
-        "add-device" => cmd_add_device(&without_wg(&args)).await?,
+        "add-device" if uses_wireguard(&args) => cmd_add_device(&without_wg(&args)).await?,
+        "add-device" => awg::add_device(&args[2..]).await?,
         "list-devices" => cmd_list_devices(&without_wg(&args)).await?,
         "status" => cmd_status(&without_wg(&args), uses_wireguard(&args)).await?,
         "export-config" if !uses_wireguard(&args) => awg::export(&args[2..])?,
@@ -135,6 +133,7 @@ fn print_help() {
     println!(
         "  deploy-awg <server-id> <wg-device-id> <udp-port> <new.conf>  用已有设备密钥部署 AWG"
     );
+    println!("  add-device <server-id> <name> --output <new.conf>  添加 AWG 设备并生成配置");
     println!("  add-device --wg <server-id> <name> [type]   添加原生 WireGuard 设备");
     println!("  list-devices [--wg] <server-id>              列出设备（默认 AWG）");
     println!("  status [--wg] <server-id>                   查看服务状态（默认 AWG）");
@@ -146,6 +145,7 @@ fn print_help() {
     println!("  validate [--wg]                               验证已保存的连接（不切路由）");
     println!("  validate --wg <ip:port> <client-priv> <server-pub> 验证指定的原生 WireGuard 连接");
     println!("  profile --wg init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]");
+    println!("  profile import <device.conf>                   验证并导入 AWG 配置（无需 SSH）");
     println!("  profile show [--wg]                            查看当前配置");
     println!(
         "  connect [server-id] [--device <device-id>] [--wg] [--full] [--port <udp-port>] [--skip-validate] [--daemon] [--dev] 建立隧道 (需 sudo)"
@@ -1126,10 +1126,15 @@ async fn wait_for_stop_request() {
 
 async fn redeploy_next_port(args: &[String]) -> Result<u16> {
     let wireguard = uses_wireguard(args);
+    let dir = data_dir();
     let (profile, framing) = if wireguard {
-        (ConnectionProfile::load(&data_dir())?, Default::default())
+        (ConnectionProfile::load(&dir)?, Default::default())
     } else {
-        awg::load(&data_dir())?
+        anyhow::ensure!(
+            dir.join("miaovps.db").is_file(),
+            "本机没有 VPS 管理记录，无法自动换口；请联系管理员核对服务端端口"
+        );
+        awg::load(&dir)?
     };
     let expected = connect_port_arg(args)?.unwrap_or(profile.server_addr()?.port());
     let svc = open_service().await?;
@@ -1257,6 +1262,7 @@ async fn change_listener(
     let token = uuid::Uuid::new_v4().simple().to_string();
     let change = PortChange {
         wireguard,
+        single_peer_only: !wireguard && requested.is_none(),
         token: &token,
         old,
         new,
@@ -2035,13 +2041,20 @@ fn wait_for_daemon_exit(pid: u32, attempts: usize) -> Result<bool> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_profile(args: &[String]) -> Result<()> {
+    if args.get(2).is_some_and(|action| action == "import") {
+        let [path] = &args[3..] else {
+            anyhow::bail!("用法: miaovps profile import <device.conf>");
+        };
+        anyhow::ensure!(!path.starts_with("--"), "请指定要导入的 AWG 配置文件");
+        return awg::import(std::path::Path::new(path)).await;
+    }
     let wireguard = uses_wireguard(args);
     let args = without_wg(args);
     match args.get(2).map(|s| s.as_str()) {
         Some("init") if wireguard => cmd_profile_init(&args),
         Some("show") => cmd_profile_show(wireguard),
         _ => anyhow::bail!(
-            "用法: miaovps profile show [--wg] 或 profile --wg init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]"
+            "用法: miaovps profile import <device.conf> | profile show [--wg] | profile --wg init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]"
         ),
     }
 }

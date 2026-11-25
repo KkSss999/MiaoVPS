@@ -48,7 +48,20 @@ sudo miaovps connect --full
 sudo miaovps disconnect
 ```
 
-部署和连接默认使用 AmneziaWG，不需要另装客户端；一次 AWG 部署只对应本机一个 Peer。原生 WireGuard 请显式使用 `deploy --wg`、`add-device --wg`、`connect --wg` 等命令，可注册多台设备。切换前先断开当前隧道；另一协议的监听和配置保留。首次检测或部署前，先通过可信渠道核对 VPS 的 SSH 指纹，再将对应密钥加入 `~/.ssh/known_hosts`；MiaoVPS 会拒绝未知或已变更的主机密钥。
+部署和连接默认使用 AmneziaWG，不需要另装客户端。原生 WireGuard 请显式使用 `deploy --wg`、`add-device --wg`、`connect --wg` 等命令。切换前先断开当前隧道；另一协议的监听和配置保留。首次检测或部署前，先通过可信渠道核对 VPS 的 SSH 指纹，再将对应密钥加入 `~/.ssh/known_hosts`；MiaoVPS 会拒绝未知或已变更的主机密钥。
+
+### 给第二台及后续设备配置 AWG
+
+```bash
+# 管理员在已有 AWG 节点上创建独立的 peer，并安全发送 laptop.conf
+miaovps add-device <server-id> "新笔记本" --output laptop.conf
+
+# 新设备导入并连接，不需要 VPS 的 SSH 凭据
+miaovps profile import laptop.conf
+sudo miaovps connect --full
+```
+
+`.conf` 包含私钥，只交给对应设备，不要在多台设备间共享。导入先验证握手，不改路由，也不覆盖现有配置。
 
 完整参数与安全边界请阅读 [CLI 指南](docs/CLI.md) 和
 [部署指南](docs/deployment.md)。

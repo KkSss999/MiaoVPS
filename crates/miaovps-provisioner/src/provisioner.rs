@@ -128,6 +128,7 @@ fn base64_encode(input: &[u8]) -> String {
 
 pub struct PortChange<'a> {
     pub wireguard: bool,
+    pub single_peer_only: bool,
     pub token: &'a str,
     pub old: u16,
     pub new: u16,
@@ -156,7 +157,7 @@ impl SshProvisioner {
         }
     }
 
-    /// Bring up the isolated, single-peer AmneziaWG trial. Only the peer's public key leaves the client.
+    /// Bring up the isolated AWG listener with its initial peer. Only the public key leaves the client.
     pub async fn deploy_awg_trial(
         &self,
         port: u16,
@@ -168,6 +169,24 @@ impl SshProvisioner {
             shell_quote(peer_public_key)
         );
         self.exec_root(&cmd, "deploy-awg").await
+    }
+
+    pub async fn add_awg_peer(&self, public_key: &str, name: &str) -> Result<String, AppError> {
+        let cmd = format!(
+            "python3 -X utf8 -c {} add {} {}",
+            shell_quote(include_str!("awg-peers.py")),
+            shell_quote(public_key),
+            shell_quote(name)
+        );
+        self.exec_root(&cmd, "add-awg-peer").await
+    }
+
+    pub async fn list_awg_peers(&self) -> Result<String, AppError> {
+        let cmd = format!(
+            "python3 -X utf8 -c {} list",
+            shell_quote(include_str!("awg-peers.py"))
+        );
+        self.exec_root(&cmd, "list-awg-peers").await
     }
 
     /// Query the live listener without returning private or preshared keys.
@@ -211,8 +230,9 @@ impl SshProvisioner {
             PortAction::Commit => "commit",
             PortAction::Abort => "abort",
         };
+        let single_peer_only = u8::from(change.single_peer_only);
         let cmd = format!(
-            "bash -c {} -- {action} {proto} {} {} {} {} {}",
+            "bash -c {} -- {action} {proto} {} {} {} {} {} {single_peer_only}",
             shell_quote(include_str!("switch-port.sh")),
             shell_quote(change.token),
             change.old,
@@ -927,6 +947,18 @@ mod tests {
             .arg(script)
             .status()
             .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn awg_enrollment_preserves_the_original_peer_and_retries_safely() {
+        assert!(std::process::Command::new("bash")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/test-awg-peers.sh"
+            ))
+            .status()
+            .expect("run AWG enrollment simulation")
             .success());
     }
 

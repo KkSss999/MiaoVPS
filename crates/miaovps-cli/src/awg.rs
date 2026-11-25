@@ -125,6 +125,152 @@ pub(super) fn stage_port(
     super::profile::stage_private(path, updated.as_bytes())
 }
 
+pub(super) async fn add_device(args: &[String]) -> Result<()> {
+    let [server, name, flag, output] = args else {
+        anyhow::bail!("用法: miaovps add-device <server-id> <name> --output <new.conf>");
+    };
+    ensure!(
+        flag == "--output" && !output.is_empty(),
+        "请用 --output 指定配置文件"
+    );
+    ensure!(
+        !name.trim().is_empty()
+            && name.chars().count() <= 100
+            && !name.chars().any(char::is_control)
+            && !name.contains(['\u{2028}', '\u{2029}']),
+        "设备名须为 1–100 个可见字符"
+    );
+    let output = Path::new(output);
+    ensure!(
+        output.extension().is_some_and(|ext| ext == "conf"),
+        "输出配置文件须以 .conf 结尾"
+    );
+    let file = output.file_name().context("输出必须是新文件路径")?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let output = parent
+        .canonicalize()
+        .context("输出目录不存在或无法访问")?
+        .join(file);
+    let profile_path = data_dir().canonicalize()?.join(PROFILE_FILE);
+    ensure!(
+        output != profile_path,
+        "请另选导出的配置文件，不要覆盖本机配置"
+    );
+    let svc = open_service().await?;
+    let _lock = svc.deployment_lock()?;
+    let id = resolve_server_id(&svc, server).await?;
+    let server = svc.db.get_server(&id).await?.context("节点不存在")?;
+    let ip: Ipv4Addr = server.host.parse().context("AWG 节点地址须为 IPv4")?;
+
+    // Keep the key beside the requested output so an interrupted SSH call can be retried.
+    let mut pending_path = output.as_os_str().to_os_string();
+    pending_path.push(".pending");
+    let pending_path = std::path::PathBuf::from(pending_path);
+    let keys = enrollment_key(&output, &pending_path, &id, name)?;
+    let ssh = open_provisioner(&server, &svc.cred_dir, None).await?;
+    let reply = ssh
+        .add_awg_peer(&keys.public_key, name)
+        .await
+        .context("添加 AWG 设备未完成；排除错误后用原命令重试，保留 .pending 文件")?;
+    let (port, config_reply) = reply.split_once('\n').context("缺少 AWG 端口")?;
+    let port: u16 = port.parse().context("AWG 端口无效")?;
+    let config = client_config(config_reply, keys.private_key, ip, port)?;
+    create_private(&output, &config)
+        .context("设备已注册但配置未保存；保留 .pending 文件，用原命令重试")?;
+    if let Err(error) = std::fs::remove_file(&pending_path) {
+        tracing::warn!(%error, "设备配置已生成，无法删除暂存密钥 {}", pending_path.display());
+    }
+    let _ = ssh.disconnect().await;
+    println!("✓ AWG 设备已添加，配置已保存至 {}。", output.display());
+    println!("  请通过可信渠道把配置交给这一台设备（包含私钥）。");
+    println!("  对方运行：miaovps profile import <device.conf>");
+    println!("  然后运行：sudo miaovps connect --full");
+    Ok(())
+}
+
+fn enrollment_key(
+    output: &Path,
+    pending: &Path,
+    server: &str,
+    name: &str,
+) -> Result<wg::WgKeyPair> {
+    ensure!(
+        output
+            .symlink_metadata()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "输出文件已存在或无法检查: {}",
+        output.display()
+    );
+    if pending.symlink_metadata().is_ok() {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(pending)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file() && metadata.mode() & 0o077 == 0 && metadata.nlink() == 1,
+            "暂存文件必须为私有普通文件: {}",
+            pending.display()
+        );
+        let mut text = String::new();
+        file.take(4096).read_to_string(&mut text)?;
+        let [old_server, old_name, private] = text.lines().collect::<Vec<_>>()[..] else {
+            anyhow::bail!("暂存文件无效: {}", pending.display());
+        };
+        ensure!(
+            old_server == server && old_name == name,
+            "暂存文件属于另一节点或设备；请用原命令重试，或另选输出路径"
+        );
+        return Ok(wg::WgKeyPair::from_private_key(private)?);
+    }
+    let keys = wg::generate_keypair();
+    create_private(
+        pending,
+        &format!("{server}\n{name}\n{}\n", keys.private_key),
+    )?;
+    Ok(keys)
+}
+
+pub(super) async fn import(source: &Path) -> Result<()> {
+    let dir = data_dir();
+    ensure!(
+        !miaovps_app::tunnel::TunnelState::load(&dir).occupies_tunnel(),
+        "请先断开当前隧道，再导入配置"
+    );
+    import_with_probe(source, &dir, |profile, framing, port| async move {
+        super::probe_listener(&profile, framing, port).await
+    })
+    .await
+}
+
+async fn import_with_probe<F, Fut>(source: &Path, dir: &Path, probe: F) -> Result<()>
+where
+    F: FnOnce(super::ConnectionProfile, miaovps_connect::awg::Framing, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let path = dir.join(PROFILE_FILE);
+    ensure!(
+        path.symlink_metadata()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "已有 AWG 配置 {}，不会覆盖；如需切换，请先断开并备份移走旧配置",
+        path.display()
+    );
+    let text = std::fs::read_to_string(source).context("无法读取要导入的 AWG 配置")?;
+    let (profile, framing) = parse(&text)?;
+    let port = profile.server_addr()?.port();
+    probe(profile, framing, port)
+        .await
+        .context("导入握手失败，未保存配置；请向管理员核对节点地址、UDP 端口和放行规则")?;
+    create_private(&path, &text)?;
+    println!("✓ AWG 配置已验证并导入。可以运行 sudo miaovps connect --full。");
+    Ok(())
+}
+
 pub(super) async fn list_device(args: &[String]) -> Result<()> {
     let [prefix] = args else {
         anyhow::bail!("用法: miaovps list-devices [--wg] <server-id>");
@@ -132,25 +278,16 @@ pub(super) async fn list_device(args: &[String]) -> Result<()> {
     let svc = open_service().await?;
     let id = resolve_server_id(&svc, prefix).await?;
     let server = svc.db.get_server(&id).await?.context("节点不存在")?;
-    let dir = data_dir();
-    if dir.join(PROFILE_FILE).try_exists()? {
-        let (profile, _) = load(&dir)?;
-        if profile.server_ip()? == server.host {
-            println!(
-                "AWG 本机设备: {}  {}/32",
-                profile.client_public_key, profile.client_ip
-            );
-            return Ok(());
-        }
-    }
-    println!("此节点没有已保存的本机 AWG 设备；请运行 miaovps deploy {prefix}");
+    let ssh = open_provisioner(&server, &svc.cred_dir, None).await?;
+    print!("{}", ssh.list_awg_peers().await?);
+    let _ = ssh.disconnect().await;
     Ok(())
 }
 
 pub(super) fn export(args: &[String]) -> Result<()> {
     ensure!(
         args.is_empty(),
-        "用法: miaovps export-config（AWG 单设备）或 export-config --wg <device-id>"
+        "用法: miaovps export-config（本机 AWG 配置）或 export-config --wg <device-id>"
     );
     let text = std::fs::read_to_string(data_dir().join(PROFILE_FILE))?;
     parse(&text)?;
@@ -207,7 +344,7 @@ pub(super) async fn deploy_trial(args: &[String]) -> Result<()> {
     let config = client_config(&reply, private, ip, port)?;
     create_private(Path::new(output), &config)?;
     println!(
-        "已生成 {output}（UDP {port}）。保存为数据目录下的 {PROFILE_FILE} 后，可运行 sudo miaovps connect；也可导入 AmneziaWG 客户端。"
+        "已生成 {output}（UDP {port}）。运行 miaovps profile import <device.conf> 导入，也可导入 AmneziaWG 客户端。"
     );
     Ok(())
 }
@@ -220,7 +357,7 @@ pub(super) fn load(
     let path = dir.join(PROFILE_FILE);
     let text = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "无法读取 AWG 配置 {}。请部署 AWG 并将配置保存到该路径，或用 connect --wg。",
+            "无法读取 AWG 配置 {}。请运行 miaovps profile import <device.conf>，或由管理员部署 AWG。原生 WireGuard 请加 --wg。",
             path.display()
         )
     })?;
@@ -250,36 +387,52 @@ pub(super) async fn check_target(
 }
 
 fn parse(text: &str) -> Result<(super::ConnectionProfile, miaovps_connect::awg::Framing)> {
-    let mut framing = std::collections::HashMap::new();
-    let mut in_interface = false;
-    for line in text.lines() {
-        let line = line.trim();
+    let mut fields = std::collections::HashMap::new();
+    let mut section = None;
+    for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line.starts_with('[') {
-            ensure!(
-                matches!(line, "[Interface]" | "[Peer]"),
-                "不支持的 AWG 配置段"
-            );
-            in_interface = line == "[Interface]";
-        } else if let Some((k, v)) = line.split_once('=') {
-            let key = k.trim().to_ascii_lowercase();
-            match (in_interface, key.as_str()) {
-                (true, "h1" | "h2" | "h3" | "h4" | "s1" | "s2" | "jc" | "jmin" | "jmax") => {
-                    ensure!(
-                        framing.insert(key, v.trim()).is_none(),
-                        "包含重复的 AWG 参数"
-                    );
-                }
-                (true, "address" | "privatekey" | "dns" | "mtu")
-                | (false, "publickey" | "endpoint" | "allowedips" | "persistentkeepalive") => {}
-                _ => anyhow::bail!("配置包含 MiaoVPS 不支持的字段"),
-            }
+            section = Some(match (section, line) {
+                (None, "[Interface]") => true,
+                (Some(true), "[Peer]") => false,
+                _ => anyhow::bail!("AWG 配置必须依次包含一个 [Interface] 和一个 [Peer]"),
+            });
+            continue;
         }
+        let interface = section.context("AWG 配置缺少 [Interface]")?;
+        let (k, v) = line.split_once('=').context("AWG 配置行缺少等号")?;
+        let key = k.trim().to_ascii_lowercase();
+        let value = v.trim();
+        ensure!(
+            matches!(
+                (interface, key.as_str()),
+                (
+                    true,
+                    "h1" | "h2"
+                        | "h3"
+                        | "h4"
+                        | "s1"
+                        | "s2"
+                        | "jc"
+                        | "jmin"
+                        | "jmax"
+                        | "address"
+                        | "privatekey"
+                        | "dns"
+                        | "mtu"
+                ) | (
+                    false,
+                    "publickey" | "endpoint" | "allowedips" | "persistentkeepalive"
+                )
+            ),
+            "配置包含 MiaoVPS 不支持的字段"
+        );
+        ensure!(fields.insert(key, value).is_none(), "AWG 配置包含重复字段");
     }
     let value = |key: &str| {
-        framing
+        fields
             .get(key)
             .copied()
             .with_context(|| format!("缺少 AWG 参数 {key}"))
@@ -298,45 +451,61 @@ fn parse(text: &str) -> Result<(super::ConnectionProfile, miaovps_connect::awg::
             value("jmax")?.parse()?,
         ],
     )?;
-    let config = wg::parse_config(text)?;
-    let iface = config.interface.context("缺少 AWG [Interface]")?;
-    let [peer] = config.peers.as_slice() else {
-        anyhow::bail!("AWG 配置必须仅有一个 peer")
-    };
-    let client_private_key = iface.private_key.context("缺少 AWG 客户端私钥")?;
+    ensure!(section == Some(false), "缺少 AWG [Peer]");
+    if let Some(allowed) = fields.get("allowedips") {
+        ensure!(
+            allowed.split(',').any(|net| net.trim() == "0.0.0.0/0"),
+            "MiaoVPS AWG 配置须允许全部 IPv4，使用 connect --full 决定是否接管公网流量"
+        );
+    }
+    if let Some(keepalive) = fields.get("persistentkeepalive") {
+        keepalive.parse::<u16>().context("AWG 保活间隔无效")?;
+    }
+    let client_private_key = value("privatekey")?.to_owned();
     let client_public_key =
         super::derive_public_key(&decode_key(&client_private_key, "AWG 客户端私钥")?);
-    let address: Ipv4Addr = iface
-        .address
-        .as_deref()
-        .and_then(|s| s.strip_suffix("/32"))
+    let address: Ipv4Addr = value("address")?
+        .strip_suffix("/32")
         .context("AWG 客户端地址必须是 /32")?
         .parse()?;
     let mut gateway = address.octets();
+    // The first peer keeps its original /30. Extra peers use the same .1 gateway and the /24 pool.
+    let expanded = gateway[3] != 2;
     ensure!(
-        address.is_private() && gateway[3] == 2,
-        "AWG 客户端地址不符合 MiaoVPS /30 配置"
+        address.is_private() && (gateway[3] == 2 || (4..=254).contains(&gateway[3])),
+        "AWG 客户端地址不符合 MiaoVPS 地址分配规则"
     );
     gateway[3] = 1;
+    let dns: Vec<String> = fields.get("dns").map_or_else(Vec::new, |value| {
+        value.split(',').map(|s| s.trim().to_owned()).collect()
+    });
     ensure!(
-        iface
-            .dns
-            .iter()
-            .all(|dns| dns.parse::<std::net::IpAddr>().is_ok()),
+        dns.iter()
+            .all(|address| address.parse::<std::net::IpAddr>().is_ok()),
         "AWG DNS 地址无效"
     );
-    let mtu = iface.mtu.unwrap_or(1380);
+    let mtu: u16 = fields
+        .get("mtu")
+        .copied()
+        .unwrap_or("1380")
+        .parse()
+        .context("AWG MTU 无效")?;
     ensure!((576..=1420).contains(&mtu), "AWG MTU 必须为 576–1420");
     let profile = super::ConnectionProfile {
         client_private_key,
         client_public_key,
         client_ip: address.to_string(),
         peer_ip: Ipv4Addr::from(gateway).to_string(),
-        netmask: "255.255.255.252".into(),
+        netmask: if expanded {
+            "255.255.255.0"
+        } else {
+            "255.255.255.252"
+        }
+        .into(),
         mtu,
-        dns: iface.dns,
-        server_public_key: peer.public_key.clone().context("缺少 AWG 服务端公钥")?,
-        server_endpoint: peer.endpoint.clone().context("缺少 AWG 端点")?,
+        dns,
+        server_public_key: value("publickey")?.to_owned(),
+        server_endpoint: value("endpoint")?.to_owned(),
     };
     ensure!(
         profile.server_addr()?.is_ipv4() && profile.server_addr()?.port() != 0,
@@ -386,13 +555,90 @@ fn client_config(reply: &str, private_key: String, ip: Ipv4Addr, port: u16) -> R
 mod tests {
     use super::*;
 
+    fn reply(public: &str, address: &str) -> String {
+        format!(
+            "{public}\n{address}/32\nH1 = 120\nH2 = 240\nH3 = 360\nH4 = 480\nS1 = 20\nS2 = 24\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn import_saves_only_after_handshake_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let keys = wg::generate_keypair();
+        let text = client_config(
+            &reply(&keys.public_key, "172.29.67.4"),
+            keys.private_key,
+            Ipv4Addr::LOCALHOST,
+            52181,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("miaovps-awg-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("new-device.conf");
+        let path = dir.join(PROFILE_FILE);
+        std::fs::write(&source, text.replace("S1 = 20", "PostUp = true\nS1 = 20")).unwrap();
+        assert!(import_with_probe(&source, &dir, |_, _, _| async {
+            panic!("invalid config must not probe")
+        })
+        .await
+        .is_err());
+        std::fs::write(&source, &text).unwrap();
+        assert!(import_with_probe(&source, &dir, |_, _, _| async {
+            anyhow::bail!("handshake failed")
+        })
+        .await
+        .is_err());
+        assert!(!path.exists());
+        import_with_probe(&source, &dir, |profile, _, port| async move {
+            assert_eq!(profile.client_ip, "172.29.67.4");
+            assert_eq!(profile.peer_ip, "172.29.67.1");
+            assert_eq!(profile.netmask, "255.255.255.0");
+            assert_eq!(port, 52181);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(import_with_probe(&source, &dir, |_, _, _| async {
+            panic!("existing profile must not probe")
+        })
+        .await
+        .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(!dir.join("miaovps.db").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enrollment_reuses_only_the_matching_pending_key() {
+        let dir = std::env::temp_dir().join(format!("miaovps-awg-enroll-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let output = dir.join("new.conf");
+        let pending = dir.join("new.conf.pending");
+        let key = enrollment_key(&output, &pending, "node-id", "new device")
+            .unwrap()
+            .public_key;
+        assert_eq!(
+            enrollment_key(&output, &pending, "node-id", "new device")
+                .unwrap()
+                .public_key,
+            key
+        );
+        assert!(enrollment_key(&output, &pending, "other-node", "new device").is_err());
+        assert!(enrollment_key(&output, &pending, "node-id", "other device").is_err());
+        std::os::unix::fs::symlink("missing", &output).unwrap();
+        assert!(enrollment_key(&output, &pending, "node-id", "new device").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn staging_an_awg_port_does_not_touch_the_current_profile_until_install() {
         let keys = wg::generate_keypair();
-        let reply = format!(
-            "{}\n172.29.67.2/32\nH1 = 120\nH2 = 240\nH3 = 360\nH4 = 480\nS1 = 20\nS2 = 24\n",
-            keys.public_key
-        );
+        let reply = reply(&keys.public_key, "172.29.67.2");
         let text = client_config(&reply, keys.private_key, Ipv4Addr::LOCALHOST, 52181).unwrap();
         let dir = std::env::temp_dir().join(format!("miaovps-awg-port-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
@@ -418,10 +664,7 @@ mod tests {
     #[test]
     fn export_keeps_matching_interface_framing_and_rejects_script_injection() {
         let keys = wg::generate_keypair();
-        let reply = format!(
-            "{}\n172.29.67.2/32\nH1 = 120\nH2 = 240\nH3 = 360\nH4 = 480\nS1 = 20\nS2 = 24\n",
-            keys.public_key
-        );
+        let reply = reply(&keys.public_key, "172.29.67.2");
         let export =
             |r: &str| client_config(r, keys.private_key.clone(), Ipv4Addr::LOCALHOST, 52181);
         let config = export(&reply).unwrap();

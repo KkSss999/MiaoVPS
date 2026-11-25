@@ -28,7 +28,7 @@ miaovps validate
 sudo miaovps connect --full
 ```
 
-`deploy` creates one AWG peer, checks a real handshake from your device and
+`deploy` creates the initial AWG peer, checks a real handshake from your device and
 saves `~/.miaovps/miao-awg-trial.conf`. It does not need `wg0` and does not
 modify it. If verification fails, fix firewall access and retry the same
 command; the client key is retained for the retry. The default port is 52181.
@@ -57,7 +57,7 @@ This creates a separate `miao-awg` interface, server key, framing parameters and
 
 Stop the current tunnel before `connect`. No external client is required; you may also import the private `.conf` into an AmneziaWG app, but do not connect both clients using the same peer key at once. `sudo awg show miao-awg` on the VPS shows handshakes and transfer counters. Full tunnel provides IPv4 internet access only.
 
-One device per AWG listener. Retry with the same arguments and a **new output filename** to re-export without rotating keys. To roll back to WG, stop AWG locally and reconnect using `sudo miaovps connect --wg --full`; to remove the AWG listener, run `sudo systemctl disable --now awg-quick@miao-awg` on the VPS. This leaves the protected AWG config, packages and repository installed.
+Retry with the same arguments and a **new output filename** to re-export the initial peer without rotating keys. For a different device, use `add-device` below instead. To roll back to WG, stop AWG locally and reconnect using `sudo miaovps connect --wg --full`; to remove the AWG listener, run `sudo systemctl disable --now awg-quick@miao-awg` on the VPS. This leaves the protected AWG config, packages and repository installed.
 
 ## Firewall rules
 
@@ -82,20 +82,43 @@ The candidate replaces the current listen port temporarily. A successful
 client handshake commits the change. Otherwise the old listener is restored,
 with a server-side timer as a fallback if SSH is lost. Other devices on that
 interface can be interrupted during the test. Keys, peers and the other
-protocol's listener are unchanged. Only run the command for your chosen protocol.
+protocol's listener are unchanged. Automatic port changes are disabled on shared
+AWG listeners. Before a manual change, coordinate with all devices; afterwards
+clients can use `connect --full --port <new-port>` as a temporary override.
 
 ## Multiple devices
 
-AWG deployments currently hold one peer each. Native WireGuard (all commands
-below use `--wg`) supports multiple devices per interface. One WireGuard
-interface has one server listen port; all its devices use that port with
-distinct public keys and VPN addresses:
+On a machine with SSH administration access to the deployed AWG node:
 
-```text
-Device A: random local UDP port -> VPS:443  (unique key, 10.66.66.2/32)
-Device B: random local UDP port -> VPS:443  (unique key, 10.66.66.3/32)
+```bash
+miaovps add-device <server-id> "Alice's laptop" --output alice.conf
+miaovps list-devices <server-id>
 ```
 
+Send `alice.conf` securely to that device only. It contains the new device's
+private key, not the VPS SSH credential. On the new machine, as the regular
+user (not root), run:
+
+```bash
+miaovps profile import alice.conf
+sudo miaovps connect --full
+```
+
+Import verifies a real handshake before saving a `0600` local profile. It
+requires no SSH, changes no routes and will not overwrite an existing profile.
+If replacing a profile, stop the tunnel and move the old file to a private
+backup before importing. Use a unique file for each device; never share a peer
+key across devices. MiaoVPS currently keeps one active AWG profile per local user.
+
+The existing `/30`, gateway and first peer stay unchanged. Extra peers use
+individual `/32` routes and share the same listener. If the surrounding `/24`
+already overlaps another VPS route, enrollment stops without changing the
+existing network. If interrupted, keep the private `.pending` file beside the
+output and rerun the same command to resume that peer rather than allocate another.
+
+### Native WireGuard
+
+Native WireGuard also supports multiple devices on one interface and port.
 Create one peer per physical device:
 
 ```bash

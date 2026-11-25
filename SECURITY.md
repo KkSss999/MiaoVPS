@@ -25,5 +25,8 @@ Changes to a server listen port interrupt every peer on that interface until the
 use the new port. Test on non-critical infrastructure first, keep provider-console
 access to the VPS, and review the deployment and rollback guidance before use.
 
-Never commit VPS credentials, WireGuard private keys, exported `.conf` files,
-real infrastructure addresses, or local MiaoVPS data directories.
+Never commit VPS credentials, VPN private keys, exported `.conf` files,
+private `.conf.pending` files, real infrastructure addresses, or local MiaoVPS
+data directories. Deliver newly enrolled AWG profiles only to their intended
+device over a trusted channel. Once imported, remove any transfer copies you
+no longer need.

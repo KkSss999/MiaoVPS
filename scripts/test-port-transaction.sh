@@ -16,7 +16,7 @@ set -eu
 case $1:$3 in
     show:public-key) cat "$work/public" ;;
     show:listen-port) cat "$work/live" ;;
-    show:peers) printf '%s\n' 'test-peer' ;;
+    show:peers) printf '%s\n' 'test-peer'; if [[ -e $work/shared ]]; then printf '%s\n' 'second-peer'; fi ;;
     set:listen-port) printf '%s\n' "$4" > "$work/live" ;;
     *) exit 1 ;;
 esac
@@ -47,8 +47,18 @@ for proto in awg wg; do
     cp "$conf" "$work/before"
     printf '12518\n' > "$work/live"
     token=0123456789abcdef0123456789abcdef
-    change() { bash "$work/switch.sh" "$1" "$proto" "$token" 12518 12519 'wg test key' test-peer; }
-    reject() { if change "$1" > "$work/error" 2>&1; then echo "unexpected success: $1" >&2; exit 1; fi; }
+    change() { bash "$work/switch.sh" "$1" "$proto" "$token" 12518 12519 'wg test key' test-peer "${2:-0}"; }
+    reject() { if change "$@" > "$work/error" 2>&1; then echo "unexpected success: $*" >&2; exit 1; fi; }
+    if [[ $proto == awg ]]; then
+        touch "$work/shared"; reject prepare 1; rm "$work/shared"
+        printf '\n[Peer]\nPublicKey = second-peer\n' >> "$conf"
+        reject prepare 1
+        cmp "$work/live" <(printf '12518\n')
+        cp "$work/before" "$conf"
+        change prepare 1
+        change abort
+        bash "$(<"$work/timer")"
+    fi
     touch "$work/occupied"; reject prepare; rm "$work/occupied"
     touch "$work/timer-blocked"; reject prepare; rm "$work/timer-blocked"
     [[ $(<"$work/live") == 12518 ]]

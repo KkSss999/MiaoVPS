@@ -18,16 +18,17 @@ miaovps CLI / compatible clients
 ```
 
 The control and data planes are independent. SSH is used for administration;
-VPN traffic is never tunneled through SSH. Client private keys are generated and
-stored on the client, while the VPS receives peer public keys. SSH host keys are
-checked against `~/.ssh/known_hosts`; an unknown or changed key aborts the
+VPN traffic is never tunneled through SSH. The VPS receives only peer public keys.
+When an administrator enrolls another device, its private key is generated on
+the administrator's machine and delivered to that device in its private profile.
+SSH host keys are checked against `~/.ssh/known_hosts`; an unknown or changed key aborts the
 connection before credentials are sent.
 
 Protocols use separate server listeners and local profiles:
 
 | Protocol | Server interface | Local profile | Peer model |
 | --- | --- | --- | --- |
-| AmneziaWG (default) | `miao-awg` | `miao-awg-trial.conf` | One device per deployment |
+| AmneziaWG (default) | `miao-awg` | `miao-awg-trial.conf` | Multiple peers; one imported profile per local user |
 | WireGuard (`--wg`) | `wg0` | `profile.json` | Multiple registered devices |
 
 `deploy` installs the default AWG listener; `deploy --wg` installs native
@@ -50,9 +51,9 @@ WireGuard. Neither path silently replaces the other.
 
 ## Connection safety boundary
 
-Connection setup verifies the SSH host key, validates UDP reachability and an
-authenticated handshake for the selected protocol, then creates the tunnel and
-applies routes in sequence. A critical validation failure does not switch
+Administrative SSH verifies the host key. Tunnel setup (including profile-only
+clients with no SSH account) validates UDP reachability and an authenticated
+handshake for the selected protocol, then creates the tunnel and applies routes. A critical validation failure does not switch
 global routes. Port changes bind the candidate listener first and commit only
 after the client completes a handshake; otherwise the old port is restored.
 

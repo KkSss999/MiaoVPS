@@ -55,11 +55,11 @@ by MiaoVPS.
 
 ## Choose the protocol
 
-`deploy`, `connect`, `validate`, `status`, `list-devices`, `profile show` and
-`export-config` default to AmneziaWG. Use `--wg` explicitly for WireGuard;
-peer-management commands `add-device` and `profile init` are WireGuard-only and
-require `--wg`. `deploy` saves one local AWG profile at `~/.miaovps/miao-awg-trial.conf` (or under
-`MIAOVPS_DATA_DIR`). Use `miaovps validate` to verify it without changing routes.
+`deploy`, `add-device`, `connect`, `validate`, `status`, `list-devices`,
+`profile show` and `export-config` default to AmneziaWG. Use `--wg` explicitly
+for WireGuard; `profile init` is WireGuard-only and requires `--wg`.
+`deploy` and `profile import` save one local AWG profile at
+`~/.miaovps/miao-awg-trial.conf` (or under `MIAOVPS_DATA_DIR`). Use `miaovps validate` to verify it without changing routes.
 A missing or invalid profile never causes a fallback to WireGuard.
 
 Use `sudo miaovps connect --wg --full` to use your existing WireGuard profile,
@@ -68,6 +68,14 @@ connection before switching protocols. Omit `--full` to route only the private
 VPN subnet. For AWG, normally omit server/device: `deploy` saves one profile and
 registers no device entry. Explicit server/device with AWG only works when the
 profile was produced by `deploy-awg` for an already registered WG peer.
+
+## Set up another AWG device
+
+The administrator runs `miaovps add-device <server-id> "New laptop" --output laptop.conf`
+and sends the private file securely to the new device. The recipient runs
+`miaovps profile import laptop.conf` and `sudo miaovps connect --full`.
+Import checks a real handshake but needs no server record, SSH credentials or
+root. See [Multiple devices](deployment.md#multiple-devices) for details.
 
 ## Continuous diagnostics
 
@@ -130,11 +138,13 @@ candidate UDP port in both firewalls in advance. Recovery tries at most one
 new port per outage; if that does not restore the tunnel, it stops rather than
 cycling through ports.
 
-Profile-only recovery needs an unambiguous local SSH node. Ctrl+C, SIGTERM and
-daemon stop requests stop recovery. Listeners are shared: every peer on the same
-interface may be interrupted during the test and must use the new port after a
-successful change. AWG and WG listeners stay independent. Full tunnel recovery
-can temporarily route traffic directly; it is not a kill switch.
+Automatic port migration needs an unambiguous local SSH node and is disabled
+for shared AWG listeners. Recipients without SSH should contact the administrator
+if reconnecting fails. Ctrl+C, SIGTERM and daemon stop requests stop recovery.
+Every peer on a shared interface may be interrupted during a manual port test
+and must use the new port after a successful change. AWG and WG listeners stay
+independent. Full tunnel recovery can temporarily route traffic directly;
+it is not a kill switch.
 
 ## Command reference
 
@@ -145,12 +155,13 @@ can temporarily route traffic directly; it is not a kill switch.
 | `inspect` | Run read-only deployment prerequisite checks |
 | `deploy` / `deploy --wg` | Deploy AWG (default) or native WG, or verify a port change |
 | `deploy-awg <server-id> <wg-device-id> <udp-port> <new.conf>` | Optionally reuse an existing WG peer key for a [separate AWG deployment](deployment.md#reuse-an-existing-wireguard-peer-optional) |
-| `add-device --wg` | Register a native WG peer (AWG `deploy` creates the sole peer) |
-| `list-devices [--wg]` | List AWG's saved local peer, or native WG devices |
+| `add-device <server-id> <name> --output <new.conf>` / `add-device --wg` | Register an AWG peer and save its private config, or register a native WG peer |
+| `list-devices [--wg]` | List the VPS's AWG peers over SSH, or list registered native WG devices |
 | `status [--wg]` | Read remote AWG or native WG status |
 | `export-config` / `export-config --wg <device-id>` | Export the local AWG profile or a registered WG peer |
 | `generate-keypair` | Generate a keypair usable with either protocol |
 | `validate` / `validate --wg` | Validate the saved AWG or WG profile without changing routes |
+| `profile import <device.conf>` | Verify and save an AWG profile without SSH or route changes |
 | `profile show [--wg]` / `profile --wg init` | Inspect the selected profile or create a native WG profile manually |
 | `connect` / `disconnect` | Start or stop the local tunnel |
 

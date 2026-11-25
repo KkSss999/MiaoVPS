@@ -2,7 +2,7 @@
 # Two-phase port change: runtime only until the client authenticates on the new port.
 set -euo pipefail
 umask 077
-mode=$1 proto=$2 token=$3 old=$4 new=$5 public=$6 peer=$7
+mode=$1 proto=$2 token=$3 old=$4 new=$5 public=$6 peer=$7 single_peer_only=${8:-0}
 case $proto in
     wg) iface=wg0; conf=/etc/wireguard/wg0.conf ;;
     awg) iface=miao-awg; conf=/etc/amnezia/amneziawg/miao-awg.conf ;;
@@ -35,7 +35,11 @@ case $mode in
         [[ ! -e $pending ]] || fail 'Port trial already in progress'
         [[ -f $conf && ! -L $conf && $("$proto" show "$iface" public-key) == "$public" ]] || fail 'VPN interface, public key or configuration mismatch'
         [[ $("$proto" show "$iface" listen-port) == "$old" ]] || fail 'Current server port differs; check status and pass the actual port'
-        "$proto" show "$iface" peers | grep -Fxq -- "$peer" || fail 'Client is not registered on this interface'
+        peers=$("$proto" show "$iface" peers)
+        grep -Fxq -- "$peer" <<< "$peers" || fail 'Client is not registered on this interface'
+        if [[ $single_peer_only == 1 ]]; then
+            [[ $proto == awg && $peers == "$peer" && $(grep -c '^\[Peer\]$' "$conf") == 1 ]] || fail 'Shared AWG listener: automatic port migration is disabled; contact the administrator'
+        fi
         [[ $(config_port "$conf") =~ ^[1-9][0-9]{0,4}$ && $(config_port "$conf") != "$new" ]] || fail 'Disk port is missing or already equals the candidate'
         ! grep -Eiq '^[[:space:]]*SaveConfig[[:space:]]*=[[:space:]]*true' "$conf" || fail 'SaveConfig is incompatible with port trials'
         sockets=$(ss -H -uan "sport = :$new") || fail 'Could not check candidate UDP port'

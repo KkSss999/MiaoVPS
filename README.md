@@ -67,6 +67,8 @@ sudo miaovps disconnect
 
 [AmneziaWG](docs/deployment.md#deploy) is the default. Use `deploy --wg` and `connect --wg` for native WireGuard. Stop the active connection before switching. Before `inspect` or `deploy`, independently verify the VPS SSH host key and add it to your `~/.ssh/known_hosts`.
 
+Already have an AWG node? The admin runs `miaovps add-device <server-id> "New laptop" --output laptop.conf` and shares the file securely with that device. The recipient only needs `miaovps profile import laptop.conf` and `sudo miaovps connect --full`—no VPS credentials. See [Multiple devices](docs/deployment.md#multiple-devices).
+
 Run `miaovps <command> --help` and read the [CLI guide](docs/CLI.md) before
 using MiaoVPS on important infrastructure.
 
@@ -75,7 +77,7 @@ using MiaoVPS on important infrastructure.
 | Area | Capabilities |
 | --- | --- |
 | VPS lifecycle | Local server records, environment inspection, verified SSH deployment and port migration |
-| Device lifecycle | One AWG peer per deployment; native WG keypairs, peer registration, allocation, listing, configuration export |
+| Device lifecycle | Multiple peers per AWG or WG listener; private AWG profile export and import |
 | Connection | Preflight validation, split tunnel, IPv4 full tunnel, daemon mode, disconnect cleanup |
 | Resilience | Endpoint rebinding, handshake monitoring, reconnect backoff, route and DNS restoration |
 | Security | OS credential storage, log masking, client-side private keys, no hosted control plane |
