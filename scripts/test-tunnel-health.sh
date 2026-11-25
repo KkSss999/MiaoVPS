@@ -14,7 +14,7 @@ DEFAULT_VPS="203.0.113.10"
 TEST_BYTES=33554432
 PING_COUNT=10
 SAMPLES=6
-GITHUB_URL="https://github.com/KkSss999/pmem/archive/refs/heads/main.tar.gz"
+GITHUB_URL="https://github.com/KkSss999/MiaoVPS/archive/refs/heads/main.tar.gz"
 VPS_IP=""
 
 usage() {
