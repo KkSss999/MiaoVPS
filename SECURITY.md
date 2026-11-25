@@ -18,8 +18,11 @@ disclosure.
 
 ## Operator responsibility
 
-MiaoVPS modifies remote WireGuard configuration and may modify local routes and
-DNS settings. Test on non-critical infrastructure first, keep provider-console
+MiaoVPS modifies remote AmneziaWG or WireGuard configuration and may modify
+local routes and DNS settings. It refuses unknown or changed SSH host keys, so
+verify the VPS fingerprint through a trusted channel before the first connection.
+Changes to a server listen port interrupt every peer on that interface until they
+use the new port. Test on non-critical infrastructure first, keep provider-console
 access to the VPS, and review the deployment and rollback guidance before use.
 
 Never commit VPS credentials, WireGuard private keys, exported `.conf` files,

@@ -7,7 +7,36 @@ use crate::credentials::{CredError, ServerCredential};
 use miaovps_core::{Server, SshAuthType};
 use miaovps_provisioner::{AppError, ErrorCode, SshProvisioner};
 use miaovps_ssh::{SshAuthMethod, SshConnectionConfig, SshError, SshSession};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn ssh_home(cred_dir: &Path) -> Result<PathBuf, ServiceError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        let uid = std::fs::metadata(cred_dir)
+            .map_err(|e| ServiceError::other(format!("无法读取凭据目录: {e}")))?
+            .uid();
+        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buf = vec![0; 16384];
+        // Resolve the credentials owner's home even in sudo/GUI daemon sessions.
+        unsafe {
+            if libc::getpwuid_r(
+                uid,
+                record.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            ) == 0
+                && !result.is_null()
+            {
+                let home = std::ffi::CStr::from_ptr((*result).pw_dir);
+                return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())));
+            }
+        }
+    }
+    Err(ServiceError::other("无法确定 SSH 凭据所有者的主目录"))
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  ServiceError — 统一应用层错误
@@ -90,14 +119,17 @@ impl serde::Serialize for ServiceError {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 从 Server 记录和凭据目录构建 SSH 连接配置
-fn build_config(server: &Server, cred: &ServerCredential) -> SshConnectionConfig {
+fn build_config(server: &Server, cred: &ServerCredential, home: &Path) -> SshConnectionConfig {
     let auth = match cred {
         ServerCredential::Password { password } => SshAuthMethod::Password(password.clone()),
         ServerCredential::PrivateKey {
             key_path,
             passphrase,
         } => SshAuthMethod::PrivateKey {
-            key_path: key_path.clone(),
+            key_path: key_path.strip_prefix("~/").map_or_else(
+                || key_path.clone(),
+                |path| home.join(path).to_string_lossy().into_owned(),
+            ),
             passphrase: passphrase.clone(),
         },
     };
@@ -106,6 +138,7 @@ fn build_config(server: &Server, cred: &ServerCredential) -> SshConnectionConfig
         port: server.ssh_port,
         username: server.ssh_user.clone(),
         auth,
+        known_hosts: home.join(".ssh/known_hosts"),
     }
 }
 
@@ -116,7 +149,7 @@ pub async fn open_provisioner(
     sudo_password: Option<&str>,
 ) -> Result<SshProvisioner, ServiceError> {
     let cred = ServerCredential::load(cred_dir, &server.id)?;
-    let config = build_config(server, &cred);
+    let config = build_config(server, &cred, &ssh_home(cred_dir)?);
     let session = SshSession::connect(&config).await?;
 
     let privilege = SshProvisioner::detect_privilege(&session, sudo_password)

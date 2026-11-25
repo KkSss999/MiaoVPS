@@ -21,9 +21,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use boringtun::noise::errors::WireGuardError;
-use boringtun::noise::{Tunn, TunnResult};
-use x25519_dalek::{PublicKey, StaticSecret};
+use awgtun::noise::errors::WireGuardError;
+use awgtun::noise::{Tunn, TunnResult};
+#[cfg(test)]
+use awgtun::x25519::{PublicKey, StaticSecret};
+
+use crate::awg::{outgoing, Framing};
 
 use crate::error::ConnectError;
 use crate::tun::{TunInterface, TunReader, TunWriter};
@@ -298,9 +301,25 @@ impl NativeTunnel {
         server_addr: SocketAddr,
         keepalive_secs: u16,
     ) -> Result<Self, ConnectError> {
-        let sk: StaticSecret = private_key.into();
-        let pk: PublicKey = server_public_key.into();
-        let tunn = Tunn::new(sk, pk, None, Some(keepalive_secs), 0, None);
+        Self::start_with_framing(
+            tun,
+            private_key,
+            server_public_key,
+            server_addr,
+            keepalive_secs,
+            Framing::default(),
+        )
+    }
+
+    pub fn start_with_framing(
+        tun: TunInterface,
+        private_key: [u8; 32],
+        server_public_key: [u8; 32],
+        server_addr: SocketAddr,
+        keepalive_secs: u16,
+        framing: Framing,
+    ) -> Result<Self, ConnectError> {
+        let tunn = framing.tunnel(private_key, server_public_key, Some(keepalive_secs));
 
         let udp = Arc::new(Endpoint::new(server_addr)?);
 
@@ -321,6 +340,7 @@ impl NativeTunnel {
                 udp.clone(),
                 running.clone(),
                 stats.clone(),
+                framing,
             )?,
             spawn_inbound(
                 tun_tx,
@@ -329,6 +349,7 @@ impl NativeTunnel {
                 running.clone(),
                 stats.clone(),
                 started_at,
+                framing,
             )?,
             spawn_timer(
                 tunn,
@@ -459,7 +480,7 @@ impl Drop for NativeTunnel {
 /// 发送握手 Initiation（force_resend 跳过「已在握手中」检查）
 fn send_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) {
     let mut buf = [0u8; HANDSHAKE_BUF];
-    let packet = {
+    let packets = {
         let mut t = match tunn.lock() {
             Ok(t) => t,
             Err(e) => {
@@ -467,18 +488,15 @@ fn send_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) {
                 return;
             }
         };
-        match t.format_handshake_initiation(&mut buf[..], true) {
-            TunnResult::WriteToNetwork(p) => Some(p.to_vec()),
-            TunnResult::Err(e) => {
-                tracing::error!("[隧道] 握手初始化失败: {e:?}");
-                None
-            }
-            _ => None,
+        let result = t.format_handshake_initiation(&mut buf, true);
+        if let TunnResult::Err(e) = &result {
+            tracing::error!("[隧道] 握手初始化失败: {e:?}");
         }
+        outgoing(&mut t, result)
     };
-    if let Some(p) = packet {
+    for p in packets {
         match udp.send(&p) {
-            Ok(_) => tracing::info!("[隧道] 握手 Initiation 已发送"),
+            Ok(_) => tracing::debug!("[隧道] 握手数据报已发送"),
             Err(e) => tracing::error!("[隧道] 握手发送失败: {e}"),
         }
     }
@@ -491,6 +509,7 @@ fn spawn_outbound(
     udp: Arc<Endpoint>,
     running: Arc<AtomicBool>,
     stats: Arc<TunnelStats>,
+    framing: Framing,
 ) -> Result<JoinHandle<()>, ConnectError> {
     thread::Builder::new()
         .name("miaovps-tx".into())
@@ -533,23 +552,23 @@ fn spawn_outbound(
                         Ok(t) => t,
                         Err(_) => break,
                     };
-                    match t.encapsulate(&ip_packet, &mut encrypted[..]) {
-                        TunnResult::WriteToNetwork(p) => Some(p.to_vec()),
-                        TunnResult::Err(e) => {
-                            tracing::warn!("[隧道] 加密错误: {e:?}");
-                            None
-                        }
-                        // 握手未完成时包会被缓存，返回 Done
-                        _ => None,
+                    let result = t.encapsulate(&ip_packet, &mut encrypted);
+                    if let TunnResult::Err(e) = &result {
+                        tracing::warn!("[隧道] 加密错误: {e:?}");
                     }
+                    outgoing(&mut t, result)
                 };
 
-                if let Some(p) = outbound {
+                let count = outbound.len();
+                for (i, p) in outbound.into_iter().enumerate() {
                     match udp.send(&p) {
                         Ok(_) => {
-                            stats
-                                .tx_bytes
-                                .fetch_add(network_plaintext_len(&p), Ordering::Relaxed);
+                            if i + 1 == count {
+                                stats.tx_bytes.fetch_add(
+                                    network_plaintext_len(framing, &p),
+                                    Ordering::Relaxed,
+                                );
+                            }
                             dropped_since_log = 0;
                         }
                         Err(e) => {
@@ -588,6 +607,7 @@ fn spawn_inbound(
     running: Arc<AtomicBool>,
     stats: Arc<TunnelStats>,
     started_at: Instant,
+    framing: Framing,
 ) -> Result<JoinHandle<()>, ConnectError> {
     thread::Builder::new()
         .name("miaovps-rx".into())
@@ -632,14 +652,20 @@ fn spawn_inbound(
                         Err(_) => break,
                     };
                     let result = t.decapsulate(None, &udp_buf[..n], &mut decrypted[..]);
-                    record_link_progress(&stats, started_at.elapsed(), &udp_buf[..n], &result);
+                    record_link_progress(
+                        framing,
+                        &stats,
+                        started_at.elapsed(),
+                        &udp_buf[..n],
+                        &result,
+                    );
                     match result {
                         TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
                             to_tun = Some(p.to_vec());
                         }
                         TunnResult::Done => {}
-                        TunnResult::WriteToNetwork(p) => {
-                            to_net.push(p.to_vec());
+                        TunnResult::WriteToNetwork(_) => {
+                            to_net = outgoing(&mut t, result);
                             drain_queued_packets(&mut t, &mut to_net);
                         }
                         TunnResult::Err(e) => {
@@ -664,7 +690,7 @@ fn spawn_inbound(
                         Ok(_) => {
                             stats
                                 .tx_bytes
-                                .fetch_add(network_plaintext_len(p), Ordering::Relaxed);
+                                .fetch_add(network_plaintext_len(framing, p), Ordering::Relaxed);
                         }
                         Err(e) => {
                             stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
@@ -688,8 +714,8 @@ fn spawn_inbound(
 
 /// WireGuard transport data has a 16-byte header and a 16-byte authentication tag.
 /// Handshake packets carry no tunnel plaintext.
-fn network_plaintext_len(packet: &[u8]) -> u64 {
-    if packet.starts_with(&4u32.to_le_bytes()) {
+fn network_plaintext_len(framing: Framing, packet: &[u8]) -> u64 {
+    if framing.packet_type(packet) == 4 {
         packet.len().saturating_sub(32) as u64
     } else {
         0
@@ -702,7 +728,10 @@ fn drain_queued_packets(tunn: &mut Tunn, packets: &mut Vec<Vec<u8>>) {
     let mut buf = [0u8; PKT_BUF];
     loop {
         match tunn.decapsulate(None, &[], &mut buf) {
-            TunnResult::WriteToNetwork(p) => packets.push(p.to_vec()),
+            TunnResult::WriteToNetwork(p) => {
+                let result = TunnResult::WriteToNetwork(p);
+                packets.extend(outgoing(tunn, result));
+            }
             TunnResult::Err(e) => {
                 tracing::warn!("[隧道] 积压队列处理失败: {e:?}");
                 break;
@@ -718,38 +747,36 @@ fn drain_queued_packets(tunn: &mut Tunn, packets: &mut Vec<Vec<u8>>) {
 /// Only completed protocol progress proves both directions. A verified request
 /// proves the peer can reach us, but not that it received/accepted our response.
 fn record_link_progress(
+    framing: Framing,
     stats: &TunnelStats,
     elapsed: Duration,
     packet: &[u8],
     result: &TunnResult<'_>,
 ) {
-    let confirmed = match (packet.get(..4), result) {
+    let kind = framing.packet_type(packet);
+    let confirmed = match (kind, result) {
         (
-            Some([4, 0, 0, 0]),
+            4,
             TunnResult::Done | TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..),
         ) => true,
-        (Some([2, 0, 0, 0]), TunnResult::WriteToNetwork(reply)) => {
-            reply.starts_with(&4u32.to_le_bytes())
-        }
+        (2, TunnResult::WriteToNetwork(reply)) => framing.packet_type(reply) == 4,
         _ => false,
     };
     if confirmed {
         stats
             .last_authenticated_ms
             .store((elapsed.as_millis() as u64).max(1), Ordering::Relaxed);
-    } else if let (Some([1, 0, 0, 0]), TunnResult::WriteToNetwork(reply)) =
-        (packet.get(..4), result)
+    } else if kind == 1
+        && matches!(result, TunnResult::WriteToNetwork(reply) if framing.packet_type(reply) == 2)
     {
-        if reply.starts_with(&2u32.to_le_bytes()) {
-            let n = stats
-                .peer_handshake_requests
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            tracing::debug!(
-                requests = n,
-                "[隧道] 已回应对端握手，等待双向确认（不刷新链路健康）"
-            );
-        }
+        let n = stats
+            .peer_handshake_requests
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        tracing::debug!(
+            requests = n,
+            "[隧道] 已回应对端握手，等待双向确认（不刷新链路健康）"
+        );
     }
 }
 
@@ -806,7 +833,7 @@ fn should_count_decrypt_error(elapsed: Duration) -> bool {
 
 /// Rate-limit warnings without treating persistent session rejection as normal rekey.
 fn log_decrypt_error(
-    err: &boringtun::noise::errors::WireGuardError,
+    err: &WireGuardError,
     total: u64,
     started_at: Instant,
     last_log: &mut Option<Instant>,
@@ -872,8 +899,9 @@ fn spawn_timer(
                         Err(_) => break,
                     };
 
-                    match t.update_timers(&mut buf[..]) {
-                        TunnResult::WriteToNetwork(p) => TimerOutcome::Send(p.to_vec()),
+                    let result = t.update_timers(&mut buf);
+                    match result {
+                        TunnResult::WriteToNetwork(_) => TimerOutcome::Send(outgoing(&mut t, result)),
                         TunnResult::Err(WireGuardError::ConnectionExpired) => TimerOutcome::Expired,
                         TunnResult::Err(e) => TimerOutcome::OtherError(format!("{e:?}")),
                         _ => TimerOutcome::Idle,
@@ -920,15 +948,16 @@ fn spawn_timer(
                 }
 
                 match outcome {
-                    TimerOutcome::Send(p) => {
+                    TimerOutcome::Send(packets) => {
                         // Only authenticated recovery resets backoff, not an unanswered send.
                         if alive {
                             backoff = RECONNECT_BACKOFF_MIN;
                             next_revive = None;
                         }
-                        if let Err(e) = udp.send_with_rebind(&p) {
-                            // 断网期间这条每 250ms 会触发一次，降为 debug
-                            tracing::debug!("[隧道] 保活/握手发送失败: {e}");
+                        for p in packets {
+                            if let Err(e) = udp.send_with_rebind(&p) {
+                                tracing::debug!("[隧道] 保活/握手发送失败: {e}");
+                            }
                         }
                     }
                     TimerOutcome::Idle => {
@@ -983,18 +1012,15 @@ fn probe_link(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) {
         return;
     }
     let mut buf = [0u8; HANDSHAKE_BUF];
-    let packet = {
+    let packets = {
         let Ok(mut t) = tunn.lock() else { return };
-        match t.format_handshake_initiation(&mut buf, false) {
-            TunnResult::WriteToNetwork(p) => Some(p.to_vec()),
-            TunnResult::Err(e) => {
-                tracing::debug!("[隧道] 链路探测失败: {e:?}");
-                None
-            }
-            _ => None,
+        let result = t.format_handshake_initiation(&mut buf, false);
+        if let TunnResult::Err(e) = &result {
+            tracing::debug!("[隧道] 链路探测失败: {e:?}");
         }
+        outgoing(&mut t, result)
     };
-    if let Some(p) = packet {
+    for p in packets {
         tracing::debug!("[隧道] 双向确认静默，发起链路探测");
         if let Err(e) = udp.send(&p) {
             tracing::debug!("[隧道] 链路探测发送失败: {e}");
@@ -1012,7 +1038,7 @@ fn next_backoff(current: Duration) -> Duration {
 /// 计时器一次 tick 的结果
 enum TimerOutcome {
     /// 有包要发
-    Send(Vec<u8>),
+    Send(Vec<Vec<u8>>),
     /// 无事可做
     Idle,
     /// boringtun 已放弃握手，需要复活
@@ -1036,7 +1062,7 @@ fn revive_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) -> bool {
     }
 
     let mut buf = [0u8; HANDSHAKE_BUF];
-    let packet = {
+    let packets = {
         let mut t = match tunn.lock() {
             Ok(t) => t,
             Err(e) => {
@@ -1044,24 +1070,20 @@ fn revive_handshake(tunn: &Arc<Mutex<Tunn>>, udp: &Arc<Endpoint>) -> bool {
                 return false;
             }
         };
-        match t.format_handshake_initiation(&mut buf[..], true) {
-            TunnResult::WriteToNetwork(p) => p.to_vec(),
-            TunnResult::Err(e) => {
-                tracing::warn!("[隧道] 复活握手构造失败: {e:?}");
-                return false;
-            }
-            _ => return false,
+        let result = t.format_handshake_initiation(&mut buf, true);
+        if !matches!(result, TunnResult::WriteToNetwork(_)) {
+            tracing::debug!("[隧道] 复活握手未生成: {result:?}");
+            return false;
         }
+        outgoing(&mut t, result)
     };
-
-    match udp.send(&packet) {
-        Ok(_) => true,
-        Err(e) => {
-            // 网络不可用时 send 会失败（如 Wi-Fi 断开），属预期，等下次退避重试
+    for packet in packets {
+        if let Err(e) = udp.send(&packet) {
             tracing::debug!("[隧道] 复活握手发送失败（网络不可用?）: {e}");
-            false
+            return false;
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -1255,6 +1277,46 @@ mod tests {
     }
 
     #[test]
+    fn awg_recovery_resends_framed_handshake_and_restores_authenticated_progress() {
+        let framing = Framing::amnezia([101, 202, 303, 404], [24, 40], [2, 48, 80]).unwrap();
+        let a = StaticSecret::from([1u8; 32]);
+        let b = StaticSecret::from([2u8; 32]);
+        let client = framing.tunnel(a.to_bytes(), PublicKey::from(&b).to_bytes(), None);
+        let mut server = framing.tunnel(b.to_bytes(), PublicKey::from(&a).to_bytes(), None);
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let udp = Arc::new(Endpoint::new(listener.local_addr().unwrap()).unwrap());
+        let client = Arc::new(Mutex::new(client));
+        assert!(revive_handshake(&client, &udp));
+        let mut buf = [0u8; PKT_BUF];
+        for _ in 0..2 {
+            assert!((48..=80).contains(&listener.recv(&mut buf).unwrap()));
+        }
+        let n = listener.recv(&mut buf).unwrap();
+        assert_eq!(n, 148 + 24);
+        assert_eq!(framing.packet_type(&buf[..n]), 1);
+        let mut out = [0u8; PKT_BUF];
+        let response = network_packet(server.decapsulate(None, &buf[..n], &mut out));
+        let stats = TunnelStats::default();
+        let mut client = client.lock().unwrap();
+        let result = client.decapsulate(None, &response, &mut out);
+        record_link_progress(framing, &stats, Duration::from_secs(10), &response, &result);
+        assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 10_000);
+        let confirm = network_packet(result);
+        assert!(matches!(
+            server.decapsulate(None, &confirm, &mut out),
+            TunnResult::Done
+        ));
+        let data = network_packet(server.encapsulate(&ipv4_packet(), &mut out));
+        let result = client.decapsulate(None, &data, &mut out);
+        record_link_progress(framing, &stats, Duration::from_secs(11), &data, &result);
+        assert!(matches!(result, TunnResult::WriteToTunnelV4(..)));
+        assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 11_000);
+    }
+
+    #[test]
     fn old_inflight_data_survives_rekey() {
         let (mut a, mut b) = paired_tunnels();
         handshake(&mut a, &mut b);
@@ -1314,7 +1376,13 @@ mod tests {
         let mut buf = [0u8; PKT_BUF];
         let data = network_packet(server.encapsulate(&ipv4_packet(), &mut buf));
         let result = client.decapsulate(None, &data, &mut buf);
-        record_link_progress(&stats, Duration::from_secs(1), &data, &result);
+        record_link_progress(
+            Framing::default(),
+            &stats,
+            Duration::from_secs(1),
+            &data,
+            &result,
+        );
         assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 1000);
 
         let mut schedule = LinkProbeSchedule::default();
@@ -1325,7 +1393,7 @@ mod tests {
             let result = client.decapsulate(None, &request, &mut buf);
             assert!(matches!(result, TunnResult::WriteToNetwork(_)));
             // Intentionally discard the response, matching the stalled confirmation path.
-            record_link_progress(&stats, elapsed, &request, &result);
+            record_link_progress(Framing::default(), &stats, elapsed, &request, &result);
             let confirmed = stats.last_authenticated_ms.load(Ordering::Relaxed);
             assert_eq!(confirmed, 1000, "peer requests must not refresh health");
             if schedule.due(elapsed, confirmed, false) {
@@ -1344,7 +1412,13 @@ mod tests {
             rejected,
             TunnResult::Err(WireGuardError::WrongIndex)
         ));
-        record_link_progress(&stats, Duration::from_secs(44), &old, &rejected);
+        record_link_progress(
+            Framing::default(),
+            &stats,
+            Duration::from_secs(44),
+            &old,
+            &rejected,
+        );
         assert!(!link_is_fresh(
             client.stats().0.is_some(),
             Duration::from_secs(46),
@@ -1368,7 +1442,13 @@ mod tests {
         let response = network_packet(server.decapsulate(None, &request, &mut buf));
         let mut client = tunn.lock().unwrap();
         let result = client.decapsulate(None, &response, &mut buf);
-        record_link_progress(&stats, Duration::from_secs(62), &response, &result);
+        record_link_progress(
+            Framing::default(),
+            &stats,
+            Duration::from_secs(62),
+            &response,
+            &result,
+        );
         let confirmation = network_packet(result);
         assert!(matches!(
             server.decapsulate(None, &confirmation, &mut buf),
@@ -1382,27 +1462,37 @@ mod tests {
         let data = network_packet(server.encapsulate(&ipv4_packet(), &mut buf));
         let result = client.decapsulate(None, &data, &mut buf);
         assert!(matches!(result, TunnResult::WriteToTunnelV4(..)));
-        record_link_progress(&stats, Duration::from_secs(63), &data, &result);
+        record_link_progress(
+            Framing::default(),
+            &stats,
+            Duration::from_secs(63),
+            &data,
+            &result,
+        );
         assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 63_000);
     }
 
     #[test]
     fn cookies_invalid_data_and_queued_output_do_not_confirm_link() {
         let stats = TunnelStats::default();
+        let mut transport_header = [0; 32];
+        transport_header[0] = 4;
         record_link_progress(
+            Framing::default(),
             &stats,
             Duration::from_secs(30),
             &[3, 0, 0, 0],
             &TunnResult::Done,
         );
         record_link_progress(
+            Framing::default(),
             &stats,
             Duration::from_secs(30),
-            &[4, 0, 0, 0],
+            &transport_header,
             &TunnResult::Err(WireGuardError::WrongIndex),
         );
-        let mut transport_header = [4, 0, 0, 0];
         record_link_progress(
+            Framing::default(),
             &stats,
             Duration::from_secs(30),
             &[],
@@ -1411,9 +1501,10 @@ mod tests {
         assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 0);
         // An authenticated empty transport packet (keepalive) is sufficient even when idle.
         record_link_progress(
+            Framing::default(),
             &stats,
             Duration::from_secs(31),
-            &[4, 0, 0, 0],
+            &transport_header,
             &TunnResult::Done,
         );
         assert_eq!(stats.last_authenticated_ms.load(Ordering::Relaxed), 31_000);

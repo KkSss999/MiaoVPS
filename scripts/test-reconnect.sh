@@ -66,7 +66,7 @@ echo "[1/4] 确认隧道当前连通..."
 if ping -c 2 -W 3000 "$PEER_IP" >/dev/null 2>&1; then
     echo "      ✅ ping $PEER_IP 通"
 else
-    echo "      ❌ ping $PEER_IP 不通 — 隧道未运行？先启动 sudo miaovps connect"
+    echo "      ❌ ping $PEER_IP 不通 — 隧道未运行？先启动 sudo miaovps connect --wg"
     exit 1
 fi
 

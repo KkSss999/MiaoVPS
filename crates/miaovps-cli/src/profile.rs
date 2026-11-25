@@ -13,7 +13,51 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::os::unix::{
+    fs::{MetadataExt, OpenOptionsExt},
+    io::AsRawFd,
+};
 use std::path::{Path, PathBuf};
+
+// Stage on the same filesystem so a failed write never destroys the active profile.
+pub(crate) struct StagedPrivate(PathBuf);
+impl StagedPrivate {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+    pub fn install(self, path: &Path) -> Result<()> {
+        std::fs::rename(&self.0, path).with_context(|| format!("无法安装 {}", path.display()))
+    }
+}
+impl Drop for StagedPrivate {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+pub(crate) fn stage_private(path: &Path, bytes: &[u8]) -> Result<StagedPrivate> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let owner = std::fs::metadata(parent)?;
+    let temp = parent.join(format!(".miaovps-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    let staged = StagedPrivate(temp);
+    if unsafe { libc::geteuid() } == 0
+        && unsafe { libc::fchown(file.as_raw_fd(), owner.uid(), owner.gid()) } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(staged)
+}
 
 /// 与服务端 provisioner 默认值一致
 const DEFAULT_MTU: u16 = 1380;
@@ -64,7 +108,7 @@ impl ConnectionProfile {
         let raw = std::fs::read_to_string(&path).with_context(|| {
             format!(
                 "未找到连接配置 {}\n\
-                 先运行: miaovps profile init <server-ip:port> <客户端私钥> <服务器公钥>",
+                 先运行: miaovps profile --wg init <server-ip:port> <客户端私钥> <服务器公钥>",
                 path.display()
             )
         })?;
@@ -78,18 +122,13 @@ impl ConnectionProfile {
     pub fn save(&self, data_dir: &Path) -> Result<PathBuf> {
         self.validate()?;
         let path = Self::path(data_dir);
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json).with_context(|| format!("无法写入 {}", path.display()))?;
-
-        // 私钥文件必须限制权限
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("无法设置 {} 权限", path.display()))?;
-        }
-
+        self.stage(data_dir)?.install(&path)?;
         Ok(path)
+    }
+
+    pub(crate) fn stage(&self, data_dir: &Path) -> Result<StagedPrivate> {
+        self.validate()?;
+        stage_private(&Self::path(data_dir), &serde_json::to_vec_pretty(self)?)
     }
 
     /// 校验字段可用性 — 早失败，避免带着坏配置去创建 TUN

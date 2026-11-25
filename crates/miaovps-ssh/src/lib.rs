@@ -26,6 +26,7 @@ pub struct SshConnectionConfig {
     pub port: u16,
     pub username: String,
     pub auth: SshAuthMethod,
+    pub known_hosts: std::path::PathBuf,
 }
 
 impl Default for SshConnectionConfig {
@@ -35,6 +36,7 @@ impl Default for SshConnectionConfig {
             port: 22,
             username: "root".into(),
             auth: SshAuthMethod::Password(String::new()),
+            known_hosts: expand_tilde("~/.ssh/known_hosts"),
         }
     }
 }
@@ -50,10 +52,10 @@ pub struct HostKeyInfo {
 }
 
 /// 从 russh_keys PublicKey 提取指纹
-pub fn host_key_info(_key: &russh_keys::key::PublicKey) -> HostKeyInfo {
+pub fn host_key_info(key: &russh_keys::key::PublicKey) -> HostKeyInfo {
     HostKeyInfo {
-        key_type: "RSA/ED25519".into(),
-        fingerprint_sha256: "fingerprint_placeholder".into(),
+        key_type: key.name().into(),
+        fingerprint_sha256: format!("SHA256:{}", key.fingerprint()),
     }
 }
 
@@ -61,20 +63,25 @@ pub fn host_key_info(_key: &russh_keys::key::PublicKey) -> HostKeyInfo {
 //  SSH 客户端 Handler
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-struct ClientHandler;
+struct ClientHandler {
+    trusted: Vec<russh_keys::key::PublicKey>,
+}
+
+impl ClientHandler {
+    fn matches(&self, key: &russh_keys::key::PublicKey) -> bool {
+        self.trusted.iter().any(|trusted| trusted == key)
+    }
+}
 
 #[async_trait::async_trait]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    /// 服务端 Host Key 验证
-    /// 首次连接由上层 UI 确认后写入 known-hosts
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh_keys::key::PublicKey,
+        server_public_key: &russh_keys::key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // TODO: 与本地 known-hosts 对比，首次提示用户确认
-        Ok(true)
+        Ok(self.matches(server_public_key))
     }
 }
 
@@ -131,11 +138,60 @@ impl SshSession {
     }
 
     async fn open(config: &SshConnectionConfig) -> Result<client::Handle<ClientHandler>, SshError> {
-        let addr = format!("{}:{}", config.host, config.port);
-        let ssh_config = Arc::new(client::Config::default());
-        client::connect(ssh_config, &addr, ClientHandler)
-            .await
-            .map_err(SshError::ConnectionFailed)
+        let host_key_error = || {
+            SshError::HostKey(format!(
+                "{}:{} 的主机密钥缺失或不匹配。请独立核对 VPS 指纹，再更新 {}",
+                config.host,
+                config.port,
+                config.known_hosts.display()
+            ))
+        };
+        let trusted: Vec<_> =
+            russh_keys::known_host_keys_path(&config.host, config.port, &config.known_hosts)
+                .map_err(|_| host_key_error())?
+                .into_iter()
+                .map(|(_, key)| key)
+                .collect();
+        if trusted.is_empty() {
+            return Err(host_key_error());
+        }
+        let mut ssh_config = client::Config {
+            inactivity_timeout: Some(std::time::Duration::from_secs(120)),
+            ..Default::default()
+        };
+        let algorithms: Vec<_> = ssh_config
+            .preferred
+            .key
+            .iter()
+            .copied()
+            .filter(|alg| {
+                trusted.iter().any(|key| match key {
+                    russh_keys::key::PublicKey::RSA { .. } => {
+                        matches!(alg.0, "rsa-sha2-256" | "rsa-sha2-512")
+                    }
+                    _ => key.name() == alg.0,
+                })
+            })
+            .collect();
+        if algorithms.is_empty() {
+            return Err(host_key_error());
+        }
+        ssh_config.preferred.key = algorithms.into();
+        let ssh_config = Arc::new(ssh_config);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client::connect(
+                ssh_config,
+                (config.host.as_str(), config.port),
+                ClientHandler { trusted },
+            ),
+        )
+        .await
+        .map_err(|_| SshError::TimedOut)?
+        .map_err(|err| match err {
+            russh::Error::UnknownKey => host_key_error(),
+            err => SshError::ConnectionFailed(err),
+        })
     }
 
     /// 建立 SSH 连接（密码认证）
@@ -301,8 +357,45 @@ fn truncate_cmd(cmd: &str) -> String {
 //  错误
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russh::client::Handler;
+
+    #[tokio::test]
+    async fn refuses_unknown_hosts_and_changed_keys() {
+        use russh_keys::key::KeyPair;
+        let key = || {
+            KeyPair::generate_ed25519()
+                .unwrap()
+                .clone_public_key()
+                .unwrap()
+        };
+        let known = key();
+        let mut handler = ClientHandler {
+            trusted: vec![known.clone()],
+        };
+        assert!(handler.check_server_key(&known).await.unwrap());
+        assert!(!handler.check_server_key(&key()).await.unwrap());
+        let config = SshConnectionConfig {
+            host: "127.0.0.1".into(),
+            known_hosts: std::env::temp_dir()
+                .join(format!("miaovps-no-hosts-{}", std::process::id())),
+            ..Default::default()
+        };
+        assert!(matches!(
+            SshSession::open(&config).await,
+            Err(SshError::HostKey(_))
+        ));
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
+    #[error("SSH 主机校验失败: {0}")]
+    HostKey(String),
+    #[error("SSH 连接超时")]
+    TimedOut,
     #[error("SSH 连接失败: {0}")]
     ConnectionFailed(#[from] russh::Error),
 

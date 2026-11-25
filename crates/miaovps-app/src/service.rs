@@ -67,6 +67,7 @@ impl AppService {
         info!(server_id=%server_id, "开始环境检测: {}", server.name);
         let mut provisioner = open_provisioner_any(&server, &self.cred_dir).await?;
         let report = provisioner.inspect().await?;
+        let _ = provisioner.disconnect().await;
 
         // 持久化检测结果到 Server
         //
@@ -90,7 +91,13 @@ impl AppService {
         updated.status = if report.blocked {
             ServerStatus::ConfigBroken
         } else if report.all_passed {
-            ServerStatus::Added
+            if self.db.get_wg_node(&server_id).await?.is_some()
+                || server.status == ServerStatus::Online
+            {
+                ServerStatus::Online
+            } else {
+                ServerStatus::Added
+            }
         } else {
             ServerStatus::NeedsAttention
         };
@@ -99,6 +106,48 @@ impl AppService {
 
         info!(server_id=%server_id, passed=%report.all_passed, "检测完成");
         Ok(report)
+    }
+
+    pub fn deployment_lock(&self) -> Result<std::fs::File, ServiceError> {
+        let other = |e| ServiceError::other(format!("无法获取部署锁: {e}"));
+        let path = self.cred_dir.join(".deployment.lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        // The file holds no data; read access lets the owner lock it after a sudo recovery.
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match options.clone().write(true).create_new(true).open(&path) {
+                    Ok(file) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            file.set_permissions(std::fs::Permissions::from_mode(0o644))
+                                .map_err(other)?;
+                        }
+                        file
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        options.open(&path).map_err(other)?
+                    }
+                    Err(e) => return Err(other(e)),
+                }
+            }
+            Err(e) => return Err(other(e)),
+        };
+        if !file.metadata().map_err(other)?.is_file() {
+            return Err(ServiceError::other("部署锁不是普通文件"));
+        }
+        file.try_lock()
+            .map_err(|e| ServiceError::other(format!("已有部署或换口进行中，或无法锁定: {e}")))?;
+        Ok(file)
     }
 
     /// Tauri IPC: #[tauri::command] async fn deploy_server(...)
@@ -112,6 +161,7 @@ impl AppService {
         options: Option<DeploymentOptions>,
         events: Option<StepSender>,
     ) -> Result<DeploymentProgress, ServiceError> {
+        let _lock = self.deployment_lock()?;
         let server = self
             .db
             .get_server(&server_id)
@@ -126,12 +176,12 @@ impl AppService {
         }
 
         info!(server_id=%server_id, "开始部署: {}", server.name);
-        self.db
-            .update_server_status(&server_id, &ServerStatus::Deploying)
-            .await?;
-
         let opts = options.unwrap_or_default();
         let mut provisioner = open_provisioner(&server, &self.cred_dir, None).await?;
+        // Once mutation begins, interruption leaves a retryable status, not a stale running flag.
+        self.db
+            .update_server_status(&server_id, &ServerStatus::Incomplete)
+            .await?;
         let mut progress = provisioner.deploy_reporting(&opts, events).await?;
         // 部署完成后显式关闭 russh 会话。仅丢弃 Handle 可能让后台连接任务
         // 继续存活，CLI 会表现为部署成功但进程不自动退出。
@@ -160,7 +210,7 @@ impl AppService {
                 .await?;
         } else {
             self.db
-                .update_server_status(&server_id, &ServerStatus::ConfigBroken)
+                .update_server_status(&server_id, &ServerStatus::Incomplete)
                 .await?;
         }
 
@@ -179,6 +229,21 @@ impl AppService {
 
         let mut provisioner = open_provisioner_any(&server, &self.cred_dir).await?;
         let status = provisioner.get_status().await?;
+        if server.status == ServerStatus::Deploying && status.contains("interface: wg0") {
+            if let Ok(_lock) = self.deployment_lock() {
+                if let Some(mut node) = self.db.get_wg_node(&server_id).await? {
+                    let (key, port) = provisioner.listener(true).await?;
+                    if key == node.server_public_key {
+                        node.listen_port = port;
+                        self.db.upsert_wg_node(&node).await?;
+                        self.db
+                            .update_server_status(&server_id, &ServerStatus::Online)
+                            .await?;
+                    }
+                }
+            }
+        }
+        let _ = provisioner.disconnect().await;
         Ok(status)
     }
 
@@ -320,7 +385,7 @@ impl AppService {
         }
 
         let mut provisioner = open_provisioner_any(&server, &self.cred_dir).await?;
-        let peer_stats = parse_wg_dump(&provisioner.get_status_dump().await?);
+        let peer_stats = parse_peer_stats(&provisioner.get_peer_stats().await?);
 
         let mut refreshed = 0usize;
         for device in &devices {
@@ -349,26 +414,22 @@ struct PeerRuntime {
     tx_bytes: u64,
 }
 
-/// 解析 `wg show wg0 dump`。
-///
-/// 第一行是接口信息；每个 peer 行的字段固定为：公钥、预共享密钥、endpoint、
-/// allowed-ips、最近握手、rx、tx、keepalive。格式损坏的行宁可忽略，不能让
-/// 单个异常 peer 阻断整个设备列表。
-fn parse_wg_dump(dump: &str) -> HashMap<String, PeerRuntime> {
-    dump.lines()
-        .skip(1)
+/// Rows contain only peer public key, last handshake, RX and TX counters.
+fn parse_peer_stats(raw: &str) -> HashMap<String, PeerRuntime> {
+    raw.lines()
         .filter_map(|line| {
-            let fields: Vec<_> = line.split('\t').collect();
-            if fields.len() != 8 || fields[0].is_empty() {
+            let mut fields = line.split('\t');
+            let key = fields.next().filter(|key| !key.is_empty())?;
+            let last = fields.next()?.parse::<i64>().ok()?;
+            let rx_bytes = fields.next()?.parse::<u64>().ok()?;
+            let tx_bytes = fields.next()?.parse::<u64>().ok()?;
+            if fields.next().is_some() {
                 return None;
             }
-            let latest_handshake = fields[4].parse::<i64>().ok()?;
-            let rx_bytes = fields[5].parse::<u64>().ok()?;
-            let tx_bytes = fields[6].parse::<u64>().ok()?;
             Some((
-                fields[0].to_string(),
+                key.to_string(),
                 PeerRuntime {
-                    latest_handshake_at: (latest_handshake > 0).then_some(latest_handshake),
+                    latest_handshake_at: (last > 0).then_some(last),
                     rx_bytes,
                     tx_bytes,
                 },
@@ -437,6 +498,19 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn deployment_lock_releases_when_operation_is_cancelled() {
+        let dir = std::env::temp_dir().join(format!("miaovps-deploy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svc = AppService::new(Database::open_in_memory().await.unwrap(), dir.clone());
+        let lock = svc.deployment_lock().unwrap();
+        assert!(svc.deployment_lock().is_err());
+        drop(lock);
+        let again = svc.deployment_lock();
+        assert!(again.is_ok(), "{:?}", again.err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn first_device_gets_dot_two() {
         let addr = allocate_vpn_address("10.66.66.0/24", &[]).unwrap();
@@ -498,15 +572,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_wireguard_dump_with_handshake_and_counters() {
+    fn parses_peer_stats_with_handshake_and_counters() {
         let dump = concat!(
-            "server-private\tserver-public\t51820\toff\n",
-            "peer-a\t(none)\t203.0.113.1:51820\t10.66.66.2/32\t1785495944\t1449785\t1068600\t25\n",
-            "peer-b\t(none)\t(none)\t10.66.66.3/32\t0\t0\t0\t0\n",
+            "peer-a\t1785495944\t1449785\t1068600\n",
+            "peer-b\t0\t0\t0\n",
             "malformed\tline\n",
         );
 
-        let peers = parse_wg_dump(dump);
+        let peers = parse_peer_stats(dump);
         assert_eq!(peers.len(), 2);
         assert_eq!(
             peers.get("peer-a"),

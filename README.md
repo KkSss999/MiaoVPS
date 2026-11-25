@@ -18,7 +18,7 @@ not sell public nodes, require an account, or depend on a hosted control plane.
   server, peer configuration, and network path.
 - **Local-first by design.** Server metadata stays in local SQLite storage;
   credentials and private keys use the operating system credential store.
-- **One operational workflow.** Inspect, deploy, add devices, validate, connect,
+- **One operational workflow.** Inspect, deploy, manage peers, validate, connect,
   observe, and disconnect from one CLI.
 - **Fail closed.** MiaoVPS validates reachability and the WireGuard handshake
   before taking over routes. Failed validation does not switch global traffic.
@@ -53,19 +53,19 @@ cargo install --path crates/miaovps-cli
 miaovps add-server "my-vps" 203.0.113.10 22 ubuntu --key ~/.ssh/id_ed25519
 miaovps inspect <server-id>
 
-# Deploy WireGuard and add a device.
-miaovps deploy <server-id> --port 443
-miaovps add-device <server-id> "my-mac" mac
+# Allow UDP 52181 in the VPS and cloud firewalls first. Deploy AWG and save this machine's profile.
+miaovps deploy <server-id> --port 52181
 
 # Split tunnel: route only the private VPN network.
-sudo miaovps connect <server-id> --device <device-id>
-
+sudo miaovps connect
 # Full tunnel: route IPv4 through the VPS and block public IPv6 bypass.
-sudo miaovps connect <server-id> --device <device-id> --full
+sudo miaovps connect --full
 
 # Restore MiaoVPS-owned routes and DNS state.
 sudo miaovps disconnect
 ```
+
+[AmneziaWG](docs/deployment.md#deploy) is the default. Use `deploy --wg` and `connect --wg` for native WireGuard. Stop the active connection before switching. Before `inspect` or `deploy`, independently verify the VPS SSH host key and add it to your `~/.ssh/known_hosts`.
 
 Run `miaovps <command> --help` and read the [CLI guide](docs/CLI.md) before
 using MiaoVPS on important infrastructure.
@@ -74,8 +74,8 @@ using MiaoVPS on important infrastructure.
 
 | Area | Capabilities |
 | --- | --- |
-| VPS lifecycle | Local server records, environment inspection, SSH deployment, WireGuard port migration |
-| Device lifecycle | Per-device keypairs, peer registration, allocation, listing, configuration export |
+| VPS lifecycle | Local server records, environment inspection, verified SSH deployment and port migration |
+| Device lifecycle | One AWG peer per deployment; native WG keypairs, peer registration, allocation, listing, configuration export |
 | Connection | Preflight validation, split tunnel, IPv4 full tunnel, daemon mode, disconnect cleanup |
 | Resilience | Endpoint rebinding, handshake monitoring, reconnect backoff, route and DNS restoration |
 | Security | OS credential storage, log masking, client-side private keys, no hosted control plane |

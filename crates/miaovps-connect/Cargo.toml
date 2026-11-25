@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-boringtun.workspace = true
+awgtun.workspace = true
 tun = "0.6"
 libc = "0.2"
 tokio.workspace = true

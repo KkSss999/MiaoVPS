@@ -12,7 +12,10 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::tunnel::WireGuardHandshaker;
+use crate::{
+    awg::Framing,
+    tunnel::{HandshakeError, WireGuardHandshaker},
+};
 
 /// 验证结果
 #[derive(Debug, Clone)]
@@ -21,6 +24,8 @@ pub struct ValidationResult {
     pub success: bool,
     pub detail: String,
     pub duration_ms: u64,
+    /// All authenticated handshake attempts timed out, not a local UDP/config error.
+    pub timed_out: bool,
 }
 
 /// 连接验证器 — 分步测试链路
@@ -28,6 +33,8 @@ pub struct ConnectionValidator {
     server_addr: SocketAddr,
     client_private_key: [u8; 32],
     server_public_key: [u8; 32],
+    framing: Framing,
+    protocol: &'static str,
 }
 
 impl ConnectionValidator {
@@ -40,7 +47,15 @@ impl ConnectionValidator {
             server_addr,
             client_private_key,
             server_public_key,
+            framing: Framing::default(),
+            protocol: "WireGuard",
         }
+    }
+
+    pub fn with_amnezia(mut self, framing: Framing) -> Self {
+        self.framing = framing;
+        self.protocol = "AmneziaWG";
+        self
     }
 
     /// 执行全部验证步骤，返回结果列表
@@ -55,10 +70,11 @@ impl ConnectionValidator {
             results.push(self.check_wireguard_handshake().await);
         } else {
             results.push(ValidationResult {
-                step: "WireGuard 握手".into(),
+                step: format!("{} 握手", self.protocol),
                 success: false,
                 detail: "跳过 — UDP 不可达".into(),
                 duration_ms: 0,
+                timed_out: false,
             });
         }
 
@@ -84,6 +100,7 @@ impl ConnectionValidator {
                     success: false,
                     detail: format!("无法绑定本地 UDP 端口: {e}"),
                     duration_ms: start.elapsed().as_millis() as u64,
+                    timed_out: false,
                 };
             }
         };
@@ -97,6 +114,7 @@ impl ConnectionValidator {
                     self.server_addr
                 ),
                 duration_ms: start.elapsed().as_millis() as u64,
+                timed_out: false,
             };
         }
 
@@ -107,6 +125,7 @@ impl ConnectionValidator {
                 success: false,
                 detail: format!("UDP 发送失败: {e}"),
                 duration_ms: start.elapsed().as_millis() as u64,
+                timed_out: false,
             };
         }
 
@@ -121,13 +140,14 @@ impl ConnectionValidator {
             success: true,
             detail: format!("出站路径就绪 {local} → {}", self.server_addr),
             duration_ms: start.elapsed().as_millis() as u64,
+            timed_out: false,
         }
     }
 
     /// WireGuard 握手测试
     async fn check_wireguard_handshake(&self) -> ValidationResult {
         let start = std::time::Instant::now();
-        let step = "WireGuard 握手";
+        let step = format!("{} 握手", self.protocol);
 
         debug!("[验证] {} — 发起握手...", step);
 
@@ -136,10 +156,12 @@ impl ConnectionValidator {
             self.client_private_key,
             self.server_public_key,
             self.server_addr,
-        );
+        )
+        .with_framing(self.framing);
 
         const MAX_RETRIES: u32 = 3;
         let mut last_error = String::new();
+        let mut all_timed_out = true;
 
         for attempt in 1..=MAX_RETRIES {
             // 外层超时留出余量，让内层的具体错误信息能返回
@@ -147,15 +169,17 @@ impl ConnectionValidator {
                 Ok(Ok(())) => {
                     info!("[验证] ✅ {} — 成功 (第 {attempt} 次尝试)", step);
                     return ValidationResult {
-                        step: step.into(),
+                        step: step.clone(),
                         success: true,
                         detail: format!("握手成功 ({attempt}/{MAX_RETRIES} 次尝试)"),
                         duration_ms: start.elapsed().as_millis() as u64,
+                        timed_out: false,
                     };
                 }
                 Ok(Err(e)) => {
                     warn!("[验证] {step} — 第 {attempt} 次失败: {e}");
-                    last_error = e;
+                    all_timed_out &= matches!(e, HandshakeError::Timeout(_));
+                    last_error = e.to_string();
                 }
                 Err(_) => {
                     warn!("[验证] {step} — 第 {attempt} 次整体超时");
@@ -172,9 +196,10 @@ impl ConnectionValidator {
             step: step.into(),
             success: false,
             detail: format!(
-                "{MAX_RETRIES} 次尝试均失败: {last_error}。若 VPS 已收到请求但本机收不到回包，可能是本地网络对 UDP {} 的回程过滤；可在云防火墙放行其他 UDP 端口后，用 `miaovps deploy <server-id> --port <udp-port>` 迁移并重试。",
+                "{MAX_RETRIES} 次尝试均失败: {last_error}。检查服务器是否监听 UDP {} 以及云防火墙是否放行；确认使用匹配的协议和配置。",
                 self.server_addr.port()
             ),
+            timed_out: all_timed_out,
             duration_ms: start.elapsed().as_millis() as u64,
         }
     }

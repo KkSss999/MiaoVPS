@@ -41,10 +41,12 @@ pub enum ServerStatus {
 }
 
 impl ServerStatus {
-    /// 只有完成成功检测、已部署或一次部署中断的节点才允许进入部署流程。
-    /// 其他状态必须先检测，避免把 SSH 可达误当作可安全修改远端网络。
+    /// Legacy Deploying is recoverable: the deployment lock now records live ownership.
     pub fn permits_deployment(&self) -> bool {
-        matches!(self, Self::Added | Self::Online | Self::Incomplete)
+        matches!(
+            self,
+            Self::Added | Self::Online | Self::Incomplete | Self::Deploying
+        )
     }
 }
 

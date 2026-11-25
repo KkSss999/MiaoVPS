@@ -3,6 +3,7 @@
 //! 串联所有后端 crate，验证端到端流程：
 //!   添加服务器 → 环境检测 → 部署 WireGuard → 添加设备 → 导出配置
 
+mod awg;
 mod dns;
 mod logging;
 mod net;
@@ -22,8 +23,8 @@ use miaovps_provisioner::{DeploymentOptions, DetectStatus, StepEvent, StepResult
 use miaovps_storage::Database;
 use miaovps_wireguard_config as wg;
 use net::{
-    add_ipv6_block, apply_routes, delete_ipv6_block, delete_route, verify_ipv6_block,
-    Ipv6Block, RouteSpec,
+    add_ipv6_block, apply_routes, delete_ipv6_block, delete_route, verify_ipv6_block, Ipv6Block,
+    RouteSpec,
 };
 use profile::{decode_key, derive_public_key, ConnectionProfile};
 use std::net::SocketAddr;
@@ -88,11 +89,18 @@ async fn main() -> Result<()> {
         "remove-server" => cmd_remove_server(&args).await?,
         "list-servers" => cmd_list_servers().await?,
         "inspect" => cmd_inspect(&args).await?,
-        "deploy" => cmd_deploy(&args).await?,
-        "add-device" => cmd_add_device(&args).await?,
-        "list-devices" => cmd_list_devices(&args).await?,
-        "status" => cmd_status(&args).await?,
-        "export-config" => cmd_export_config(&args).await?,
+        "deploy" if uses_wireguard(&args) => cmd_deploy(&without_wg(&args)).await?,
+        "deploy" => awg::deploy_default(&args).await?,
+        "deploy-awg" => awg::deploy_trial(&args[2..]).await?,
+        "list-devices" if !uses_wireguard(&args) => awg::list_device(&args[2..]).await?,
+        "add-device" if !uses_wireguard(&args) => {
+            anyhow::bail!("AWG 单设备由 deploy 创建；添加原生 WireGuard 设备请显式加 --wg")
+        }
+        "add-device" => cmd_add_device(&without_wg(&args)).await?,
+        "list-devices" => cmd_list_devices(&without_wg(&args)).await?,
+        "status" => cmd_status(&without_wg(&args), uses_wireguard(&args)).await?,
+        "export-config" if !uses_wireguard(&args) => awg::export(&args[2..])?,
+        "export-config" => cmd_export_config(&without_wg(&args)).await?,
         "generate-keypair" => cmd_generate_keypair(),
         "validate" => cmd_validate(&args).await?,
         "profile" => cmd_profile(&args).await?,
@@ -112,37 +120,50 @@ async fn main() -> Result<()> {
 }
 
 fn print_help() {
-    println!(concat!("MiaoVPS CLI v", env!("CARGO_PKG_VERSION"), " — 私人 VPN 节点管理工具\n"));
+    println!(concat!(
+        "MiaoVPS CLI v",
+        env!("CARGO_PKG_VERSION"),
+        " — 私人 VPN 节点管理工具\n"
+    ));
     println!("用法: miaovps <command> [args]\n");
     println!("命令:");
     println!("  add-server <name> <host> [port] [user]  添加 VPS 服务器");
     println!("  remove-server <server-id>                删除本地 VPS 节点记录");
     println!("  list-servers                             列出所有服务器");
     println!("  inspect <server-id>                      环境检测");
-    println!("  deploy <server-id> [--port <udp-port>]  一键部署/迁移 WireGuard 端口");
-    println!("  add-device <server-id> <name> [type]     添加 VPN 设备");
-    println!("  list-devices <server-id>                 列出设备");
-    println!("  status <server-id>                       查看服务状态");
-    println!("  export-config <device-id>                导出 WireGuard 配置");
-    println!("  generate-keypair                         生成 WireGuard 密钥对");
+    println!("  deploy [--wg] <server-id> [--port <udp-port>]  部署或验证换口（默认 AWG）");
+    println!(
+        "  deploy-awg <server-id> <wg-device-id> <udp-port> <new.conf>  用已有设备密钥部署 AWG"
+    );
+    println!("  add-device --wg <server-id> <name> [type]   添加原生 WireGuard 设备");
+    println!("  list-devices [--wg] <server-id>              列出设备（默认 AWG）");
+    println!("  status [--wg] <server-id>                   查看服务状态（默认 AWG）");
+    println!("  export-config                               导出本机 AWG 配置");
+    println!("  export-config --wg <device-id>              导出原生 WireGuard 配置");
+    println!("  generate-keypair                            生成 AWG / WireGuard 通用密钥对");
     println!();
     println!("连接管理:");
-    println!("  validate <ip:port> <client-priv> <server-pub>  分步验证链路（不切路由）");
-    println!("  profile init <ip:port> <client-priv> <server-pub> [client-ip]");
-    println!("                                                保存连接配置");
-    println!("  profile show                                  查看当前配置");
-    println!("  connect [server-id] [--device <device-id>] [--full] [--port <udp-port>] [--skip-validate] [--daemon] [--dev] 建立隧道 (需 sudo)");
+    println!("  validate [--wg]                               验证已保存的连接（不切路由）");
+    println!("  validate --wg <ip:port> <client-priv> <server-pub> 验证指定的原生 WireGuard 连接");
+    println!("  profile --wg init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]");
+    println!("  profile show [--wg]                            查看当前配置");
+    println!(
+        "  connect [server-id] [--device <device-id>] [--wg] [--full] [--port <udp-port>] [--skip-validate] [--daemon] [--dev] 建立隧道 (需 sudo)"
+    );
+    println!(
+        "                                                默认 AmneziaWG（{}），--wg 使用原生 WireGuard",
+        awg::PROFILE_FILE
+    );
     println!("                                                --daemon 后台运行并写状态文件");
-    println!("                                                --dev 追加详细日志到 ~/.miaovps/tunnel-dev.log（自动轮转）");
-    println!("                                                Full Tunnel 会阻止公网 IPv6，避免未受保护的 IPv6 直连");
+    println!(
+        "                                                --dev 追加详细日志到 ~/.miaovps/tunnel-dev.log（自动轮转）"
+    );
+    println!(
+        "                                                Full Tunnel 会阻止公网 IPv6，避免未受保护的 IPv6 直连"
+    );
     println!("  disconnect                                    停止隧道并清理路由");
     println!();
-    println!("典型流程:");
-    println!("  1. miaovps generate-keypair              # 生成客户端密钥对");
-    println!("  2. 在 VPS 上注册公钥为 peer");
-    println!("  3. miaovps profile init <ip:port> <priv> <server-pub>");
-    println!("  4. miaovps validate <ip:port> <priv> <server-pub>");
-    println!("  5. sudo miaovps connect --full");
+    println!("典型流程: inspect <server-id> → deploy <server-id> → sudo miaovps connect --full");
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -260,6 +281,15 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+/// The flag is reserved only for protocol-specific commands.
+fn without_wg(args: &[String]) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(i, arg)| *i < 2 || *arg != "--wg")
+        .map(|(_, arg)| arg.clone())
+        .collect()
+}
+
 /// 按 ID 前缀查服务器 —— 命令行里让用户敲完整 UUID 不现实
 async fn resolve_server_id(svc: &AppService, prefix: &str) -> Result<String> {
     let servers = svc.list_servers().await?;
@@ -353,9 +383,8 @@ async fn cmd_inspect(args: &[String]) -> Result<()> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_deploy(args: &[String]) -> Result<()> {
-    let Some(prefix) = args.get(2) else {
-        eprintln!("用法: miaovps deploy <server-id> [--port <udp-port>]");
-        std::process::exit(1);
+    let Some(prefix) = args.get(2).filter(|value| !value.starts_with("--")) else {
+        anyhow::bail!("用法: miaovps deploy --wg <server-id> [--port <udp-port>]");
     };
 
     let svc = open_service().await?;
@@ -367,11 +396,38 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
         .find(|s| s.id == server_id)
         .expect("resolve_server_id 已确认存在");
 
+    let requested_port = deploy_port_arg(args)?;
+    if let Some(node) = svc.db.get_wg_node(&server_id).await? {
+        if let Some(port) = requested_port {
+            ensure_no_local_tunnel_for_port_change()?;
+            let profile = ConnectionProfile::load(&data_dir())?;
+            anyhow::ensure!(
+                profile.server_ip()? == server.host
+                    && profile.server_public_key == node.server_public_key,
+                "请先保存与该节点及设备匹配的 WG profile"
+            );
+            change_listener(
+                &svc,
+                &server,
+                &profile,
+                Default::default(),
+                true,
+                None,
+                Some(port),
+            )
+            .await?;
+            println!("✓ WG 服务端和本机配置已校对: UDP {port}");
+        } else {
+            println!(
+                "WG 节点已存在；用 status --wg {prefix} 检查运行状态，或 deploy --wg {prefix} --port <port> 安全换口"
+            );
+        }
+        return Ok(());
+    }
     let mut options = DeploymentOptions::default();
-    if let Some(port) = deploy_port_arg(args)? {
+    if let Some(port) = requested_port {
         options.wireguard_port = port;
     }
-    let requested_wireguard_port = options.wireguard_port;
     println!("即将部署 WireGuard 到 {} ({})\n", server.name, server.host);
     println!("部署配置:");
     println!("  WireGuard 端口: {}", options.wireguard_port);
@@ -407,12 +463,7 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
             if let Some(pk) = &progress.server_public_key {
                 println!("  服务器公钥: {}", pk);
             }
-            sync_profile_after_deploy(
-                &server.host,
-                requested_wireguard_port,
-                progress.server_public_key.as_deref(),
-            )?;
-            println!("\n下一步: miaovps add-device {} <设备名>", prefix);
+            println!("\n下一步: miaovps add-device --wg {} <设备名>", prefix);
         }
         _ => {
             println!("❌ 部署未完成 (状态: {:?})", progress.status);
@@ -421,48 +472,21 @@ async fn cmd_deploy(args: &[String]) -> Result<()> {
                     println!("  失败步骤: {} — {}", step.label(), e);
                 }
             }
+            anyhow::bail!("部署未完成 ({:?})", progress.status);
         }
     }
     Ok(())
 }
 
-/// 部署成功后同步 CLI 共用的本地 profile，避免服务端端口变更而客户端仍
-/// 连接旧端点。没有 profile（例如首次仅部署服务器）时保持正常，不创建
-/// 一个没有设备密钥的伪配置。
-fn sync_profile_after_deploy(
-    server_host: &str,
-    wireguard_port: u16,
-    server_public_key: Option<&str>,
-) -> Result<()> {
-    let path = ConnectionProfile::path(&data_dir());
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let mut profile = ConnectionProfile::load(&data_dir())?;
-    let current = profile.server_addr()?;
-    if current.ip().to_string() != server_host {
-        println!(
-            "  ⚠ 未同步 profile：当前端点 {} 与部署目标 {} 不一致",
-            profile.server_endpoint, server_host
-        );
-        return Ok(());
-    }
-
-    let mut endpoint = current;
-    endpoint.set_port(wireguard_port);
-    profile.server_endpoint = endpoint.to_string();
-    if let Some(public_key) = server_public_key {
-        profile.server_public_key = public_key.to_string();
-    }
-    profile.save(&data_dir())?;
-    println!("  ✓ 已同步本地连接端点: {}", profile.server_endpoint);
+fn ensure_no_local_tunnel_for_port_change() -> Result<()> {
+    anyhow::ensure!(
+        !TunnelState::load(&data_dir()).occupies_tunnel(),
+        "有隧道正在运行；请先断开，再手动换服务端端口"
+    );
     Ok(())
 }
 
-/// WireGuard 是 UDP 协议；部分国内网络会对 51820 的回程流量做特殊处理。
-/// 端口不是写死的：用户可在云防火墙放行后，以 `deploy --port 443` 进行
-/// 事务化重部署。Provisioner 会保留运行中的 peer，成功后同步节点端口。
+/// Parse the UDP port requested for deploy or a verified listener change.
 fn deploy_port_arg(args: &[String]) -> Result<Option<u16>> {
     let mut found = None;
     let mut index = 3;
@@ -495,9 +519,12 @@ fn connect_port_arg(args: &[String]) -> Result<Option<u16>> {
     while index < args.len() {
         match args[index].as_str() {
             value if index == 2 && !value.starts_with("--") => index += 1,
-            "--full" | "--skip-validate" | "--daemon" | "--dev" => index += 1,
+            "--full" | "--skip-validate" | "--daemon" | "--dev" | "--wg" => index += 1,
             "--device" => {
-                if args.get(index + 1).is_none() {
+                if !args
+                    .get(index + 1)
+                    .is_some_and(|value| !value.is_empty() && !value.starts_with("--"))
+                {
                     anyhow::bail!("--device 需要设备 ID 或前缀");
                 }
                 index += 2;
@@ -541,7 +568,7 @@ fn connect_target_args(args: &[String]) -> Result<(Option<String>, Option<String
                 }
                 index += 2;
             }
-            "--full" | "--skip-validate" | "--daemon" | "--dev" => index += 1,
+            "--full" | "--skip-validate" | "--daemon" | "--dev" | "--wg" => index += 1,
             "--port" => index += 2,
             "--proxy" => anyhow::bail!(
                 "WireGuard 使用 UDP，不支持 HTTP/SOCKS --proxy；请使用 --port <udp-port>"
@@ -685,7 +712,7 @@ fn spawn_elevated(args: &[String]) -> Result<()> {
 
 async fn cmd_add_device(args: &[String]) -> Result<()> {
     let Some(prefix) = args.get(2) else {
-        eprintln!("用法: miaovps add-device <server-id> <name> [type]");
+        eprintln!("用法: miaovps add-device --wg <server-id> <name> [type]");
         std::process::exit(1);
     };
     let name = args.get(3).cloned().unwrap_or_else(|| "My Device".into());
@@ -713,13 +740,13 @@ async fn cmd_add_device(args: &[String]) -> Result<()> {
     println!("\nWireGuard 配置:\n");
     println!("{}", config);
     println!("私钥已存入系统 Keychain，可随时用以下命令重新导出:");
-    println!("  miaovps export-config {}", &device.id[..8]);
+    println!("  miaovps export-config --wg {}", &device.id[..8]);
     Ok(())
 }
 
 async fn cmd_list_devices(args: &[String]) -> Result<()> {
     let prefix = args.get(2).cloned().unwrap_or_else(|| {
-        eprintln!("用法: miaovps list-devices <server-id>");
+        eprintln!("用法: miaovps list-devices --wg <server-id>");
         std::process::exit(1);
     });
 
@@ -753,14 +780,27 @@ async fn cmd_list_devices(args: &[String]) -> Result<()> {
 //  status / export-config / generate-keypair
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async fn cmd_status(args: &[String]) -> Result<()> {
-    let Some(prefix) = args.get(2) else {
-        eprintln!("用法: miaovps status <server-id>");
-        std::process::exit(1);
+async fn cmd_status(args: &[String], wireguard: bool) -> Result<()> {
+    let [prefix] = &args[2..] else {
+        anyhow::bail!("用法: miaovps status [--wg] <server-id>");
     };
-
     let svc = open_service().await?;
     let server_id = resolve_server_id(&svc, prefix).await?;
+    if !wireguard {
+        let server = svc.db.get_server(&server_id).await?.context("节点不存在")?;
+        let ssh = miaovps_app::session::open_provisioner(&server, &svc.cred_dir, None).await?;
+        let status = ssh.awg_status().await?;
+        let _ = ssh.disconnect().await;
+        println!(
+            "{}",
+            if status.trim() == "not-running" {
+                "AmneziaWG 未运行。"
+            } else {
+                status.trim()
+            }
+        );
+        return Ok(());
+    }
     let status = svc.server_status(server_id.clone()).await?;
 
     if status.contains("not-running") {
@@ -787,7 +827,7 @@ async fn cmd_status(args: &[String]) -> Result<()> {
 
 async fn cmd_export_config(args: &[String]) -> Result<()> {
     let Some(prefix) = args.get(2) else {
-        eprintln!("用法: miaovps export-config <device-id>");
+        eprintln!("用法: miaovps export-config --wg <device-id>");
         std::process::exit(1);
     };
 
@@ -816,7 +856,7 @@ async fn cmd_export_config(args: &[String]) -> Result<()> {
 
 fn cmd_generate_keypair() {
     let kp = wg::generate_keypair();
-    println!("WireGuard 密钥对:");
+    println!("AWG / WireGuard 通用密钥对:");
     println!("  私钥: {}", kp.private_key);
     println!("  公钥: {}", kp.public_key);
     println!("\n⚠ 请妥善保管私钥，不要分享给他人。");
@@ -827,33 +867,48 @@ fn cmd_generate_keypair() {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_validate(args: &[String]) -> Result<()> {
-    if args.len() < 5 {
-        eprintln!(
-            "用法: miaovps validate <server-ip:port> <client-private-key> <server-public-key>"
-        );
-        eprintln!("示例: miaovps validate 203.0.113.10:51820 OGuo5... A2xHn...");
-        std::process::exit(1);
-    }
-
-    let server_addr: SocketAddr = args[2]
-        .parse()
-        .map_err(|e| anyhow::anyhow!("服务器地址格式错误 (应为 IP:PORT): {e}"))?;
-    let client_priv_b64 = &args[3];
-    let server_pub_b64 = &args[4];
-
-    // 解码 base64 密钥
-    let client_private_key = decode_key(client_priv_b64, "客户端私钥")?;
-    let server_public_key = decode_key(server_pub_b64, "服务器公钥")?;
-
+    let (server_addr, client_private_key, server_public_key, framing) = match &args[2..] {
+        [] => {
+            let (profile, framing) = awg::load(&data_dir())?;
+            (
+                profile.server_addr()?,
+                profile.client_private_bytes()?,
+                profile.server_public_bytes()?,
+                Some(framing),
+            )
+        }
+        [flag] if flag == "--wg" => {
+            let profile = ConnectionProfile::load(&data_dir())?;
+            (
+                profile.server_addr()?,
+                profile.client_private_bytes()?,
+                profile.server_public_bytes()?,
+                None,
+            )
+        }
+        [flag, endpoint, private, public] if flag == "--wg" => (
+            endpoint
+                .parse()
+                .context("服务器地址格式错误 (应为 IP:PORT)")?,
+            decode_key(private, "客户端私钥")?,
+            decode_key(public, "服务器公钥")?,
+            None,
+        ),
+        _ => anyhow::bail!(
+            "用法: miaovps validate [--wg] 或 validate --wg <ip:port> <client-private-key> <server-public-key>"
+        ),
+    };
     println!("🔍 MiaoVPS 连接验证");
     println!("  服务器: {}", server_addr);
     println!("  客户端公钥: {}", derive_public_key(&client_private_key));
-    println!("  服务器公钥: {}", short_key(server_pub_b64));
     println!();
     println!("正在分步验证链路（不会切换路由，安全）...\n");
 
-    let validator = ConnectionValidator::new(server_addr, client_private_key, server_public_key);
-
+    let mut validator =
+        ConnectionValidator::new(server_addr, client_private_key, server_public_key);
+    if let Some(framing) = framing {
+        validator = validator.with_amnezia(framing);
+    }
     let results = validator.validate_all().await;
 
     let mut all_ok = true;
@@ -869,12 +924,15 @@ async fn cmd_validate(args: &[String]) -> Result<()> {
     println!();
     if all_ok {
         println!("🎉 全部验证通过！服务器链路正常，可以安全连接。");
-        println!("   下一步: miaovps connect <server-id>");
+        println!(
+            "   下一步: sudo miaovps connect{}",
+            if framing.is_none() { " --wg" } else { "" }
+        );
     } else {
-        println!("❌ 验证失败。请检查:");
-        println!("   1. VPS 安全组是否开放 UDP {}", server_addr.port());
-        println!("   2. WireGuard 服务是否运行 (sudo wg show)");
-        println!("   3. 客户端/服务器公钥是否匹配");
+        anyhow::bail!(
+            "验证失败：请检查 UDP {}、服务端 peer 与协议配置",
+            server_addr.port()
+        );
     }
 
     Ok(())
@@ -899,8 +957,8 @@ fn spawn_daemon(args: &[String]) -> Result<()> {
 
     let exe = std::env::current_exe().context("无法获取自身路径")?;
     let log_path = data_dir().join(DAEMON_LOG);
-    let log = std::fs::File::create(&log_path)
-        .with_context(|| format!("无法创建日志 {}", log_path.display()))?;
+    let log = logging::open_private(&log_path)
+        .with_context(|| format!("无法打开日志 {}", log_path.display()))?;
     let log_err = log.try_clone()?;
 
     let child = Command::new(exe)
@@ -935,6 +993,7 @@ fn publish_state(
         pid: std::process::id(),
         server_endpoint: profile.server_endpoint.clone(),
         client_ip: profile.client_ip.clone(),
+        vpn_route: vpn_network_cidr(&profile.peer_ip, &profile.netmask).ok(),
         started_at,
         updated_at: miaovps_app::tunnel::now_secs(),
         tx_bytes: tx,
@@ -954,8 +1013,45 @@ fn publish_state(
 /// Own the entire lifecycle: a restart is requested only after the old session
 /// has joined its threads and restored its routes/DNS.
 async fn cmd_connect(args: &[String]) -> Result<()> {
+    let mut guard = None;
+    if is_root()
+        && (!args.iter().any(|a| a == "--daemon") || std::env::var_os(DAEMON_MARKER).is_some())
+    {
+        guard = Some(lock_tunnel()?);
+    }
+    let _guard = guard;
+    let result = supervise_connection(args.to_vec()).await;
+    let daemon_child =
+        std::env::var_os(DAEMON_MARKER).is_some() && args.iter().any(|a| a == "--daemon");
+    if daemon_child && result.is_ok() {
+        let dir = data_dir();
+        if TunnelState::load(&dir).pid == std::process::id() {
+            TunnelState::clear(&dir);
+            TunnelState::clear_stop_request(&dir);
+        }
+    }
+    result
+}
+
+fn lock_tunnel() -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(data_dir().join(".tunnel.lock"))?;
+    anyhow::ensure!(file.metadata()?.is_file(), "隧道锁不是普通文件");
+    anyhow::ensure!(
+        file.try_lock().is_ok(),
+        "已有 MiaoVPS 隧道或恢复任务运行；请先断开"
+    );
+    Ok(file)
+}
+
+async fn supervise_connection(mut current_args: Vec<String>) -> Result<()> {
     use recovery::SessionExit;
-    let mut current_args = args.to_vec();
     let mut policy = recovery::RecoveryPolicy::default();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -979,15 +1075,21 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
             return Ok(());
         }
         if policy.ended(outcome) {
-            // No active tunnel or overlay remains when mutating the remote port.
+            anyhow::ensure!(
+                !policy.tried_port(),
+                "新端口已通过握手，但完整隧道未恢复；停止继续换口，请检查数据转发和防火墙"
+            );
+            // SSH and the real handshake must use the restored direct route.
             let deployment = tokio::select! {
-                result = redeploy_next_port(&current_args) => result,
+                result = tokio::time::timeout(Duration::from_secs(45), redeploy_next_port(&current_args)) => {
+                    result.context("换口操作超时；未提交的端口会自动恢复")?
+                },
                 _ = wait_for_stop_request() => {
-                    tracing::warn!("[恢复] 收到停止请求，终止自动端口部署，远端状态需核对");
+                    tracing::warn!("[恢复] 收到停止请求，未提交的端口由服务端定时恢复");
                     return Ok(());
                 },
                 _ = stop_rx.changed() => {
-                    tracing::warn!("[恢复] 用户停止端口部署，远端状态需核对");
+                    tracing::warn!("[恢复] 用户停止换口，未提交的端口由服务端定时恢复");
                     return Ok(());
                 }
             };
@@ -1006,9 +1108,8 @@ async fn cmd_connect(args: &[String]) -> Result<()> {
         // Stop/disconnect must also work in the gap between sessions.
         tokio::select! {
             _ = stop_rx.changed() => return Ok(()),
-            _ = tokio::time::sleep(if outcome == SessionExit::RetryFailed {
-                Duration::from_secs(5)
-            } else { Duration::ZERO }) => {}
+            _ = wait_for_stop_request() => return Ok(()),
+            _ = tokio::time::sleep(if outcome == SessionExit::RetryFailed { Duration::from_secs(5) } else { Duration::ZERO }) => {}
         }
         if TunnelState::stop_requested(&data_dir()) {
             TunnelState::clear_stop_request(&data_dir());
@@ -1024,61 +1125,194 @@ async fn wait_for_stop_request() {
 }
 
 async fn redeploy_next_port(args: &[String]) -> Result<u16> {
-    let mut profile = ConnectionProfile::load(&data_dir())?;
-    let port =
-        recovery::next_port(connect_port_arg(args)?.unwrap_or(profile.server_addr()?.port()))?;
+    let wireguard = uses_wireguard(args);
+    let (profile, framing) = if wireguard {
+        (ConnectionProfile::load(&data_dir())?, Default::default())
+    } else {
+        awg::load(&data_dir())?
+    };
+    let expected = connect_port_arg(args)?.unwrap_or(profile.server_addr()?.port());
     let svc = open_service().await?;
     let (selected, _) = connect_target_args(args)?;
-    let server_id = if let Some(prefix) = selected {
-        resolve_server_id(&svc, &prefix).await?
+    let server = if let Some(prefix) = selected {
+        let id = resolve_server_id(&svc, &prefix).await?;
+        svc.db.get_server(&id).await?.context("节点不存在")?
     } else {
+        let host = profile.server_ip()?;
         let mut matches = Vec::new();
-        for server in svc.list_servers().await? {
-            if let Some(node) = svc.db.get_wg_node(&server.id).await? {
-                if node.server_public_key == profile.server_public_key {
-                    matches.push(server.id);
-                }
+        for server in svc
+            .list_servers()
+            .await?
+            .into_iter()
+            .filter(|s| s.host == host && s.status.permits_deployment())
+        {
+            if !wireguard
+                || svc
+                    .db
+                    .get_wg_node(&server.id)
+                    .await?
+                    .is_some_and(|n| n.server_public_key == profile.server_public_key)
+            {
+                matches.push(server);
             }
         }
-        match matches.as_slice() {
-            [id] => id.clone(),
-            _ => anyhow::bail!(
-                "无法唯一确定重部署节点，请使用 connect <server-id> --device <device-id>"
-            ),
-        }
-    };
-    let mut node = svc
-        .db
-        .get_wg_node(&server_id)
-        .await?
-        .context("未找到已部署节点，停止自动迁移")?;
-    if node.server_public_key != profile.server_public_key {
-        anyhow::bail!("所选节点与当前连接公钥不符，拒绝自动部署");
-    }
-    let options = recovery::deployment_options(&node, profile.mtu, port);
-    tracing::warn!(%server_id, port, "[恢复] 连续两次完整重连失败，重新部署下一端口");
-    let progress = svc.deploy_server(server_id, Some(options), None).await?;
-    if progress.status != DeploymentStatus::Success {
-        anyhow::bail!(
-            "自动端口部署失败（{:?}），未切换本地连接端口",
-            progress.status
+        anyhow::ensure!(
+            matches.len() == 1,
+            "无法唯一确定 SSH 节点；请确认本地节点记录或显式选择节点"
         );
-    }
-    let public_key = progress
-        .server_public_key
-        .context("部署结果缺少公钥，停止自动迁移")?;
-    if public_key != profile.server_public_key {
-        anyhow::bail!("重部署意外改变了服务端公钥，请人工核对后连接");
-    }
-    // Preserve the existing node's non-port settings in local storage as well.
-    node.listen_port = port;
-    svc.db.upsert_wg_node(&node).await?;
+        matches.remove(0)
+    };
+    tracing::warn!(server_id=%server.id, wireguard, "[恢复] 连续重连失败，校验当前协议的下一端口");
+    change_listener(
+        &svc,
+        &server,
+        &profile,
+        framing,
+        wireguard,
+        Some(expected),
+        None,
+    )
+    .await
+}
+
+async fn probe_listener(
+    profile: &ConnectionProfile,
+    framing: miaovps_connect::awg::Framing,
+    port: u16,
+) -> Result<()> {
     let mut endpoint = profile.server_addr()?;
     endpoint.set_port(port);
-    profile.server_endpoint = endpoint.to_string();
-    profile.save(&data_dir())?;
-    tracing::info!(port, "[恢复] 端口部署成功，已同步节点与 profile");
-    Ok(port)
+    let probe = miaovps_connect::tunnel::WireGuardHandshaker::new(
+        profile.client_private_bytes()?,
+        profile.server_public_bytes()?,
+        endpoint,
+    )
+    .with_framing(framing);
+    let mut result = probe.try_handshake().await;
+    if result.is_err() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        result = probe.try_handshake().await;
+    }
+    result.context("客户端认证握手未通过")
+}
+
+async fn change_listener(
+    svc: &AppService,
+    server: &Server,
+    profile: &ConnectionProfile,
+    framing: miaovps_connect::awg::Framing,
+    wireguard: bool,
+    expected: Option<u16>,
+    requested: Option<u16>,
+) -> Result<u16> {
+    use miaovps_provisioner::{PortAction, PortChange};
+    let _lock = svc.deployment_lock()?;
+    anyhow::ensure!(
+        server.host == profile.server_ip()? && server.status.permits_deployment(),
+        "SSH 节点与当前端点不匹配，或尚未完成检测"
+    );
+    let mut node = if wireguard {
+        let node = svc
+            .db
+            .get_wg_node(&server.id)
+            .await?
+            .context("未找到 WG 节点记录")?;
+        anyhow::ensure!(
+            node.server_public_key == profile.server_public_key,
+            "本地 WG 节点公钥与 profile 不符"
+        );
+        Some(node)
+    } else {
+        None
+    };
+    let ssh = miaovps_app::session::open_provisioner(server, &svc.cred_dir, None).await?;
+    let (key, old) = ssh.listener(wireguard).await?;
+    anyhow::ensure!(
+        key == profile.server_public_key,
+        "服务端 VPN 公钥与 profile 不符"
+    );
+    // Do not replace the configured key or mutate either protocol on a mere timeout.
+    // The remote port transaction checks the live key and peer before binding the port.
+    let new = if let Some(port) = requested {
+        port
+    } else if expected == Some(old) {
+        recovery::next_port(old)?
+    } else {
+        // A previous commit or manual change may have succeeded despite a dropped reply.
+        old
+    };
+    let dir = data_dir();
+    let path;
+    let staged = if wireguard {
+        path = ConnectionProfile::path(&dir);
+        let mut updated = profile.clone();
+        let mut addr = updated.server_addr()?;
+        addr.set_port(new);
+        updated.server_endpoint = addr.to_string();
+        updated.stage(&dir)?
+    } else {
+        path = dir.join(awg::PROFILE_FILE);
+        awg::stage_port(&path, profile, new)?
+    };
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let change = PortChange {
+        wireguard,
+        token: &token,
+        old,
+        new,
+        public_key: &key,
+        peer: &profile.client_public_key,
+    };
+    if old != new {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            ssh.switch_port(&change, PortAction::Prepare),
+        )
+        .await
+        .context("换口 SSH 响应超时；未提交的端口会自动恢复")??;
+    }
+    if let Err(error) = probe_listener(profile, framing, new).await {
+        if old != new
+            && !matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    ssh.switch_port(&change, PortAction::Abort)
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        {
+            tracing::warn!(old, "立即回滚未确认；等待服务端定时恢复旧端口");
+        }
+        return Err(error).context(format!(
+            "UDP {new} 验证失败；未更新本机配置（换口时恢复旧端口 {old}）"
+        ));
+    }
+    if old != new {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            ssh.switch_port(&change, PortAction::Commit),
+        )
+        .await
+        .context("服务端提交结果未知；用 status 核对实际端口后重新执行 deploy --port")??;
+    }
+    staged
+        .install(&path)
+        .context("远端已验证；本机保存失败，请核对 status 后重新执行 deploy --port")?;
+    if let Some(node) = node.as_mut() {
+        node.listen_port = new;
+        svc.db.upsert_wg_node(node).await?;
+    }
+    svc.db
+        .update_server_status(&server.id, &miaovps_core::ServerStatus::Online)
+        .await?;
+    tracing::info!(old, new, wireguard, "[恢复] 已验证并保存服务端 UDP 端口");
+    let _ = ssh.disconnect().await;
+    Ok(new)
+}
+
+fn uses_wireguard(args: &[String]) -> bool {
+    args.iter().skip(2).any(|arg| arg == "--wg")
 }
 
 async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::SessionExit> {
@@ -1088,20 +1322,23 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
     if server_prefix.is_some() != device_prefix.is_some() {
         anyhow::bail!("显式连接节点时必须同时指定 server-id 和 --device <device-id>");
     }
+    let wireguard = uses_wireguard(args);
     let skip_validate = flags.contains(&"--skip-validate");
     let full_tunnel = flags.contains(&"--full");
     let daemon = flags.contains(&"--daemon");
 
+    if !retrying && TunnelState::load(&data_dir()).occupies_tunnel() {
+        anyhow::bail!("已有 MiaoVPS 隧道运行；请先断开，再切换协议");
+    }
+
     // 权限先查 — 创建 TUN 和改路由都需要 root，
     // 没有权限就别让用户白等几秒验证
     if !is_root() {
-        if let Some(server_prefix) = server_prefix.as_deref() {
-            prepare_selected_profile(server_prefix, device_prefix.as_deref()).await?;
+        if server_prefix.is_some() || !wireguard {
             return spawn_elevated(args).map(|_| recovery::SessionExit::Stopped);
         }
         anyhow::bail!(
-            "创建 TUN 接口和修改路由需要 root 权限。\n\
-             请使用: sudo miaovps connect{}{}",
+            "创建 TUN 接口和修改路由需要 root 权限。请使用: sudo miaovps connect --wg{}{}",
             if full_tunnel { " --full" } else { "" },
             port_override
                 .map(|port| format!(" --port {port}"))
@@ -1111,7 +1348,7 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
 
     // 兼容用户直接写 `sudo miaovps connect <server> --device ...` 的用法。
     // 不能在 root 进程中直接访问原用户 Keychain，否则会沿用旧 profile。
-    if let Some(server_prefix) = server_prefix.as_deref() {
+    if let Some(server_prefix) = server_prefix.as_deref().filter(|_| wireguard && !retrying) {
         if std::env::var_os("SUDO_USER").is_some() {
             prepare_selected_profile_as_user(server_prefix, device_prefix.as_deref())?;
         } else {
@@ -1129,17 +1366,34 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
     if daemon && std::env::var_os(DAEMON_MARKER).is_none() {
         return spawn_daemon(args).map(|_| recovery::SessionExit::Stopped);
     }
-
     let is_daemon_child = daemon && std::env::var_os(DAEMON_MARKER).is_some();
 
-    let mut profile = ConnectionProfile::load(&data_dir())?;
+    let (mut profile, framing) = if wireguard {
+        (
+            ConnectionProfile::load(&data_dir())?,
+            miaovps_connect::awg::Framing::default(),
+        )
+    } else {
+        let (profile, framing) = awg::load(&data_dir())?;
+        if let (Some(server), Some(device)) = (&server_prefix, &device_prefix) {
+            awg::check_target(&profile, server, device).await?;
+        }
+        (profile, framing)
+    };
+    let protocol = if wireguard { "WireGuard" } else { "AmneziaWG" };
     if let Some(port) = port_override {
         let mut endpoint = profile.server_addr()?;
         endpoint.set_port(port);
         profile.server_endpoint = endpoint.to_string();
     }
-    let server_addr = profile.server_addr()?;
-    tracing::info!(endpoint = %server_addr, full_tunnel, daemon, skip_validate, "[连接] 开始建立隧道");
+    // Only IPv4 listener endpoints are supported on this TUN path.
+    let endpoint = profile.server_addr()?;
+    anyhow::ensure!(
+        endpoint.is_ipv4() && endpoint.port() != 0,
+        "连接端点须为 IPv4 和非零端口"
+    );
+    let server_addr = endpoint;
+    tracing::info!(endpoint = %server_addr, protocol, full_tunnel, daemon, skip_validate, "[连接] 开始建立隧道");
     let client_priv = profile.client_private_bytes()?;
     let server_pub = profile.server_public_bytes()?;
     let vps_ip = profile.server_ip()?;
@@ -1152,7 +1406,7 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
             "配置不自洽：profile 记录的客户端公钥与私钥不匹配\n\
              记录: {}\n\
              实际: {}\n\
-             重新运行 profile init 修复",
+             重新部署 AWG 或运行 profile --wg init 修复原生 WireGuard 配置",
             profile.client_public_key,
             derived
         );
@@ -1164,23 +1418,30 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
         TunnelMode::Split
     };
     let started_at = miaovps_app::tunnel::now_secs();
+    let vpn_net = vpn_network_cidr(&profile.peer_ip, &profile.netmask)?;
 
     // 必须在创建 utun 之前先写出归属状态。否则前端在
     // 「网卡已出现、状态文件尚未写」的窗口会误判为终端启动。
+    if !retrying {
+        TunnelState::clear_stop_request(&data_dir());
+    }
     if is_daemon_child {
         if retrying && TunnelState::stop_requested(&data_dir()) {
             return Ok(recovery::SessionExit::Stopped);
         }
-        TunnelState::clear_stop_request(&data_dir());
-        let state = TunnelState::connecting(
+        let mut state = TunnelState::connecting(
             tunnel_mode,
             profile.server_endpoint.clone(),
             profile.client_ip.clone(),
         );
+        state.vpn_route = Some(vpn_net.clone());
+        if retrying && full_tunnel {
+            state.status = TunnelStatus::FallbackDirect;
+        }
         state.save(&data_dir()).context("无法写入隧道启动状态")?;
     }
 
-    println!("🔗 MiaoVPS 隧道 → {}", server_addr);
+    println!("🔗 MiaoVPS {protocol} → {server_addr}");
     println!("  客户端公钥: {}", short_key(&profile.client_public_key));
     println!("  服务器公钥: {}", short_key(&profile.server_public_key));
     println!(
@@ -1194,12 +1455,23 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
     println!();
 
     // ── 1. 验证 ──
+    let mut startup_sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     if skip_validate {
         println!("[1/4] ⏭ 跳过验证");
     } else {
         println!("[1/4] 验证链路...");
-        let validator = ConnectionValidator::new(server_addr, client_priv, server_pub);
-        for r in &validator.validate_all().await {
+        let mut validator = ConnectionValidator::new(server_addr, client_priv, server_pub);
+        if !wireguard {
+            validator = validator.with_amnezia(framing);
+        }
+        let results = tokio::select! {
+            results = validator.validate_all() => results,
+            _ = tokio::signal::ctrl_c() => return Ok(recovery::SessionExit::Stopped),
+            _ = startup_sigterm.recv() => return Ok(recovery::SessionExit::Stopped),
+            _ = wait_for_stop_request(), if is_daemon_child => return Ok(recovery::SessionExit::Stopped),
+        };
+        for r in &results {
             println!(
                 "  {} {} ({}ms)",
                 if r.success { "✅" } else { "❌" },
@@ -1208,13 +1480,13 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
             );
             if !r.success {
                 println!("     {}", r.detail);
-                if retrying {
-                    tracing::warn!(step = %r.step, "[恢复] 重连链路验证失败");
+                if r.timed_out {
+                    tracing::warn!(step = %r.step, "[恢复] 无认证握手响应");
                     return Ok(recovery::SessionExit::RetryFailed);
                 }
                 anyhow::bail!(
                     "验证失败，未切换任何路由。\n\
-                     确认公钥 {} 已注册到 VPS peer 列表 (sudo wg show)",
+                     确认公钥 {} 已注册到 VPS 的 {protocol} peer 列表",
                     short_key(&profile.client_public_key)
                 );
             }
@@ -1257,7 +1529,7 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
     };
 
     let default_gw = net::default_gateway()?;
-    let vpn_net = vpn_network_cidr(&profile.peer_ip)?;
+    let vpn_net = vpn_network_cidr(&profile.peer_ip, &profile.netmask)?;
 
     let mut plan = vec![
         // VPS 公网 IP 必须经原始网关直连，否则加密包被路由回隧道形成死循环
@@ -1309,7 +1581,14 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
 
     // ── 4. 启动隧道 ──
     println!("[4/4] 启动加密隧道...");
-    let tunnel = match NativeTunnel::start(tun, client_priv, server_pub, server_addr, 25) {
+    let tunnel = match NativeTunnel::start_with_framing(
+        tun,
+        client_priv,
+        server_pub,
+        server_addr,
+        25,
+        framing,
+    ) {
         Ok(t) => t,
         Err(e) => {
             // 隧道起不来时必须撤掉路由和 DNS，否则流量进黑洞
@@ -1452,12 +1731,10 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
                 // ── 断线回落 / 恢复接管 ──
                 //
                 // 使用经过认证的收包新鲜度；空闲时由握手探测确认，不能只看本地密钥。
+                let alive = tunnel.stats().is_session_alive();
+                outage_ticks = if alive { 0 } else { outage_ticks + 1 };
                 if let Some(ov) = overlay.as_mut() {
-                    let alive = tunnel.stats().is_session_alive();
-
-                    if ov.is_engaged() && !alive {
-                        outage_ticks += 1;
-                        if outage_ticks >= OUTAGE_TICKS_BEFORE_FALLBACK {
+                    if ov.is_engaged() && outage_ticks >= OUTAGE_TICKS_BEFORE_FALLBACK {
                             println!();
                             println!("  ⚠ 隧道断开约 {}s 未恢复 —— 回落直连以保持网络可用",
                                 outage_ticks * TICK.as_secs() as u32);
@@ -1466,7 +1743,6 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
                             println!("    全局路由已撤下。隧道继续重连，恢复后自动接管。");
                             println!("    此时流量不经 VPN（无隐私保护）。");
                             println!();
-                        }
                     } else if !ov.is_engaged() && alive {
                         // 会话恢复 —— 重新接管
                         println!();
@@ -1483,9 +1759,16 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
                             }
                         }
                         println!();
-                    } else if alive {
-                        outage_ticks = 0;
                     }
+                }
+                if outage_ticks >= recovery::OUTAGE_TICKS_BEFORE_RESTART {
+                    exit = if retrying && !retry_confirmed {
+                        recovery::SessionExit::RetryFailed
+                    } else {
+                        recovery::SessionExit::Restart
+                    };
+                    tracing::warn!(outage_ticks, "[恢复] 连续没有认证流量，完整重连");
+                    break;
                 }
 
                 // 每 tick 刷一次状态文件 —— 前端轮询靠它
@@ -1538,10 +1821,21 @@ async fn cmd_connect_once(args: &[String], retrying: bool) -> Result<recovery::S
     remove_tunnel_routes(&vps_ip, &vpn_net);
 
     // 状态文件必须在路由清理后删 —— 中间崩溃时留着文件才能被识别为 Stale
-    if is_daemon_child {
+    if is_daemon_child && exit == recovery::SessionExit::Stopped {
         TunnelState::clear(&data_dir());
-        if exit == recovery::SessionExit::Stopped {
-            TunnelState::clear_stop_request(&data_dir());
+        TunnelState::clear_stop_request(&data_dir());
+    } else if is_daemon_child {
+        let dir = data_dir();
+        let mut state = TunnelState::load(&dir);
+        state.status = if full_tunnel {
+            TunnelStatus::FallbackDirect
+        } else {
+            TunnelStatus::Reconnecting
+        };
+        state.updated_at = miaovps_app::tunnel::now_secs();
+        state.session_alive = false;
+        if let Err(error) = state.save(&dir) {
+            tracing::warn!(%error, "无法发布隧道重连状态");
         }
     }
 
@@ -1572,9 +1866,14 @@ async fn cmd_disconnect(_args: &[String]) -> Result<()> {
 
     println!("清理残留状态...");
 
+    let state = TunnelState::load(&data_dir());
+    if state.status == TunnelStatus::External {
+        anyhow::bail!("前台隧道仍在运行，请在原终端按 Ctrl+C 断开");
+    }
     // 先停 daemon 隧道进程 —— 它还活着的话会把路由重新加回来
     // （VpsRouteGuard 每 5s 核对一次），先清路由就白清了
     stop_daemon_if_running()?;
+    let _guard = lock_tunnel()?;
 
     // 上次异常退出（kill -9 / 崩溃）可能留下被改写的 DNS，优先还原
     if let Some(desc) = dns::restore_if_pending(&data_dir()) {
@@ -1587,17 +1886,30 @@ async fn cmd_disconnect(_args: &[String]) -> Result<()> {
         eprintln!("  ⚠ IPv6 防泄漏规则清理失败: {e}");
     }
 
-    // profile 存在时按其配置精确清理，否则退回通用清理
-    let (vps_ip, vpn_net) = match ConnectionProfile::load(&data_dir()) {
-        Ok(p) => {
-            let net = vpn_network_cidr(&p.peer_ip).unwrap_or_else(|_| "10.66.66.0/24".into());
-            (p.server_ip().unwrap_or_default(), net)
+    let route = state.vpn_route.as_deref().and_then(|route| {
+        let (ip, prefix) = route.split_once('/')?;
+        let ip = ip.parse::<std::net::Ipv4Addr>().ok()?;
+        let prefix = prefix.parse::<u8>().ok()?;
+        // State lives in a user-writable directory: never pass arbitrary route arguments to root.
+        if !ip.is_private() || !(24..=32).contains(&prefix) {
+            return None;
         }
-        Err(_) => {
-            println!("  (无 profile，仅清理全局路由)");
-            (String::new(), "10.66.66.0/24".to_string())
-        }
-    };
+        Some(format!("{ip}/{prefix}"))
+    });
+    let saved = route
+        .zip(state.server_endpoint.parse::<SocketAddr>().ok())
+        .map(|(route, endpoint)| (endpoint.ip().to_string(), route));
+    let (vps_ip, vpn_net) = saved.unwrap_or_else(|| {
+        ConnectionProfile::load(&data_dir())
+            .ok()
+            .and_then(|p| {
+                Some((
+                    p.server_ip().ok()?,
+                    vpn_network_cidr(&p.peer_ip, &p.netmask).ok()?,
+                ))
+            })
+            .unwrap_or_else(|| (String::new(), "10.66.66.0/24".into()))
+    });
 
     remove_tunnel_routes(&vps_ip, &vpn_net);
     TunnelState::clear(&data_dir());
@@ -1723,17 +2035,14 @@ fn wait_for_daemon_exit(pid: u32, attempts: usize) -> Result<bool> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async fn cmd_profile(args: &[String]) -> Result<()> {
+    let wireguard = uses_wireguard(args);
+    let args = without_wg(args);
     match args.get(2).map(|s| s.as_str()) {
-        Some("init") => cmd_profile_init(args),
-        Some("show") => cmd_profile_show(),
-        _ => {
-            println!("用法:");
-            println!(
-                "  miaovps profile init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]"
-            );
-            println!("  miaovps profile show");
-            Ok(())
-        }
+        Some("init") if wireguard => cmd_profile_init(&args),
+        Some("show") => cmd_profile_show(wireguard),
+        _ => anyhow::bail!(
+            "用法: miaovps profile show [--wg] 或 profile --wg init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]"
+        ),
     }
 }
 
@@ -1741,8 +2050,7 @@ fn cmd_profile_init(args: &[String]) -> Result<()> {
     // args: [bin, "profile", "init", endpoint, client_priv, server_pub, client_ip?, peer_ip?]
     if args.len() < 6 {
         anyhow::bail!(
-            "用法: miaovps profile init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]\n\
-             示例: miaovps profile init 203.0.113.10:51820 OGuo5... fRp9S... 10.66.66.2 10.66.66.1"
+            "用法: miaovps profile --wg init <ip:port> <client-priv> <server-pub> [client-ip] [peer-ip]"
         );
     }
 
@@ -1775,24 +2083,26 @@ fn cmd_profile_init(args: &[String]) -> Result<()> {
         "    sudo wg set wg0 peer {} allowed-ips {}/32",
         client_public_key, profile.client_ip
     );
-    println!("  然后: sudo miaovps connect");
+    println!("  然后: sudo miaovps connect --wg");
 
     Ok(())
 }
 
-fn cmd_profile_show() -> Result<()> {
-    let profile = ConnectionProfile::load(&data_dir())?;
-    println!(
-        "连接配置 ({})",
-        ConnectionProfile::path(&data_dir()).display()
-    );
+fn cmd_profile_show(wireguard: bool) -> Result<()> {
+    let dir = data_dir();
+    let (profile, path) = if wireguard {
+        (
+            ConnectionProfile::load(&dir)?,
+            ConnectionProfile::path(&dir),
+        )
+    } else {
+        (awg::load(&dir)?.0, dir.join(awg::PROFILE_FILE))
+    };
+    println!("连接配置 ({})", path.display());
     println!("  服务器:     {}", profile.server_endpoint);
     println!("  服务器公钥: {}", profile.server_public_key);
     println!("  客户端公钥: {}", profile.client_public_key);
-    println!(
-        "  客户端私钥: {} (已隐藏)",
-        short_key(&profile.client_private_key)
-    );
+    println!("  客户端私钥: (已隐藏)");
     println!("  VPN 地址:   {} → {}", profile.client_ip, profile.peer_ip);
     println!("  掩码/MTU:   {} / {}", profile.netmask, profile.mtu);
     println!("  DNS:        {}", profile.dns.join(", "));
@@ -2120,13 +2430,20 @@ impl VpsRouteGuard {
     }
 }
 
-/// 由 VPN 网关地址推导 /24 网段 CIDR
-fn vpn_network_cidr(peer_ip: &str) -> Result<String> {
-    let ip: std::net::Ipv4Addr = peer_ip
-        .parse()
-        .map_err(|e| anyhow::anyhow!("无效 VPN 网关 IP '{peer_ip}': {e}"))?;
-    let o = ip.octets();
-    Ok(format!("{}.{}.{}.0/24", o[0], o[1], o[2]))
+/// Gateway and netmask identify the route owned by this tunnel, including AWG /30.
+fn vpn_network_cidr(peer_ip: &str, netmask: &str) -> Result<String> {
+    let ip: std::net::Ipv4Addr = peer_ip.parse().context("无效 VPN 网关 IP")?;
+    let mask = u32::from(
+        netmask
+            .parse::<std::net::Ipv4Addr>()
+            .context("无效 VPN 掩码")?,
+    );
+    let bits = mask.leading_ones();
+    anyhow::ensure!(bits == mask.count_ones(), "无效 VPN 掩码");
+    Ok(format!(
+        "{}/{bits}",
+        std::net::Ipv4Addr::from(u32::from(ip) & mask)
+    ))
 }
 
 /// 密钥缩略显示 — 避免日志泄露完整私钥
@@ -2243,9 +2560,29 @@ mod tests {
 
     #[test]
     fn derives_vpn_network_from_gateway() {
-        assert_eq!(vpn_network_cidr("10.66.66.1").unwrap(), "10.66.66.0/24");
-        assert_eq!(vpn_network_cidr("192.168.9.1").unwrap(), "192.168.9.0/24");
-        assert!(vpn_network_cidr("not-an-ip").is_err());
+        assert_eq!(
+            vpn_network_cidr("10.66.66.1", "255.255.255.0").unwrap(),
+            "10.66.66.0/24"
+        );
+        assert_eq!(
+            vpn_network_cidr("172.29.67.1", "255.255.255.252").unwrap(),
+            "172.29.67.0/30"
+        );
+        assert!(vpn_network_cidr("not-an-ip", "255.255.255.0").is_err());
+    }
+
+    #[test]
+    fn awg_is_default_and_wg_is_an_explicit_override() {
+        assert!(!uses_wireguard(&argv(&["miaovps", "connect", "--full"])));
+        let wg = argv(&[
+            "miaovps", "connect", "node", "--device", "dev", "--wg", "--port", "12518",
+        ]);
+        assert!(uses_wireguard(&wg));
+        assert_eq!(connect_port_arg(&wg).unwrap(), Some(12518));
+        assert_eq!(
+            connect_target_args(&wg).unwrap(),
+            (Some("node".into()), Some("dev".into()))
+        );
     }
 
     #[test]

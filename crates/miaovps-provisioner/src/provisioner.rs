@@ -59,19 +59,6 @@ impl Privilege {
     }
 }
 
-/// 命令过长时截断，用于日志与错误信息
-fn elide(cmd: &str) -> String {
-    let one: String = cmd
-        .chars()
-        .map(|c| if c == '\n' { ' ' } else { c })
-        .collect();
-    if one.chars().count() <= 100 {
-        one
-    } else {
-        format!("{}…", one.chars().take(100).collect::<String>())
-    }
-}
-
 /// 把 SshError 转成 AppError，保留命令上下文
 fn ssh_err(cmd: &str, e: miaovps_ssh::SshError) -> AppError {
     AppError::new(ErrorCode::InternalError, "远程命令执行失败", format!("{e}"))
@@ -81,15 +68,15 @@ fn ssh_err(cmd: &str, e: miaovps_ssh::SshError) -> AppError {
 /// 从 VPN 网段计算服务端网关地址。`10.66.66.0/24` 的网段地址不能作为
 /// wg0 的主机地址；服务端约定使用第一个可用地址 `10.66.66.1/24`。
 fn gateway_address(cidr: &str) -> Result<String, AppError> {
-    let (raw_ip, raw_prefix) = cidr.split_once('/').ok_or_else(|| {
-        AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段无效", cidr)
-    })?;
-    let ip: std::net::Ipv4Addr = raw_ip.parse().map_err(|_| {
-        AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段无效", cidr)
-    })?;
-    let prefix: u8 = raw_prefix.parse().map_err(|_| {
-        AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段前缀无效", cidr)
-    })?;
+    let (raw_ip, raw_prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段无效", cidr))?;
+    let ip: std::net::Ipv4Addr = raw_ip
+        .parse()
+        .map_err(|_| AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段无效", cidr))?;
+    let prefix: u8 = raw_prefix
+        .parse()
+        .map_err(|_| AppError::new(ErrorCode::ConfigWriteFailed, "VPN 网段前缀无效", cidr))?;
     if prefix > 30 {
         return Err(AppError::new(
             ErrorCode::ConfigWriteFailed,
@@ -139,6 +126,21 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+pub struct PortChange<'a> {
+    pub wireguard: bool,
+    pub token: &'a str,
+    pub old: u16,
+    pub new: u16,
+    pub public_key: &'a str,
+    pub peer: &'a str,
+}
+
+pub enum PortAction {
+    Prepare,
+    Commit,
+    Abort,
+}
+
 pub struct SshProvisioner {
     session: SshSession,
     server_id: String,
@@ -152,6 +154,82 @@ impl SshProvisioner {
             server_id,
             privilege: Privilege::Root,
         }
+    }
+
+    /// Bring up the isolated, single-peer AmneziaWG trial. Only the peer's public key leaves the client.
+    pub async fn deploy_awg_trial(
+        &self,
+        port: u16,
+        peer_public_key: &str,
+    ) -> Result<String, AppError> {
+        let cmd = format!(
+            "bash -c {} -- {port} {}",
+            shell_quote(include_str!("deploy-awg.sh")),
+            shell_quote(peer_public_key)
+        );
+        self.exec_root(&cmd, "deploy-awg").await
+    }
+
+    /// Query the live listener without returning private or preshared keys.
+    pub async fn listener(&self, wireguard: bool) -> Result<(String, u16), AppError> {
+        let (tool, iface) = if wireguard {
+            ("wg", "wg0")
+        } else {
+            ("awg", "miao-awg")
+        };
+        let raw = self
+            .exec_root(
+                &format!("test ! -e /run/miaovps-{iface}-port && {tool} show {iface} public-key && {tool} show {iface} listen-port"),
+                "vpn-listener",
+            )
+            .await?;
+        let mut lines = raw.lines();
+        let key = lines.next().unwrap_or_default();
+        let port = lines
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .filter(|p| *p != 0);
+        match port.filter(|_| !key.is_empty() && lines.next().is_none()) {
+            Some(port) => Ok((key.to_string(), port)),
+            None => Err(AppError::new(
+                ErrorCode::InternalError,
+                "监听状态无效",
+                "无法确认服务端公钥或端口",
+            )),
+        }
+    }
+
+    /// Use the same guarded port transaction for both protocols, without restarting either service.
+    pub async fn switch_port(
+        &self,
+        change: &PortChange<'_>,
+        action: PortAction,
+    ) -> Result<(), AppError> {
+        let proto = if change.wireguard { "wg" } else { "awg" };
+        let action = match action {
+            PortAction::Prepare => "prepare",
+            PortAction::Commit => "commit",
+            PortAction::Abort => "abort",
+        };
+        let cmd = format!(
+            "bash -c {} -- {action} {proto} {} {} {} {} {}",
+            shell_quote(include_str!("switch-port.sh")),
+            shell_quote(change.token),
+            change.old,
+            change.new,
+            shell_quote(change.public_key),
+            shell_quote(change.peer)
+        );
+        self.exec_root(&cmd, "switch-port").await?;
+        Ok(())
+    }
+
+    pub async fn awg_status(&self) -> Result<String, AppError> {
+        self.exec_root(
+            "awg show miao-awg 2>/dev/null || echo 'not-running'",
+            "awg-show",
+        )
+        .await
     }
 
     /// 结束短命部署命令持有的 SSH 会话。
@@ -235,21 +313,19 @@ impl SshProvisioner {
     /// 部署的每一步都必须走这里 —— 原实现直接用 `exec` 且不加提权，
     /// 非 root 登录时每步都会因权限不足失败。
     async fn exec_root(&self, cmd: &str, step: &str) -> Result<String, AppError> {
-        // 日志里不能出现 wrap 后的命令 —— sudo 密码在里面
-        info!(target: "provisioner", server=%self.server_id, step, "执行: {}", elide(cmd));
+        info!(target: "provisioner", server=%self.server_id, step, "执行远端步骤");
         let wrapped = self.privilege.wrap(cmd);
         let out = self
             .session
             .exec_raw(&wrapped)
             .await
-            .map_err(|e| ssh_err(&elide(cmd), e))?;
+            .map_err(|e| ssh_err(step, e))?;
 
-        debug!(target: "provisioner", step, code=?out.exit_status,
-               output=%out.stdout.chars().take(200).collect::<String>());
+        debug!(target: "provisioner", step, code=?out.exit_status);
 
         if !out.success() {
-            let detail = if out.stderr.trim().is_empty() {
-                out.stdout.trim().to_string()
+            let detail = if matches!(step, "wg-peer-stats" | "write-config") {
+                "敏感步骤失败，已隐藏远端输出".to_string()
             } else {
                 out.stderr.trim().to_string()
             };
@@ -259,8 +335,7 @@ impl SshProvisioner {
                 detail.chars().take(400).collect::<String>(),
             )
             .with_technical(format!(
-                "命令: {} · 退出码: {:?} · 提权: {}",
-                elide(cmd),
+                "步骤: {step} · 退出码: {:?} · 提权: {}",
                 out.exit_status,
                 self.privilege.describe()
             )));
@@ -434,43 +509,22 @@ impl SshProvisioner {
         let fw = self.exec("which ufw 2>/dev/null && ufw status 2>/dev/null || which iptables 2>/dev/null && echo 'iptables' || echo 'none'").await.unwrap_or_default();
         report.add_item(DetectKey::Firewall, DetectStatus::Pass, fw.trim(), None);
 
-        // 9. UDP 端口
-        //
-        // 占用者是 wg0 自己时不算阻塞 —— 重新检测一台已经部署好的机器必然
-        // 撞上自己监听的 51820，报「阻塞」会让用户以为部署失败。
-        // WireGuard 是内核模块，socket 不挂在用户态进程上，所以只能反过来
-        // 问 wg：wg0 的 listen-port 是不是它。
-        let port_check = self
-            .exec("ss -uln | grep ':51820 ' 2>/dev/null && echo 'occupied' || echo 'free'")
-            .await
-            .unwrap_or_default();
-        if port_check.contains("free") {
-            report.add_item(DetectKey::UdpPort, DetectStatus::Pass, "51820 可用", None);
+        // A custom port is valid; deployment checks the actual selected listener, not 51820.
+        let port_check = self.exec("command -v ss").await.unwrap_or_default();
+        if port_check.is_empty() {
+            report.add_item(
+                DetectKey::UdpPort,
+                DetectStatus::Blocked,
+                "缺少 ss",
+                Some("请安装 iproute2"),
+            );
         } else {
-            // 走 exec_root：`wg show` 需要 root。`|| echo ''` 保证退出码为 0，
-            // 没有 wg0 时不会被 exec_root 的非零码检查判成失败。
-            let owner = self
-                .exec_root(
-                    "wg show wg0 listen-port 2>/dev/null || echo ''",
-                    "detect-port",
-                )
-                .await
-                .unwrap_or_default();
-            if owner.trim() == "51820" {
-                report.add_item(
-                    DetectKey::UdpPort,
-                    DetectStatus::Pass,
-                    "51820 已被本机 wg0 占用（重新部署会复用）",
-                    None,
-                );
-            } else {
-                report.add_item(
-                    DetectKey::UdpPort,
-                    DetectStatus::Blocked,
-                    "51820 已被其他服务占用",
-                    Some("请更换 WireGuard 监听端口或释放该端口"),
-                );
-            }
+            report.add_item(
+                DetectKey::UdpPort,
+                DetectStatus::Pass,
+                "部署时检查所选 UDP 端口",
+                None,
+            );
         }
 
         // 10. 磁盘
@@ -562,6 +616,28 @@ impl SshProvisioner {
             }
         }
 
+        // Existing listeners must go through the verified port transaction, never full redeploy.
+        let port_guard = format!(
+            r#"set -e
+port={}
+if [ -e /etc/wireguard/wg0.conf ]; then
+    disk=$(awk '$1 == "ListenPort" {{print $3}}' /etc/wireguard/wg0.conf)
+    [ "$disk" = "$port" ] || {{ echo 'Existing wg0 uses a different port; use the verified port-change command' >&2; exit 1; }}
+fi
+live=$(wg show wg0 listen-port 2>/dev/null || true)
+if [ -n "$live" ]; then
+    [ "$live" = "$port" ] || {{ echo 'Live wg0 uses a different port' >&2; exit 1; }}
+else
+    sockets=$(ss -H -uan "sport = :$port")
+    [ -z "$sockets" ] || {{ echo 'UDP port is occupied' >&2; exit 1; }}
+fi"#,
+            options.wireguard_port
+        );
+        if let Err(e) = self.exec_checked(&port_guard, "check-listen-port").await {
+            progress.fail(DeploymentStep::Connect, e.to_string());
+            return Ok(progress);
+        }
+
         // Step 2: 备份
         progress.update_step(DeploymentStep::Backup, StepResult::Running);
         let ts = std::time::SystemTime::now()
@@ -647,25 +723,6 @@ impl SshProvisioner {
         // Step 5: 配置虚拟网络（原子写入）
         progress.update_step(DeploymentStep::ConfigureInterface, StepResult::Running);
 
-        // 私钥读取失败绝不能静默继续 —— 原实现 unwrap_or_default() 会把
-        // 空字符串写进 wg0.conf，部署"成功"但服务永远起不来
-        let server_private = match self
-            .exec_root("cat /etc/wireguard/private.key", "read-privkey")
-            .await
-        {
-            Ok(k) => k.trim().to_string(),
-            Err(e) => {
-                progress.fail(DeploymentStep::ConfigureInterface, e.to_string());
-                return Ok(progress);
-            }
-        };
-        if server_private.is_empty() {
-            progress.fail(
-                DeploymentStep::ConfigureInterface,
-                "服务器私钥为空 —— 拒绝写入无效配置".into(),
-            );
-            return Ok(progress);
-        }
         let mtu = options.mtu.unwrap_or(1380);
         let mss = mtu.saturating_sub(40);
         if mss < 536 {
@@ -676,37 +733,39 @@ impl SshProvisioner {
             return Ok(progress);
         }
         let wg_conf = format!(
-            "[Interface]\nPrivateKey = {}\nListenPort = {}\nAddress = {}\nMTU = {}\n",
-            server_private,
+            "ListenPort = {}\nAddress = {}\nMTU = {}",
             options.wireguard_port,
             gateway_address(&options.vpn_cidr)?,
             mtu
         );
-        // 原子写入：写临时文件 → 验证 → 替换
+        // Keep the private key on the VPS, and create the temporary config as 0600 before any write.
         let write_conf_cmd = format!(
-            r#"cat > /etc/wireguard/wg0.conf.tmp <<'WGCONF'
+            r#"set -eu
+umask 077
+tmp=$(mktemp /etc/wireguard/wg0.conf.XXXXXXXX)
+trap 'rm -f "$tmp"' EXIT
+key=$(cat /etc/wireguard/private.key)
+printf '%s' "$key" | grep -Eq '^[A-Za-z0-9+/]{{43}}=$' || exit 1
+{{
+    printf '[Interface]\nPrivateKey = %s\n' "$key"
+    cat <<'WGCONF'
 {config}
 WGCONF
-# 重新部署时不能删掉已有设备。优先从内核运行态提取 Peer（它比磁盘配置
-# 更可信，也能修复旧版本已经覆盖过 wg0.conf 的情况）；首次部署则没有 Peer。
+}} > "$tmp"
 if wg show wg0 >/dev/null 2>&1; then
-    wg showconf wg0 | awk '/^\[Peer\]/{{found=1}} found' >> /etc/wireguard/wg0.conf.tmp
+    peers=$(wg showconf wg0)
+    printf '%s\n' "$peers" | awk '/^\[Peer\]/{{found=1}} found' >> "$tmp"
 elif [ -f /etc/wireguard/wg0.conf ]; then
-    awk '/^\[Peer\]/{{found=1}} found' /etc/wireguard/wg0.conf >> /etc/wireguard/wg0.conf.tmp
+    awk '/^\[Peer\]/{{found=1}} found' /etc/wireguard/wg0.conf >> "$tmp"
 fi
-[ -s /etc/wireguard/wg0.conf.tmp ] && chmod 600 /etc/wireguard/wg0.conf.tmp && mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf && echo 'ok' || echo 'failed'"#,
+mv -f "$tmp" /etc/wireguard/wg0.conf"#,
             config = wg_conf
         );
-        match self.exec_checked(&write_conf_cmd, "write-config").await {
-            Ok(o) if o.contains("ok") => {
-                progress.update_step(DeploymentStep::ConfigureInterface, StepResult::Success)
-            }
-            Ok(_) => progress.fail(DeploymentStep::ConfigureInterface, "写入配置失败".into()),
-            Err(e) => {
-                progress.fail(DeploymentStep::ConfigureInterface, e.to_string());
-                return Ok(progress);
-            }
+        if let Err(e) = self.exec_checked(&write_conf_cmd, "write-config").await {
+            progress.fail(DeploymentStep::ConfigureInterface, e.to_string());
+            return Ok(progress);
         }
+        progress.update_step(DeploymentStep::ConfigureInterface, StepResult::Success);
 
         // Step 6: 配置路由和防火墙
         progress.update_step(DeploymentStep::ConfigureRouting, StepResult::Running);
@@ -837,14 +896,13 @@ fi
             .await
     }
 
-    /// 获取便于机器解析的 WireGuard 运行指标。
-    ///
-    /// `wg show dump` 的 peer 行分别携带公钥、最近握手 Unix 时间戳、接收和
-    /// 发送字节数；不要解析面向人类的 `wg show` 文案，以免受语言和时间单位影响。
-    /// 不给命令追加 `|| echo`：接口不存在或命令失败时必须报错，调用方不能把
-    /// 一次 SSH/服务故障误写成所有设备“从未连接”。
-    pub async fn get_status_dump(&mut self) -> Result<String, AppError> {
-        self.exec_checked("wg show wg0 dump", "wg-show-dump").await
+    /// Drop interface private and peer preshared keys on the server, before returning counters.
+    pub async fn get_peer_stats(&mut self) -> Result<String, AppError> {
+        self.exec_checked(
+            "bash -o pipefail -c \"wg show wg0 dump | cut -f1,5-7 | tail -n +2\"",
+            "wg-peer-stats",
+        )
+        .await
     }
 
     /// 获取服务器公钥
@@ -862,9 +920,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn port_transaction_rolls_back_or_commits_for_both_protocols() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-port-transaction.sh");
+        assert!(std::process::Command::new("bash")
+            .arg(script)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
     fn gateway_address_uses_first_host_not_network_address() {
         assert_eq!(gateway_address("10.66.66.0/24").unwrap(), "10.66.66.1/24");
-        assert_eq!(gateway_address("192.168.10.128/25").unwrap(), "192.168.10.129/25");
+        assert_eq!(
+            gateway_address("192.168.10.128/25").unwrap(),
+            "192.168.10.129/25"
+        );
         assert!(gateway_address("10.0.0.0/31").is_err());
     }
 
@@ -914,14 +986,5 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn elide_collapses_newlines_and_truncates() {
-        assert_eq!(elide("a\nb"), "a b");
-        let long = "x".repeat(200);
-        let out = elide(&long);
-        assert_eq!(out.chars().count(), 101); // 100 + 省略号
-        assert!(out.ends_with('…'));
     }
 }

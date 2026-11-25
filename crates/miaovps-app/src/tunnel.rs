@@ -18,6 +18,23 @@ use std::path::{Path, PathBuf};
 
 /// 状态文件名 —— 位于 data_dir 下
 pub const STATE_FILE: &str = "tunnel-state.json";
+pub const AWG_PROFILE_FILE: &str = "miao-awg-trial.conf";
+
+#[derive(Clone, Copy, Default)]
+pub enum TunnelProtocol {
+    #[default]
+    AmneziaWg,
+    WireGuard,
+}
+
+impl TunnelProtocol {
+    pub fn profile_file(self) -> &'static str {
+        match self {
+            Self::AmneziaWg => AWG_PROFILE_FILE,
+            Self::WireGuard => "profile.json",
+        }
+    }
+}
 
 /// 普通用户 App 向 root daemon 发出的停止请求。
 ///
@@ -80,6 +97,9 @@ pub struct TunnelState {
     pub pid: u32,
     pub server_endpoint: String,
     pub client_ip: String,
+    /// Route recorded by newer clients so a stale daemon can be cleaned up after a protocol/profile switch.
+    #[serde(default)]
+    pub vpn_route: Option<String>,
     /// 隧道建立时间（Unix 秒）
     pub started_at: i64,
     /// 状态最后刷新时间（Unix 秒）
@@ -111,6 +131,7 @@ impl TunnelState {
             pid: std::process::id(),
             server_endpoint,
             client_ip,
+            vpn_route: None,
             started_at: now,
             updated_at: now,
             tx_bytes: 0,
@@ -131,6 +152,7 @@ impl TunnelState {
             pid: 0,
             server_endpoint: String::new(),
             client_ip: String::new(),
+            vpn_route: None,
             started_at: 0,
             updated_at: now_secs(),
             tx_bytes: 0,
@@ -179,12 +201,28 @@ impl TunnelState {
     /// 判据是 profile 里的客户端地址是否已绑在某个 TUN 上 —— 比扫进程名
     /// 可靠：进程可能叫任何名字，但地址在网卡上就是在。
     fn probe_external(data_dir: &Path) -> Self {
-        let Some(client_ip) = profile_client_ip(data_dir) else {
+        let awg_ip = std::fs::read_to_string(data_dir.join(AWG_PROFILE_FILE))
+            .ok()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim() == "Address").then(|| {
+                        value
+                            .trim()
+                            .split('/')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                })
+            });
+        let Some(client_ip) = [profile_client_ip(data_dir), awg_ip]
+            .into_iter()
+            .flatten()
+            .find(|ip| utun_has_address(ip))
+        else {
             return Self::disconnected();
         };
-        if !utun_has_address(&client_ip) {
-            return Self::disconnected();
-        }
         let mut state = Self::disconnected();
         state.status = TunnelStatus::External;
         state.client_ip = client_ip;

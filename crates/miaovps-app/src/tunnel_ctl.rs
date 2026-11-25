@@ -16,7 +16,7 @@
 //! （数据目录路径）必须逐层转义。这里不接受任何前端传入的自由文本 ——
 //! 只有 mode 枚举和已知路径，转义后仍做一次白名单校验。
 
-use crate::tunnel::{TunnelMode, TunnelState, TunnelStatus};
+use crate::tunnel::{TunnelMode, TunnelProtocol, TunnelState, TunnelStatus};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
@@ -31,9 +31,11 @@ pub enum TunnelCtlError {
     LaunchFailed(String),
     #[error("隧道已在运行 (pid {0})")]
     AlreadyRunning(u32),
-    #[error("检测到隧道已在运行，但不是由本应用启动的。\n请先在终端里停止它（Ctrl+C 或 sudo miaovps disconnect）再从这里连接")]
+    #[error(
+        "检测到隧道已在运行，但不是由本应用启动的。\n请先在终端里停止它（Ctrl+C 或 sudo miaovps disconnect）再从这里连接"
+    )]
     ExternalTunnel,
-    #[error("未找到连接配置，请先在节点页面完成部署并添加本机设备")]
+    #[error("未找到所选协议的连接配置，请先部署该协议并配置本机设备")]
     ProfileMissing,
     #[error("{0}")]
     Other(String),
@@ -80,6 +82,14 @@ impl TunnelCtl {
     ///
     /// 已在运行时直接返回错误，不重复拉起 —— 两个隧道进程会互相踩路由表。
     pub fn connect(&self, mode: TunnelMode) -> Result<TunnelState, TunnelCtlError> {
+        self.connect_with_protocol(mode, TunnelProtocol::default())
+    }
+
+    pub fn connect_with_protocol(
+        &self,
+        mode: TunnelMode,
+        protocol: TunnelProtocol,
+    ) -> Result<TunnelState, TunnelCtlError> {
         let current = self.status();
         if current.status == TunnelStatus::External {
             return Err(TunnelCtlError::ExternalTunnel);
@@ -89,13 +99,13 @@ impl TunnelCtl {
         }
 
         // profile 缺失时提前失败 —— 否则要等授权框点完才报错
-        if !self.data_dir.join("profile.json").exists() {
+        if !self.data_dir.join(protocol.profile_file()).is_file() {
             return Err(TunnelCtlError::ProfileMissing);
         }
 
         TunnelState::clear_stop_request(&self.data_dir);
 
-        let connect_shell = self.build_shell_command("connect", mode.as_flag());
+        let connect_shell = self.connect_shell(mode, protocol);
         // 崩溃残留的清理和重连合并在同一次授权里，
         // 否则一次点击会连续弹两次密码框。
         let shell = if current.status == TunnelStatus::Stale {
@@ -182,6 +192,14 @@ impl TunnelCtl {
         }
         if subcommand == "connect" {
             cmd.push_str(" --daemon");
+        }
+        cmd
+    }
+
+    fn connect_shell(&self, mode: TunnelMode, protocol: TunnelProtocol) -> String {
+        let mut cmd = self.build_shell_command("connect", mode.as_flag());
+        if matches!(protocol, TunnelProtocol::WireGuard) {
+            cmd.push_str(" --wg");
         }
         cmd
     }
@@ -313,6 +331,23 @@ mod tests {
             PathBuf::from(dir),
             PathBuf::from("/Users/test/.cargo/bin/miaovps"),
         )
+    }
+
+    #[test]
+    fn desktop_preflights_awg_by_default_and_requires_explicit_wg() {
+        let dir = std::env::temp_dir().join(format!("miaovps-ctl-protocol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("profile.json"), "{}").unwrap();
+        let ctl = TunnelCtl::with_binary(dir.clone(), PathBuf::from("/bin/false"));
+        assert!(matches!(
+            ctl.connect(TunnelMode::Full),
+            Err(TunnelCtlError::ProfileMissing)
+        ));
+        let awg = ctl.connect_shell(TunnelMode::Full, TunnelProtocol::default());
+        let wg = ctl.connect_shell(TunnelMode::Full, TunnelProtocol::WireGuard);
+        assert!(awg.ends_with("connect --full --daemon"));
+        assert!(wg.ends_with("connect --full --daemon --wg"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

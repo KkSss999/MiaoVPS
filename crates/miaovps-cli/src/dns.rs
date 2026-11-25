@@ -284,8 +284,7 @@ mod platform {
                 }
             }
         } else if let Some(raw) = &backup.raw {
-            std::fs::write(RESOLV_CONF, raw)
-                .with_context(|| format!("无法写回 {RESOLV_CONF}"))?;
+            std::fs::write(RESOLV_CONF, raw).with_context(|| format!("无法写回 {RESOLV_CONF}"))?;
         }
 
         let _ = std::fs::remove_file(DnsBackup::path(data_dir));
@@ -323,7 +322,10 @@ mod platform {
         }
 
         if resolv_conf_editable() {
-            let content: String = servers.iter().map(|s| format!("nameserver {s}\n")).collect();
+            let content: String = servers
+                .iter()
+                .map(|s| format!("nameserver {s}\n"))
+                .collect();
             std::fs::write(RESOLV_CONF, content)
                 .with_context(|| format!("无法写入 {RESOLV_CONF}"))?;
             return Ok(());

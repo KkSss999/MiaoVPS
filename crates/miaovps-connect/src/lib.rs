@@ -12,6 +12,7 @@
 //!     → Disconnecting
 //!     → Disconnected
 
+pub mod awg;
 pub mod error;
 pub mod native;
 pub mod state;

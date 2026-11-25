@@ -10,10 +10,15 @@ const BACKUPS: usize = 3;
 pub const DEV_LOG: &str = "tunnel-dev.log";
 
 pub fn init(dev_dir: Option<&Path>) -> anyhow::Result<()> {
-    let console = tracing_subscriber::fmt::layer().with_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("miaovps=info")),
-    );
+    // SSH library debug/trace output can include protocol messages or key material.
+    let safe_console =
+        tracing_subscriber::filter::filter_fn(|meta| !meta.target().starts_with("russh"));
+    let console = tracing_subscriber::fmt::layer()
+        .with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("miaovps=info")),
+        )
+        .with_filter(safe_console);
     let file = dev_dir
         .map(|dir| -> anyhow::Result<_> {
             let path = dir.join(DEV_LOG);
@@ -23,7 +28,7 @@ pub fn init(dev_dir: Option<&Path>) -> anyhow::Result<()> {
                 .with_thread_names(true)
                 .with_writer(writer)
                 .with_filter(tracing_subscriber::EnvFilter::new(
-                    "miaovps=debug,boringtun=debug",
+                    "miaovps=debug,awgtun=debug",
                 )))
         })
         .transpose()?;
@@ -68,15 +73,32 @@ struct RollingLog {
     size: u64,
     limit: u64,
 }
-fn open_private(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+pub(crate) fn open_private(path: &Path) -> io::Result<File> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    };
+    let owner = std::fs::metadata(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 || (meta.uid() != owner.uid() && meta.uid() != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not a private log file",
+        ));
+    }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    if unsafe { libc::geteuid() } == 0
+        && meta.uid() != owner.uid()
+        && unsafe { libc::fchown(file.as_raw_fd(), owner.uid(), owner.gid()) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(file)
 }
 impl RollingLog {
@@ -154,6 +176,27 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn rejects_symlinks_and_hardlinks_before_changing_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("miaovps-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("other");
+        let path = dir.join(DEV_LOG);
+        std::fs::write(&target, b"untouched").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(open_private(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(open_private(&path).is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn file_captures_app_and_protocol_debug_with_console_disabled() {
         let dir = std::env::temp_dir().join(format!("miaovps-filter-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
@@ -168,12 +211,12 @@ mod tests {
             .with_ansi(false)
             .with_writer(writer)
             .with_filter(tracing_subscriber::EnvFilter::new(
-                "miaovps=debug,boringtun=debug",
+                "miaovps=debug,awgtun=debug",
             ));
         let subscriber = tracing_subscriber::registry().with(console).with(file);
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(target: "miaovps_connect", "app diagnostic");
-            tracing::debug!(target: "boringtun::noise", "protocol diagnostic");
+            tracing::debug!(target: "awgtun::noise", "protocol diagnostic");
             tracing::debug!(target: "unrelated", "unrelated event");
         });
         let contents = std::fs::read_to_string(path).unwrap();

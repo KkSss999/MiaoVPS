@@ -4,6 +4,7 @@ use std::time::Duration;
 pub const RECONNECT_WRONG_INDEX: u64 = 2;
 pub const RETRY_STABLE_FOR: Duration = Duration::from_secs(30);
 pub const RETRY_CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
+pub const OUTAGE_TICKS_BEFORE_RESTART: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionExit {
@@ -16,6 +17,7 @@ pub enum SessionExit {
 pub struct RecoveryPolicy {
     pub retrying: bool,
     failures: u8,
+    tried_port: bool,
 }
 impl RecoveryPolicy {
     /// True requests a port migration. A successful transport session starts a
@@ -26,9 +28,11 @@ impl RecoveryPolicy {
             SessionExit::Restart => {
                 self.retrying = true;
                 self.failures = 0;
+                self.tried_port = false;
                 false
             }
             SessionExit::RetryFailed => {
+                self.retrying = true;
                 self.failures = self.failures.saturating_add(1);
                 self.failures >= 2
             }
@@ -36,6 +40,11 @@ impl RecoveryPolicy {
     }
     pub fn migrated(&mut self) {
         self.failures = 0;
+        self.tried_port = true;
+    }
+
+    pub fn tried_port(&self) -> bool {
+        self.tried_port
     }
 }
 
@@ -56,21 +65,6 @@ pub fn session_exit(
         })
     } else {
         None
-    }
-}
-
-pub fn deployment_options(
-    node: &miaovps_core::WireGuardNode,
-    profile_mtu: u16,
-    port: u16,
-) -> miaovps_provisioner::DeploymentOptions {
-    miaovps_provisioner::DeploymentOptions {
-        wireguard_port: port,
-        vpn_cidr: node.vpn_cidr.clone(),
-        dns: node.dns.clone(),
-        mtu: node.mtu.or(Some(profile_mtu)),
-        ipv6_enabled: node.ipv6_enabled,
-        ..miaovps_provisioner::DeploymentOptions::default()
     }
 }
 
@@ -112,8 +106,10 @@ mod tests {
         assert!(!p.ended(SessionExit::RetryFailed));
         assert!(p.ended(SessionExit::RetryFailed));
         p.migrated();
+        assert!(p.tried_port());
         assert!(!p.ended(SessionExit::RetryFailed));
         assert!(!p.ended(SessionExit::Restart));
+        assert!(!p.tried_port());
         assert!(!p.ended(SessionExit::RetryFailed));
         assert!(p.ended(SessionExit::RetryFailed));
     }
@@ -161,22 +157,10 @@ mod tests {
         );
     }
     #[test]
-    fn migration_preserves_node_network_settings() {
-        let mut node = miaovps_core::WireGuardNode::new(
-            "server".into(),
-            168,
-            "10.77.0.0/24".into(),
-            "public".into(),
-            vec!["9.9.9.9".into()],
-        );
-        node.mtu = Some(1280);
-        node.ipv6_enabled = true;
-        let options = deployment_options(&node, 1380, 169);
-        assert_eq!(options.wireguard_port, 169);
-        assert_eq!(options.vpn_cidr, node.vpn_cidr);
-        assert_eq!(options.dns, node.dns);
-        assert_eq!(options.mtu, Some(1280));
-        assert!(options.ipv6_enabled);
-        assert_eq!(node.listen_port, 168);
+    fn cold_timeout_enters_recovery_and_escalates_after_two_failures() {
+        let mut policy = RecoveryPolicy::default();
+        assert!(!policy.ended(SessionExit::RetryFailed));
+        assert!(policy.retrying);
+        assert!(policy.ended(SessionExit::RetryFailed));
     }
 }

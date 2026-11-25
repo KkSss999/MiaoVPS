@@ -11,26 +11,38 @@ miaovps CLI / compatible clients
         ├─ Control plane: SSH
         │  inspection, deployment, peer registration, status
         │
-        └─ Data plane: WireGuard UDP
+        └─ Data plane: AmneziaWG (default) or WireGuard UDP
                          │
                          ▼
-                VPS: wg0 + forwarding + NAT
+        VPS: miao-awg or wg0 + forwarding + NAT
 ```
 
 The control and data planes are independent. SSH is used for administration;
-VPN traffic is never tunneled through SSH. WireGuard client private keys are
-generated and stored on the client, while the VPS receives peer public keys.
+VPN traffic is never tunneled through SSH. Client private keys are generated and
+stored on the client, while the VPS receives peer public keys. SSH host keys are
+checked against `~/.ssh/known_hosts`; an unknown or changed key aborts the
+connection before credentials are sent.
+
+Protocols use separate server listeners and local profiles:
+
+| Protocol | Server interface | Local profile | Peer model |
+| --- | --- | --- | --- |
+| AmneziaWG (default) | `miao-awg` | `miao-awg-trial.conf` | One device per deployment |
+| WireGuard (`--wg`) | `wg0` | `profile.json` | Multiple registered devices |
+
+`deploy` installs the default AWG listener; `deploy --wg` installs native
+WireGuard. Neither path silently replaces the other.
 
 ## Crate boundaries
 
 | Crate | Responsibility |
 | --- | --- |
 | `miaovps-core` | Domain models for servers, devices, and tunnels |
-| `miaovps-wireguard-config` | Key and WireGuard configuration generation |
+| `miaovps-wireguard-config` | Key and WireGuard/AWG configuration parsing and generation |
 | `miaovps-ssh` | SSH authentication and remote command execution |
 | `miaovps-provisioner` | Environment detection, installation, configuration, startup, and rollback |
 | `miaovps-storage` | Local SQLite state and operating-system credential storage |
-| `miaovps-connect` | TUN, routes, DNS, handshake validation, and reconnect logic |
+| `miaovps-connect` | TUN, routes, DNS, handshake validation, framing, and reconnect logic |
 | `miaovps-app` | Application-service boundary reusable by the CLI and other clients |
 | `miaovps-cli` | User-facing command-line entry point |
 | `miaovps-tunnel-api` | Platform-neutral tunnel contracts |
@@ -38,9 +50,11 @@ generated and stored on the client, while the VPS receives peer public keys.
 
 ## Connection safety boundary
 
-Connection setup validates UDP reachability, the WireGuard handshake, tunnel
-creation, and route application in sequence. A critical validation failure does
-not switch global routes.
+Connection setup verifies the SSH host key, validates UDP reachability and an
+authenticated handshake for the selected protocol, then creates the tunnel and
+applies routes in sequence. A critical validation failure does not switch
+global routes. Port changes bind the candidate listener first and commit only
+after the client completes a handshake; otherwise the old port is restored.
 
 Full tunnel mode uses `0.0.0.0/1` and `128.0.0.0/1` while preserving a direct
 route to the VPS, preventing the WireGuard transport from routing into its own
